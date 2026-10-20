@@ -41,12 +41,20 @@ var splitKeys = map[string]bool{
 // Manifest describes how to rebuild a JSON body from blobs.
 type Manifest struct {
 	V      int            `json:"v"`
-	Format string         `json:"format"` // "json" or "raw"
+	Format string         `json:"format"` // "json", "raw" or "sections"
 	Raw    string         `json:"raw,omitempty"`
+	Parts  []SectionPart  `json:"parts,omitempty"` // Format "sections", concatenated in order
 	Keys   []ManifestKey  `json:"keys,omitempty"`
 	Cache  []PathValue    `json:"cache_control,omitempty"`
 	Media  []MediaRef     `json:"media,omitempty"`
 	Stats  *ManifestStats `json:"stats,omitempty"`
+}
+
+// SectionPart is one piece of a "sections" body: either literal text (stored as a blob) or a
+// JSON body (a nested manifest, split per element like any other JSON body).
+type SectionPart struct {
+	Text string `json:"t,omitempty"`
+	Body string `json:"m,omitempty"`
 }
 
 // ManifestKey is one top-level key, in original order.
@@ -93,6 +101,9 @@ func (a *Archive) splitBody(ctx context.Context, body []byte, kind string) (stri
 	m := Manifest{V: manifestVersion, Format: "json", Stats: &ManifestStats{Bytes: len(body)}}
 	trimmed := bytes.TrimSpace(body)
 	if !gjson.ValidBytes(trimmed) || len(trimmed) == 0 || trimmed[0] != '{' {
+		if parts := splitSections(body); parts != nil {
+			return a.storeSections(ctx, body, parts, kind)
+		}
 		hash, err := a.blobs.Put(ctx, body, sniffMediaType(body), kind+".raw")
 		if err != nil {
 			return "", err
@@ -207,6 +218,23 @@ func (a *Archive) rebuildBody(ctx context.Context, manifestHash string) ([]byte,
 	}
 	if m.Format == "raw" {
 		return a.blobs.Get(ctx, m.Raw)
+	}
+	if m.Format == "sections" {
+		var out []byte
+		for _, part := range m.Parts {
+			var piece []byte
+			var errPart error
+			if part.Body != "" {
+				piece, errPart = a.rebuildBody(ctx, part.Body)
+			} else if part.Text != "" {
+				piece, errPart = a.blobs.Get(ctx, part.Text)
+			}
+			if errPart != nil {
+				return nil, errPart
+			}
+			out = append(out, piece...)
+		}
+		return out, nil
 	}
 	restore := func(key string, item int, hash string) ([]byte, error) {
 		el, errGet := a.blobs.Get(ctx, hash)
@@ -356,4 +384,105 @@ func decodeMedia(s, siblingMediaType string) (data []byte, mediaType, prefix str
 		mt = sniffMediaType(decoded)
 	}
 	return decoded, mt, "", true
+}
+
+// sectionBodyMarker starts a JSON body inside a request-log text dump ("=== API REQUEST 1 ===",
+// headers, then "Body:\n{...}"). Retried attempts repeat the block.
+var sectionBodyMarker = []byte("\nBody:\n")
+
+// textPart / bodyPart are the pieces splitSections finds; bodyPart bytes are a JSON object.
+type sectionPiece struct {
+	data []byte
+	json bool
+}
+
+// splitSections cuts a text dump into literal text and embedded JSON object bodies. It returns nil
+// when no embedded JSON body is found, so the caller falls back to storing the dump verbatim.
+// Concatenating the pieces always reproduces body exactly.
+func splitSections(body []byte) []sectionPiece {
+	var pieces []sectionPiece
+	found := false
+	rest := body
+	for {
+		i := bytes.Index(rest, sectionBodyMarker)
+		if i < 0 {
+			break
+		}
+		start := i + len(sectionBodyMarker)
+		if start >= len(rest) || rest[start] != '{' {
+			pieces = append(pieces, sectionPiece{data: rest[:start]})
+			rest = rest[start:]
+			continue
+		}
+		end := jsonObjectEnd(rest[start:])
+		if end < 0 {
+			break
+		}
+		pieces = append(pieces, sectionPiece{data: rest[:start]}, sectionPiece{data: rest[start : start+end], json: true})
+		rest = rest[start+end:]
+		found = true
+	}
+	if !found {
+		return nil
+	}
+	if len(rest) > 0 {
+		pieces = append(pieces, sectionPiece{data: rest})
+	}
+	return pieces
+}
+
+// jsonObjectEnd returns the length of the JSON object at the start of b, or -1 when b does not
+// start with a complete, valid object.
+func jsonObjectEnd(b []byte) int {
+	depth, inString, escaped := 0, false, false
+	for i, c := range b {
+		switch {
+		case inString:
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+		case c == '"':
+			inString = true
+		case c == '{' || c == '[':
+			depth++
+		case c == '}' || c == ']':
+			depth--
+			if depth == 0 {
+				if !gjson.ValidBytes(b[:i+1]) {
+					return -1
+				}
+				return i + 1
+			}
+		}
+	}
+	return -1
+}
+
+// storeSections stores a text dump as text blobs plus per-element JSON manifests.
+func (a *Archive) storeSections(ctx context.Context, body []byte, pieces []sectionPiece, kind string) (string, error) {
+	m := Manifest{V: manifestVersion, Format: "sections", Stats: &ManifestStats{Bytes: len(body)}}
+	for _, piece := range pieces {
+		if len(piece.data) == 0 {
+			continue
+		}
+		if piece.json {
+			hash, err := a.splitBody(ctx, piece.data, kind)
+			if err != nil {
+				return "", err
+			}
+			m.Parts = append(m.Parts, SectionPart{Body: hash})
+			continue
+		}
+		hash, err := a.blobs.Put(ctx, piece.data, "text/plain", kind+".text")
+		if err != nil {
+			return "", err
+		}
+		m.Parts = append(m.Parts, SectionPart{Text: hash})
+	}
+	return a.putJSON(ctx, m, kind+".manifest")
 }
