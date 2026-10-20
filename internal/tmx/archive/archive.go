@@ -21,6 +21,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/capture"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
 	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	log "github.com/sirupsen/logrus"
 )
@@ -403,6 +404,14 @@ func (a *Archive) storeExchange(ctx context.Context, ex *capture.Exchange) error
 		ex.Streaming, firstChunk, duration, row.reqHeaders, row.reqBody, row.respHeaders, row.respBody,
 		row.chunks, row.upReq, row.upResp, row.ws, row.upWS, string(errorsJSON),
 		len(ex.RequestBody), len(ex.ResponseBody), clientSession)
+	if err == nil {
+		// Requests the proxy refused before trying any account never reach the usage plugin;
+		// record them here so they show up in the request log as "rejected".
+		if rej, ok := rejectedRow(ex); ok {
+			rej.TraceID, rej.RequestID = traceID, "rejected:"+traceID
+			requestlog.Default().Enqueue(rej)
+		}
+	}
 	return err
 }
 

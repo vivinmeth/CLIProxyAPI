@@ -26,6 +26,9 @@ const (
 	OutcomeSuccess  = "success"
 	OutcomeFailed   = "failed"
 	OutcomeCanceled = "canceled"
+	// OutcomeRejected: the proxy answered with an error before any account was tried (bad or
+	// missing client key, unknown model, malformed body, every credential cooling down).
+	OutcomeRejected = "rejected"
 )
 
 const maxErrorLen = 2000
@@ -198,6 +201,9 @@ func isHex(s string) bool {
 	}
 	return len(s) >= 8
 }
+
+// HashAPIKey is the stored form of a client key (first 16 hex of its sha256).
+func HashAPIKey(key string) string { return hashAPIKey(key) }
 
 func hashAPIKey(key string) string {
 	key = strings.TrimSpace(key)

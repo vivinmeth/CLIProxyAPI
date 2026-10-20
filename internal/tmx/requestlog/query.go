@@ -77,6 +77,7 @@ type Counts struct {
 	Success            int64   `json:"success"`
 	Failed             int64   `json:"failed"`
 	Canceled           int64   `json:"canceled"`
+	Rejected           int64   `json:"rejected"`
 	UncachedInput      int64   `json:"uncached_input"`
 	CacheRead          int64   `json:"cache_read"`
 	CacheWrite         int64   `json:"cache_write"`
@@ -104,6 +105,7 @@ const countsSelect = `
 	count(*) FILTER (WHERE outcome = 'success'),
 	count(*) FILTER (WHERE outcome = 'failed'),
 	count(*) FILTER (WHERE outcome = 'canceled'),
+	count(*) FILTER (WHERE outcome = 'rejected'),
 	COALESCE(sum(uncached_input), 0),
 	COALESCE(sum(cache_read), 0),
 	COALESCE(sum(cache_write), 0),
@@ -116,7 +118,7 @@ const countsSelect = `
 	COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY ttft_ms) FILTER (WHERE outcome = 'success' AND ttft_ms > 0), 0)`
 
 func (c *Counts) scanTargets() []any {
-	return []any{&c.Attempts, &c.Requests, &c.Success, &c.Failed, &c.Canceled, &c.UncachedInput,
+	return []any{&c.Attempts, &c.Requests, &c.Success, &c.Failed, &c.Canceled, &c.Rejected, &c.UncachedInput,
 		&c.CacheRead, &c.CacheWrite, &c.OutputNonReasoning, &c.ReasoningTokens, &c.TotalTokens,
 		&c.Incomplete, &c.AvgLatencyMs, &c.P50TTFTMs, &c.P95TTFTMs}
 }
@@ -284,6 +286,7 @@ type RollupRow struct {
 	Success  int64             `json:"success"`
 	Failed   int64             `json:"failed"`
 	Canceled int64             `json:"canceled"`
+	Rejected int64             `json:"rejected"`
 	// Normalised tokens; see Counts.
 	UncachedInput      int64 `json:"uncached_input"`
 	CacheRead          int64 `json:"cache_read"`
@@ -319,7 +322,8 @@ func (s *Store) Rollup(ctx context.Context, f Filter, unit, tz string, dims []st
 	args = append(args, maxRows+1)
 	q := `SELECT ` + strings.Join(cols, ", ") + `,
 		count(*), count(*) FILTER (WHERE outcome = 'success'), count(*) FILTER (WHERE outcome = 'failed'),
-		count(*) FILTER (WHERE outcome = 'canceled'), COALESCE(sum(uncached_input), 0), COALESCE(sum(cache_read), 0),
+		count(*) FILTER (WHERE outcome = 'canceled'), count(*) FILTER (WHERE outcome = 'rejected'),
+		COALESCE(sum(uncached_input), 0), COALESCE(sum(cache_read), 0),
 		COALESCE(sum(cache_write), 0), COALESCE(sum(output_non_reasoning), 0), COALESCE(sum(reasoning_tokens), 0),
 		COALESCE(sum(total_tokens), 0), count(*) FILTER (WHERE accounting_quality NOT IN ('complete', ''))
 		FROM ` + s.table() + where + ` GROUP BY ` + strings.Join(group, ", ") +
@@ -337,7 +341,7 @@ func (s *Store) Rollup(ctx context.Context, f Filter, unit, tz string, dims []st
 		for i := range vals {
 			targets = append(targets, &vals[i])
 		}
-		targets = append(targets, &r.Attempts, &r.Success, &r.Failed, &r.Canceled, &r.UncachedInput,
+		targets = append(targets, &r.Attempts, &r.Success, &r.Failed, &r.Canceled, &r.Rejected, &r.UncachedInput,
 			&r.CacheRead, &r.CacheWrite, &r.OutputNonReasoning, &r.ReasoningTokens, &r.TotalTokens, &r.Incomplete)
 		if err = rows.Scan(targets...); err != nil {
 			return nil, false, err
@@ -370,6 +374,7 @@ type SessionTotal struct {
 	Success   int64     `json:"success"`
 	Failed    int64     `json:"failed"`
 	Canceled  int64     `json:"canceled"`
+	Rejected  int64     `json:"rejected"`
 	// Normalised tokens; see Counts.
 	UncachedInput      int64 `json:"uncached_input"`
 	CacheRead          int64 `json:"cache_read"`
@@ -399,7 +404,8 @@ func (s *Store) SessionTotals(ctx context.Context, f Filter, order string, limit
 	q := `SELECT session_id, min(ts), max(ts), ` + agg("model") + `, ` + agg("auth_id") + `, ` +
 		agg("machine") + `, ` + agg("source") + `, ` + agg("api_key_hash") + `, ` + agg("harness") + `,
 		count(*), count(*) FILTER (WHERE outcome = 'success'), count(*) FILTER (WHERE outcome = 'failed'),
-		count(*) FILTER (WHERE outcome = 'canceled'), COALESCE(sum(uncached_input), 0), COALESCE(sum(cache_read), 0),
+		count(*) FILTER (WHERE outcome = 'canceled'), count(*) FILTER (WHERE outcome = 'rejected'),
+		COALESCE(sum(uncached_input), 0), COALESCE(sum(cache_read), 0),
 		COALESCE(sum(cache_write), 0), COALESCE(sum(output_non_reasoning), 0), COALESCE(sum(reasoning_tokens), 0),
 		COALESCE(sum(total_tokens), 0), count(*) FILTER (WHERE accounting_quality NOT IN ('complete', ''))
 		FROM ` + s.table() + where + ` AND session_id <> '' GROUP BY session_id ORDER BY ` + orderBy +
@@ -414,7 +420,7 @@ func (s *Store) SessionTotals(ctx context.Context, f Filter, order string, limit
 		var r SessionTotal
 		var models, auths, machines, sources, keys, harnesses pgTextArray
 		if err = rows.Scan(&r.SessionID, &r.FirstTS, &r.LastTS, &models, &auths, &machines, &sources, &keys, &harnesses,
-			&r.Attempts, &r.Success, &r.Failed, &r.Canceled, &r.UncachedInput, &r.CacheRead, &r.CacheWrite,
+			&r.Attempts, &r.Success, &r.Failed, &r.Canceled, &r.Rejected, &r.UncachedInput, &r.CacheRead, &r.CacheWrite,
 			&r.OutputNonReasoning, &r.ReasoningTokens, &r.TotalTokens, &r.Incomplete); err != nil {
 			return nil, err
 		}
