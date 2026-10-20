@@ -72,9 +72,12 @@ type Row struct {
 	OutputNonReasoning int64  `json:"output_non_reasoning"`
 	AccountingQuality  string `json:"accounting_quality"`
 	// Provenance: "tmx-proxy" for proxied calls, "extern:<harness>" for imported sessions.
-	Source    string `json:"source"`
-	Machine   string `json:"machine"`
-	ImportRef string `json:"import_ref,omitempty"`
+	Source  string `json:"source"`
+	Machine string `json:"machine"`
+	// Harness / ClientMode: see HarnessFor. Filled at write time when empty.
+	Harness    string `json:"harness"`
+	ClientMode string `json:"client_mode"`
+	ImportRef  string `json:"import_ref,omitempty"`
 	// Shadowed rows duplicate traffic the proxy already recorded (an imported session that also
 	// went through the proxy); they are excluded from totals unless asked for.
 	Shadowed bool `json:"shadowed"`
@@ -85,6 +88,9 @@ type Row struct {
 // syncImportRef maps ImportRef to the nullable column (empty = NULL, so the unique index only
 // constrains imported rows).
 func (r *Row) syncImportRef() {
+	if r.Harness == "" {
+		r.Harness, r.ClientMode = HarnessFor(r.Source, r.UserAgent)
+	}
 	if r.ImportRef == "" {
 		r.importRefPtr = nil
 		return

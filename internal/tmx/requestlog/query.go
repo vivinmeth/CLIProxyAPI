@@ -24,6 +24,8 @@ type Filter struct {
 	SessionID       string
 	APIKeyHash      string
 	Machine         string
+	Harness         string
+	ClientMode      string
 }
 
 // where renders the WHERE clause; args start at $1.
@@ -57,6 +59,7 @@ func (f Filter) where() (string, []any) {
 	for _, kv := range []struct{ col, v string }{
 		{"outcome", f.Outcome}, {"provider", f.Provider}, {"auth_id", f.AuthID}, {"model", f.Model},
 		{"session_id", f.SessionID}, {"api_key_hash", f.APIKeyHash}, {"machine", f.Machine},
+		{"harness", f.Harness}, {"client_mode", f.ClientMode},
 	} {
 		if kv.v != "" {
 			add(kv.col+" = $%d", kv.v)
@@ -270,7 +273,7 @@ func (s *Store) List(ctx context.Context, f Filter, beforeID int64, limit int) (
 var RollupDims = map[string]bool{
 	"source": true, "provider": true, "model": true, "response_model": true, "auth_id": true,
 	"api_key_hash": true, "machine": true, "outcome": true, "accounting_quality": true,
-	"session_id": true,
+	"session_id": true, "harness": true, "client_mode": true,
 }
 
 // RollupRow is one cell of the rollup cube.
@@ -360,6 +363,7 @@ type SessionTotal struct {
 	Models    []string  `json:"models"`
 	AuthIDs   []string  `json:"auth_ids"`
 	Machines  []string  `json:"machines"`
+	Harnesses []string  `json:"harnesses"`
 	Sources   []string  `json:"sources"`
 	KeyHashes []string  `json:"api_key_hashes"`
 	Attempts  int64     `json:"attempts"`
@@ -393,7 +397,7 @@ func (s *Store) SessionTotals(ctx context.Context, f Filter, order string, limit
 		return "COALESCE(array_agg(DISTINCT " + col + ") FILTER (WHERE " + col + " <> ''), '{}')"
 	}
 	q := `SELECT session_id, min(ts), max(ts), ` + agg("model") + `, ` + agg("auth_id") + `, ` +
-		agg("machine") + `, ` + agg("source") + `, ` + agg("api_key_hash") + `,
+		agg("machine") + `, ` + agg("source") + `, ` + agg("api_key_hash") + `, ` + agg("harness") + `,
 		count(*), count(*) FILTER (WHERE outcome = 'success'), count(*) FILTER (WHERE outcome = 'failed'),
 		count(*) FILTER (WHERE outcome = 'canceled'), COALESCE(sum(uncached_input), 0), COALESCE(sum(cache_read), 0),
 		COALESCE(sum(cache_write), 0), COALESCE(sum(output_non_reasoning), 0), COALESCE(sum(reasoning_tokens), 0),
@@ -408,13 +412,13 @@ func (s *Store) SessionTotals(ctx context.Context, f Filter, order string, limit
 	out := []SessionTotal{}
 	for rows.Next() {
 		var r SessionTotal
-		var models, auths, machines, sources, keys pgTextArray
-		if err = rows.Scan(&r.SessionID, &r.FirstTS, &r.LastTS, &models, &auths, &machines, &sources, &keys,
+		var models, auths, machines, sources, keys, harnesses pgTextArray
+		if err = rows.Scan(&r.SessionID, &r.FirstTS, &r.LastTS, &models, &auths, &machines, &sources, &keys, &harnesses,
 			&r.Attempts, &r.Success, &r.Failed, &r.Canceled, &r.UncachedInput, &r.CacheRead, &r.CacheWrite,
 			&r.OutputNonReasoning, &r.ReasoningTokens, &r.TotalTokens, &r.Incomplete); err != nil {
 			return nil, err
 		}
-		r.Models, r.AuthIDs, r.Machines, r.Sources, r.KeyHashes = models, auths, machines, sources, keys
+		r.Models, r.AuthIDs, r.Machines, r.Sources, r.KeyHashes, r.Harnesses = models, auths, machines, sources, keys, harnesses
 		out = append(out, r)
 	}
 	return out, rows.Err()

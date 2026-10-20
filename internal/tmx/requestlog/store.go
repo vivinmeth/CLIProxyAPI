@@ -118,6 +118,7 @@ func Open(ctx context.Context, dsn, schema string, retentionDays int) (*Store, e
 	}
 	go s.run()
 	go s.backfillAccounting()
+	go s.backfillHarness()
 	return s, nil
 }
 
@@ -174,6 +175,8 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS machine TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS import_ref TEXT`,
 		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS shadowed BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS harness TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS client_mode TEXT NOT NULL DEFAULT ''`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS requests_import_ref_idx ON ` + s.table() + ` (import_ref) WHERE import_ref IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS requests_source_ts_idx ON ` + s.table() + ` (source, ts DESC)`,
 		`CREATE INDEX IF NOT EXISTS requests_key_ts_idx ON ` + s.table() + ` (api_key_hash, ts DESC)`,
@@ -270,7 +273,7 @@ var columnNames = []string{"ts", "request_id", "trace_id", "session_id", "provid
 	"status_code", "error", "latency_ms", "ttft_ms", "input_tokens", "output_tokens",
 	"reasoning_tokens", "cached_tokens", "cache_read", "cache_creation", "total_tokens",
 	"reasoning_effort", "service_tier", "uncached_input", "cache_write", "output_non_reasoning",
-	"accounting_quality", "source", "machine", "import_ref", "shadowed"}
+	"accounting_quality", "source", "machine", "import_ref", "shadowed", "harness", "client_mode"}
 
 func rowFields(r *Row) []any {
 	return []any{&r.TS, &r.RequestID, &r.TraceID, &r.SessionID, &r.Provider, &r.Executor,
@@ -279,7 +282,7 @@ func rowFields(r *Row) []any {
 		&r.StatusCode, &r.Error, &r.LatencyMs, &r.TTFTMs, &r.InputTokens, &r.OutputTokens,
 		&r.ReasoningTokens, &r.CachedTokens, &r.CacheRead, &r.CacheCreation, &r.TotalTokens,
 		&r.ReasoningEffort, &r.ServiceTier, &r.UncachedInput, &r.CacheWrite, &r.OutputNonReasoning,
-		&r.AccountingQuality, &r.Source, &r.Machine, &r.importRefPtr, &r.Shadowed}
+		&r.AccountingQuality, &r.Source, &r.Machine, &r.importRefPtr, &r.Shadowed, &r.Harness, &r.ClientMode}
 }
 
 var insertColumns = strings.Join(columnNames, ", ")
@@ -356,6 +359,45 @@ func (s *Store) DeleteImported(ctx context.Context, prefix string, keep []string
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// backfillHarness labels rows written before the harness columns existed. Rows are grouped by
+// (source, user_agent), which has few distinct values, and updated per group.
+func (s *Store) backfillHarness() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT source, user_agent FROM `+s.table()+` WHERE harness = ''`)
+	if err != nil {
+		log.WithError(err).Warn("tmx request log: harness backfill query failed")
+		return
+	}
+	type pair struct{ source, ua string }
+	var pairs []pair
+	for rows.Next() {
+		var p pair
+		if rows.Scan(&p.source, &p.ua) == nil {
+			pairs = append(pairs, p)
+		}
+	}
+	_ = rows.Close()
+	total := int64(0)
+	for _, p := range pairs {
+		harness, mode := HarnessFor(p.source, p.ua)
+		if harness == "" {
+			continue
+		}
+		res, errUp := s.db.ExecContext(ctx, `UPDATE `+s.table()+` SET harness = $1, client_mode = $2
+			WHERE harness = '' AND source = $3 AND user_agent = $4`, harness, mode, p.source, p.ua)
+		if errUp != nil {
+			log.WithError(errUp).Warn("tmx request log: harness backfill update failed")
+			return
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+	if total > 0 {
+		log.Infof("tmx request log: labelled %d rows with a harness", total)
+	}
 }
 
 // backfillAccounting fills the normalised columns for rows written before they existed, using

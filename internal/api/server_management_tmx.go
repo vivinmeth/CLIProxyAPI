@@ -152,6 +152,8 @@ func tmxFilter(c *gin.Context) (requestlog.Filter, bool) {
 		SessionID:       strings.TrimSpace(c.Query("session_id")),
 		APIKeyHash:      strings.TrimSpace(c.Query("api_key_hash")),
 		Machine:         strings.TrimSpace(c.Query("machine")),
+		Harness:         strings.TrimSpace(c.Query("harness")),
+		ClientMode:      strings.TrimSpace(c.Query("client_mode")),
 	}
 	if raw := strings.TrimSpace(c.Query("source")); raw != "" {
 		f.Sources = strings.Split(raw, ",")

@@ -61,3 +61,57 @@ func TestSessionTotalsAndSessionRollup(t *testing.T) {
 		t.Fatalf("rollup by session_id,model = %d cells, want 4", len(cube))
 	}
 }
+
+func TestHarnessColumnsWrittenAndGrouped(t *testing.T) {
+	dsn := os.Getenv("TMX_REQUESTLOG_TEST_DSN")
+	if dsn == "" {
+		t.Skip("TMX_REQUESTLOG_TEST_DSN not set")
+	}
+	ctx := context.Background()
+	schema := fmt.Sprintf("tmx_test_%d", time.Now().UnixNano())
+	store, err := Open(ctx, dsn, schema, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.db.Exec("DROP SCHEMA " + schema + " CASCADE")
+		store.Close()
+	})
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Minute)
+	if err = store.insert([]Row{
+		{TS: base, TraceID: "a", SessionID: "s1", Source: SourceProxy, UserAgent: "claude-cli/2.1.304 (external, sdk-ts, agent-sdk/0.3.276)", Outcome: OutcomeSuccess, TotalTokens: 10},
+		{TS: base, TraceID: "b", SessionID: "s2", Source: SourceProxy, UserAgent: "codex_exec/0.163.0 (Ubuntu)", Outcome: OutcomeSuccess, TotalTokens: 20},
+		{TS: base, TraceID: "c", SessionID: "s3", Source: "extern:opencode", UserAgent: "opencode/1.2", Outcome: OutcomeSuccess, TotalTokens: 30},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A row written before the columns existed is labelled by the backfill.
+	if _, err = store.db.Exec(`INSERT INTO `+store.table()+` (ts, trace_id, source, user_agent, outcome, total_tokens)
+		VALUES ($1, 'old', 'tmx-proxy', 'claude-cli/2.1.304 (external, cli)', 'success', 40)`, base); err != nil {
+		t.Fatal(err)
+	}
+	store.backfillHarness()
+	f := Filter{From: base.Add(-time.Minute), To: base.Add(time.Hour)}
+	cube, _, err := store.Rollup(ctx, f, "day", "UTC", []string{"harness", "client_mode"}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int64{}
+	for _, c := range cube {
+		got[c.Dims["harness"]+"/"+c.Dims["client_mode"]] = c.TotalTokens
+	}
+	want := map[string]int64{"claude-agent-sdk/sdk": 10, "codex/exec": 20, "opencode/": 30, "claude-code/cli": 40}
+	if len(got) != len(want) {
+		t.Fatalf("cube = %v", got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("cube = %v, want %v", got, want)
+		}
+	}
+	f.Harness = "codex"
+	sessions, err := store.SessionTotals(ctx, f, "", 10)
+	if err != nil || len(sessions) != 1 || sessions[0].SessionID != "s2" || sessions[0].Harnesses[0] != "codex" {
+		t.Fatalf("harness filter sessions = %+v %v", sessions, err)
+	}
+}
