@@ -22,6 +22,14 @@ but are **parked**. Don't work there; see `../wiki/parked-fork-clones.md`.)
   tier: unobserved credentials first, then soonest weekly reset, then already-passed resets. It
   bypasses the scheduler fast path on purpose. Details: `../wiki/routing-reset-soonest.md`.
 
+- **Request log** (`internal/tmx/requestlog/`): usage-plugin hook → buffered batch writes to
+  Postgres `tmx.requests` (outcomes success/failed/canceled, tokens incl. cache, latency, account,
+  client). Routes `GET /v8/management/tmx/requests[/summary]` in `internal/api/server_management_tmx.go`.
+  Upstream files only carry one-line hooks (`server_management_v8.go`, `cmd/server/main.go`).
+  Integration test needs `TMX_REQUESTLOG_TEST_DSN` (throwaway `postgres:18-alpine` container).
+  Details: `../wiki/observability-plan.md`.
+- Put new fork-only code under `internal/tmx/` and keep upstream-file edits to small hooks.
+
 ## Git
 
 - Identity is set locally (`Vivin Meth <vivinmeth@surkyl.com>`). Never change global git config.
