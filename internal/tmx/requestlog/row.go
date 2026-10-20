@@ -64,6 +64,55 @@ type Row struct {
 	TotalTokens     int64     `json:"total_tokens"`
 	ReasoningEffort string    `json:"reasoning_effort"`
 	ServiceTier     string    `json:"service_tier"`
+	// Normalised accounting (identical meaning for every provider and source):
+	// input total = uncached_input + cache_read + cache_write;
+	// output total = output_non_reasoning + reasoning_tokens (reasoning is part of output).
+	UncachedInput      int64  `json:"uncached_input"`
+	CacheWrite         int64  `json:"cache_write"`
+	OutputNonReasoning int64  `json:"output_non_reasoning"`
+	AccountingQuality  string `json:"accounting_quality"`
+	// Provenance: "tmx-proxy" for proxied calls, "extern:<harness>" for imported sessions.
+	Source    string `json:"source"`
+	Machine   string `json:"machine"`
+	ImportRef string `json:"import_ref,omitempty"`
+	// Shadowed rows duplicate traffic the proxy already recorded (an imported session that also
+	// went through the proxy); they are excluded from totals unless asked for.
+	Shadowed bool `json:"shadowed"`
+
+	importRefPtr *string // scan/insert target for the nullable import_ref column
+}
+
+// syncImportRef maps ImportRef to the nullable column (empty = NULL, so the unique index only
+// constrains imported rows).
+func (r *Row) syncImportRef() {
+	if r.ImportRef == "" {
+		r.importRefPtr = nil
+		return
+	}
+	ref := r.ImportRef
+	r.importRefPtr = &ref
+}
+
+func (r *Row) loadImportRef() {
+	if r.importRefPtr != nil {
+		r.ImportRef = *r.importRefPtr
+	}
+}
+
+// SourceProxy marks rows recorded by the proxy itself.
+const SourceProxy = "tmx-proxy"
+
+// applyBreakdown fills the normalised columns from upstream's v2 token accounting.
+func (r *Row) applyBreakdown(b coreusage.TokenBreakdown) {
+	r.UncachedInput = b.Input.UncachedTokens
+	r.CacheRead = b.Input.CacheReadTokens
+	r.CacheWrite = b.Input.CacheWriteTokens
+	r.OutputNonReasoning = b.Output.NonReasoningTokens
+	r.ReasoningTokens = b.Output.ReasoningTokens
+	r.AccountingQuality = string(b.Quality)
+	if b.TotalTokens > 0 {
+		r.TotalTokens = b.TotalTokens
+	}
 }
 
 // classify maps a usage record to success / failed / canceled. A client that goes away (Esc in
@@ -160,7 +209,8 @@ func rowFromRecord(ctx context.Context, record coreusage.Record) Row {
 		errText = truncate(record.Fail.Body, maxErrorLen)
 	}
 
-	return Row{
+	row := Row{
+		Source:          SourceProxy,
 		TS:              ts.UTC(),
 		RequestID:       strings.TrimSpace(record.RequestID),
 		TraceID:         traceID,
@@ -194,4 +244,8 @@ func rowFromRecord(ctx context.Context, record coreusage.Record) Row {
 		ReasoningEffort: effort,
 		ServiceTier:     tier,
 	}
+	// Raw provider-shaped columns above are kept as reported; the normalised ones come from
+	// upstream's accounting (cache_read and reasoning_tokens take its values).
+	row.applyBreakdown(detail.TokenBreakdown)
+	return row
 }

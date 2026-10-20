@@ -13,6 +13,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -116,6 +117,7 @@ func Open(ctx context.Context, dsn, schema string, retentionDays int) (*Store, e
 		return nil, errSchema
 	}
 	go s.run()
+	go s.backfillAccounting()
 	return s, nil
 }
 
@@ -163,6 +165,18 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS requests_auth_ts_idx ON ` + s.table() + ` (auth_id, ts DESC)`,
 		`CREATE INDEX IF NOT EXISTS requests_outcome_ts_idx ON ` + s.table() + ` (outcome, ts DESC)`,
 		`CREATE INDEX IF NOT EXISTS requests_session_idx ON ` + s.table() + ` (session_id, ts DESC) WHERE session_id <> ''`,
+		// v2: normalised accounting + provenance (imported sessions).
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS uncached_input BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS cache_write BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS output_non_reasoning BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS accounting_quality TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'tmx-proxy'`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS machine TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS import_ref TEXT`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS shadowed BOOLEAN NOT NULL DEFAULT FALSE`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS requests_import_ref_idx ON ` + s.table() + ` (import_ref) WHERE import_ref IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS requests_source_ts_idx ON ` + s.table() + ` (source, ts DESC)`,
+		`CREATE INDEX IF NOT EXISTS requests_key_ts_idx ON ` + s.table() + ` (api_key_hash, ts DESC)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -249,41 +263,137 @@ func (s *Store) run() {
 	}
 }
 
-const insertColumns = `ts, request_id, trace_id, session_id, provider, executor, model, alias,
-	response_model, auth_id, auth_index, auth_label, auth_type, api_key_hash, access_provider,
-	client_ip, user_agent, stream, outcome, status_code, error, latency_ms, ttft_ms, input_tokens,
-	output_tokens, reasoning_tokens, cached_tokens, cache_read, cache_creation, total_tokens,
-	reasoning_effort, service_tier`
+// columnNames and rowFields must stay in the same order; they drive insert and scan.
+var columnNames = []string{"ts", "request_id", "trace_id", "session_id", "provider", "executor",
+	"model", "alias", "response_model", "auth_id", "auth_index", "auth_label", "auth_type",
+	"api_key_hash", "access_provider", "client_ip", "user_agent", "stream", "outcome",
+	"status_code", "error", "latency_ms", "ttft_ms", "input_tokens", "output_tokens",
+	"reasoning_tokens", "cached_tokens", "cache_read", "cache_creation", "total_tokens",
+	"reasoning_effort", "service_tier", "uncached_input", "cache_write", "output_non_reasoning",
+	"accounting_quality", "source", "machine", "import_ref", "shadowed"}
 
-const insertColumnCount = 32
+func rowFields(r *Row) []any {
+	return []any{&r.TS, &r.RequestID, &r.TraceID, &r.SessionID, &r.Provider, &r.Executor,
+		&r.Model, &r.Alias, &r.ResponseModel, &r.AuthID, &r.AuthIndex, &r.AuthLabel, &r.AuthType,
+		&r.APIKeyHash, &r.AccessProvider, &r.ClientIP, &r.UserAgent, &r.Stream, &r.Outcome,
+		&r.StatusCode, &r.Error, &r.LatencyMs, &r.TTFTMs, &r.InputTokens, &r.OutputTokens,
+		&r.ReasoningTokens, &r.CachedTokens, &r.CacheRead, &r.CacheCreation, &r.TotalTokens,
+		&r.ReasoningEffort, &r.ServiceTier, &r.UncachedInput, &r.CacheWrite, &r.OutputNonReasoning,
+		&r.AccountingQuality, &r.Source, &r.Machine, &r.importRefPtr, &r.Shadowed}
+}
 
-func (s *Store) insert(rows []Row) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+var insertColumns = strings.Join(columnNames, ", ")
+
+// insertValues renders "($1,...),($n,...)" for n rows and returns the flattened args.
+func insertValues(rows []Row) (string, []any) {
 	var b strings.Builder
-	b.WriteString("INSERT INTO " + s.table() + " (" + insertColumns + ") VALUES ")
-	args := make([]any, 0, len(rows)*insertColumnCount)
-	for i, r := range rows {
+	args := make([]any, 0, len(rows)*len(columnNames))
+	for i := range rows {
+		r := &rows[i]
+		r.syncImportRef()
 		if i > 0 {
 			b.WriteString(",")
 		}
 		b.WriteString("(")
-		for c := 0; c < insertColumnCount; c++ {
+		for c := range columnNames {
 			if c > 0 {
 				b.WriteString(",")
 			}
-			fmt.Fprintf(&b, "$%d", i*insertColumnCount+c+1)
+			fmt.Fprintf(&b, "$%d", i*len(columnNames)+c+1)
 		}
 		b.WriteString(")")
-		args = append(args, r.TS, r.RequestID, r.TraceID, r.SessionID, r.Provider, r.Executor,
-			r.Model, r.Alias, r.ResponseModel, r.AuthID, r.AuthIndex, r.AuthLabel, r.AuthType,
-			r.APIKeyHash, r.AccessProvider, r.ClientIP, r.UserAgent, r.Stream, r.Outcome,
-			r.StatusCode, r.Error, r.LatencyMs, r.TTFTMs, r.InputTokens, r.OutputTokens,
-			r.ReasoningTokens, r.CachedTokens, r.CacheRead, r.CacheCreation, r.TotalTokens,
-			r.ReasoningEffort, r.ServiceTier)
+		args = append(args, rowFields(r)...)
 	}
-	_, err := s.db.ExecContext(ctx, b.String(), args...)
+	return b.String(), args
+}
+
+func (s *Store) insert(rows []Row) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	values, args := insertValues(rows)
+	_, err := s.db.ExecContext(ctx, "INSERT INTO "+s.table()+" ("+insertColumns+") VALUES "+values, args...)
 	return err
+}
+
+// UpsertImported writes usage rows derived from an imported session (source "extern:<harness>").
+// Rows are keyed by ImportRef, so re-importing a session updates them instead of adding copies.
+func (s *Store) UpsertImported(ctx context.Context, rows []Row) error {
+	if s == nil || len(rows) == 0 {
+		return nil
+	}
+	set := make([]string, 0, len(columnNames))
+	for _, c := range columnNames {
+		if c != "import_ref" {
+			set = append(set, c+" = EXCLUDED."+c)
+		}
+	}
+	for start := 0; start < len(rows); start += batchSize {
+		end := min(start+batchSize, len(rows))
+		values, args := insertValues(rows[start:end])
+		if _, err := s.db.ExecContext(ctx, "INSERT INTO "+s.table()+" ("+insertColumns+") VALUES "+values+
+			" ON CONFLICT (import_ref) WHERE import_ref IS NOT NULL DO UPDATE SET "+strings.Join(set, ", "),
+			args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// backfillAccounting fills the normalised columns for rows written before they existed, using
+// the same upstream accounting code as live rows.
+func (s *Store) backfillAccounting() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	total := 0
+	for {
+		rows, err := s.db.QueryContext(ctx, `SELECT id, provider, executor, input_tokens, output_tokens,
+			reasoning_tokens, cached_tokens, cache_read, cache_creation, total_tokens FROM `+s.table()+`
+			WHERE accounting_quality = '' AND source = 'tmx-proxy' ORDER BY id LIMIT 500`)
+		if err != nil {
+			log.WithError(err).Warn("tmx request log: accounting backfill query failed")
+			return
+		}
+		type item struct {
+			id  int64
+			row Row
+		}
+		var batch []item
+		for rows.Next() {
+			var it item
+			var provider, executor string
+			var d coreusage.Detail
+			if err = rows.Scan(&it.id, &provider, &executor, &d.InputTokens, &d.OutputTokens,
+				&d.ReasoningTokens, &d.CachedTokens, &d.CacheReadTokens, &d.CacheCreationTokens,
+				&d.TotalTokens); err != nil {
+				break
+			}
+			d = coreusage.EnsureTokenBreakdownForProvider(d, provider, executor)
+			it.row.applyBreakdown(d.TokenBreakdown)
+			if it.row.AccountingQuality == "" {
+				it.row.AccountingQuality = "unclassified"
+			}
+			batch = append(batch, it)
+		}
+		_ = rows.Close()
+		if err != nil || len(batch) == 0 {
+			break
+		}
+		for _, it := range batch {
+			r := it.row
+			if _, err = s.db.ExecContext(ctx, `UPDATE `+s.table()+` SET uncached_input = $2, cache_read = $3,
+				cache_write = $4, output_non_reasoning = $5, reasoning_tokens = $6,
+				accounting_quality = $7, total_tokens = GREATEST(total_tokens, $8) WHERE id = $1`,
+				it.id, r.UncachedInput, r.CacheRead, r.CacheWrite, r.OutputNonReasoning,
+				r.ReasoningTokens, r.AccountingQuality, r.TotalTokens); err != nil {
+				log.WithError(err).Warn("tmx request log: accounting backfill update failed")
+				return
+			}
+		}
+		total += len(batch)
+	}
+	if total > 0 {
+		log.Infof("tmx request log: backfilled normalised accounting for %d rows", total)
+	}
 }
 
 func (s *Store) prune() {
@@ -302,3 +412,9 @@ func (s *Store) prune() {
 		log.Infof("tmx request log: pruned %d rows older than %d days", n, s.retentionDays)
 	}
 }
+
+// DB exposes the handle for tests and maintenance tooling.
+func (s *Store) DB() *sql.DB { return s.db }
+
+// SetDefaultForTest replaces the running store (tests only).
+func SetDefaultForTest(s *Store) { current.Store(s) }

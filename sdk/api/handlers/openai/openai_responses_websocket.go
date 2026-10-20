@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/capture"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -282,7 +283,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	codexResponseSteering := false
 	if h != nil {
 		if cfg := h.CurrentConfig(); cfg != nil {
-			requestLogEnabled = cfg.RequestLog
+			requestLogEnabled = cfg.RequestLog || capture.Enabled()
 			codexResponseSteering = cfg.CodexResponseSteering
 		}
 	}

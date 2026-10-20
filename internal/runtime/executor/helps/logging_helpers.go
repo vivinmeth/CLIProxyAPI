@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/capture"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -58,7 +59,8 @@ type upstreamAttempt struct {
 }
 
 func requestLogCaptureEnabled(cfg *config.Config) bool {
-	return cfg != nil && cfg.RequestLog && !cfg.CommercialMode
+	// tokenmaxx fork: full capture (internal/tmx/capture) records upstream bodies like request-log.
+	return cfg != nil && (cfg.RequestLog || capture.Enabled()) && !cfg.CommercialMode
 }
 
 // RecordAPIRequest stores the upstream request metadata in Gin context for request logging.
@@ -70,7 +72,7 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 	if ginCtx == nil {
 		return
 	}
-	if !cfg.RequestLog {
+	if !cfg.RequestLog && !capture.Enabled() {
 		deferAPIRequest(ginCtx, info)
 		return
 	}

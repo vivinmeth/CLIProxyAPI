@@ -7,66 +7,125 @@ import (
 	"time"
 )
 
-// Prompt-cache accounting differs by provider: Anthropic reports cache reads/writes on top of
-// uncached input, OpenAI reports cached tokens as a subset of input. These expressions give
-// "prompt tokens" and "prompt tokens served from cache" on one scale for both.
-const (
-	sqlPromptTokens = `CASE WHEN provider = 'claude' THEN input_tokens + cache_read + cache_creation ELSE input_tokens END`
-	sqlCacheHits    = `CASE WHEN provider = 'claude' THEN cache_read ELSE GREATEST(cached_tokens, cache_read) END`
-)
+// Filter narrows every query. Empty fields don't filter.
+//
+// Sources: exact values ("tmx-proxy", "extern:claude-code") or "extern:*" for every imported
+// source; several may be given. Shadowed rows (imported traffic the proxy already counted) are
+// excluded unless IncludeShadowed is set.
+type Filter struct {
+	From            time.Time
+	To              time.Time
+	Sources         []string
+	IncludeShadowed bool
+	Outcome         string
+	Provider        string
+	AuthID          string
+	Model           string
+	SessionID       string
+	APIKeyHash      string
+	Machine         string
+}
 
-// Counts aggregates outcomes and tokens for a slice of rows.
+// where renders the WHERE clause; args start at $1.
+func (f Filter) where() (string, []any) {
+	conds := []string{"ts >= $1", "ts < $2"}
+	args := []any{f.From, f.To}
+	add := func(cond string, v any) {
+		args = append(args, v)
+		conds = append(conds, fmt.Sprintf(cond, len(args)))
+	}
+	if !f.IncludeShadowed {
+		conds = append(conds, "NOT shadowed")
+	}
+	if len(f.Sources) > 0 {
+		var parts []string
+		for _, src := range f.Sources {
+			src = strings.TrimSpace(src)
+			switch {
+			case src == "":
+			case src == "extern:*" || src == "extern":
+				parts = append(parts, "source LIKE 'extern:%'")
+			default:
+				args = append(args, src)
+				parts = append(parts, fmt.Sprintf("source = $%d", len(args)))
+			}
+		}
+		if len(parts) > 0 {
+			conds = append(conds, "("+strings.Join(parts, " OR ")+")")
+		}
+	}
+	for _, kv := range []struct{ col, v string }{
+		{"outcome", f.Outcome}, {"provider", f.Provider}, {"auth_id", f.AuthID}, {"model", f.Model},
+		{"session_id", f.SessionID}, {"api_key_hash", f.APIKeyHash}, {"machine", f.Machine},
+	} {
+		if kv.v != "" {
+			add(kv.col+" = $%d", kv.v)
+		}
+	}
+	return " WHERE " + strings.Join(conds, " AND "), args
+}
+
+// Counts aggregates outcomes and tokens. Token fields use the normalised accounting: prompt
+// tokens = uncached_input + cache_read + cache_write, cache hits = cache_read, output =
+// output_non_reasoning + reasoning_tokens.
 type Counts struct {
-	Attempts        int64   `json:"attempts"`
-	Requests        int64   `json:"requests"`
-	Success         int64   `json:"success"`
-	Failed          int64   `json:"failed"`
-	Canceled        int64   `json:"canceled"`
-	InputTokens     int64   `json:"input_tokens"`
-	OutputTokens    int64   `json:"output_tokens"`
-	ReasoningTokens int64   `json:"reasoning_tokens"`
-	CacheRead       int64   `json:"cache_read"`
-	CacheCreation   int64   `json:"cache_creation"`
-	CachedTokens    int64   `json:"cached_tokens"`
-	TotalTokens     int64   `json:"total_tokens"`
-	PromptTokens    int64   `json:"prompt_tokens"`
-	CacheHitTokens  int64   `json:"cache_hit_tokens"`
-	CacheHitRatio   float64 `json:"cache_hit_ratio"`
-	AvgLatencyMs    float64 `json:"avg_latency_ms"`
-	P50TTFTMs       float64 `json:"p50_ttft_ms"`
-	P95TTFTMs       float64 `json:"p95_ttft_ms"`
+	Attempts           int64   `json:"attempts"`
+	Requests           int64   `json:"requests"`
+	Success            int64   `json:"success"`
+	Failed             int64   `json:"failed"`
+	Canceled           int64   `json:"canceled"`
+	UncachedInput      int64   `json:"uncached_input"`
+	CacheRead          int64   `json:"cache_read"`
+	CacheWrite         int64   `json:"cache_write"`
+	OutputNonReasoning int64   `json:"output_non_reasoning"`
+	ReasoningTokens    int64   `json:"reasoning_tokens"`
+	OutputTokens       int64   `json:"output_tokens"`
+	PromptTokens       int64   `json:"prompt_tokens"`
+	TotalTokens        int64   `json:"total_tokens"`
+	CacheHitTokens     int64   `json:"cache_hit_tokens"`
+	CacheHitRatio      float64 `json:"cache_hit_ratio"`
+	Incomplete         int64   `json:"incomplete_accounting"`
+	AvgLatencyMs       float64 `json:"avg_latency_ms"`
+	P50TTFTMs          float64 `json:"p50_ttft_ms"`
+	P95TTFTMs          float64 `json:"p95_ttft_ms"`
+	// Deprecated aliases kept for the v1 UI: input_tokens = prompt tokens,
+	// cache_creation = cache_write.
+	InputTokens   int64 `json:"input_tokens"`
+	CacheCreation int64 `json:"cache_creation"`
+	CachedTokens  int64 `json:"cached_tokens"`
 }
 
 const countsSelect = `
 	count(*),
-	count(DISTINCT COALESCE(NULLIF(trace_id, ''), request_id)),
+	count(DISTINCT COALESCE(NULLIF(trace_id, ''), NULLIF(request_id, ''), import_ref)),
 	count(*) FILTER (WHERE outcome = 'success'),
 	count(*) FILTER (WHERE outcome = 'failed'),
 	count(*) FILTER (WHERE outcome = 'canceled'),
-	COALESCE(sum(input_tokens), 0),
-	COALESCE(sum(output_tokens), 0),
-	COALESCE(sum(reasoning_tokens), 0),
+	COALESCE(sum(uncached_input), 0),
 	COALESCE(sum(cache_read), 0),
-	COALESCE(sum(cache_creation), 0),
-	COALESCE(sum(cached_tokens), 0),
+	COALESCE(sum(cache_write), 0),
+	COALESCE(sum(output_non_reasoning), 0),
+	COALESCE(sum(reasoning_tokens), 0),
 	COALESCE(sum(total_tokens), 0),
-	COALESCE(sum(` + sqlPromptTokens + `), 0),
-	COALESCE(sum(` + sqlCacheHits + `), 0),
-	COALESCE(avg(latency_ms) FILTER (WHERE outcome = 'success'), 0),
+	count(*) FILTER (WHERE accounting_quality NOT IN ('complete', '')),
+	COALESCE(avg(latency_ms) FILTER (WHERE outcome = 'success' AND latency_ms > 0), 0),
 	COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY ttft_ms) FILTER (WHERE outcome = 'success' AND ttft_ms > 0), 0),
 	COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY ttft_ms) FILTER (WHERE outcome = 'success' AND ttft_ms > 0), 0)`
 
 func (c *Counts) scanTargets() []any {
-	return []any{&c.Attempts, &c.Requests, &c.Success, &c.Failed, &c.Canceled, &c.InputTokens,
-		&c.OutputTokens, &c.ReasoningTokens, &c.CacheRead, &c.CacheCreation, &c.CachedTokens,
-		&c.TotalTokens, &c.PromptTokens, &c.CacheHitTokens, &c.AvgLatencyMs, &c.P50TTFTMs,
-		&c.P95TTFTMs}
+	return []any{&c.Attempts, &c.Requests, &c.Success, &c.Failed, &c.Canceled, &c.UncachedInput,
+		&c.CacheRead, &c.CacheWrite, &c.OutputNonReasoning, &c.ReasoningTokens, &c.TotalTokens,
+		&c.Incomplete, &c.AvgLatencyMs, &c.P50TTFTMs, &c.P95TTFTMs}
 }
 
 func (c *Counts) finish() {
+	c.PromptTokens = c.UncachedInput + c.CacheRead + c.CacheWrite
+	c.OutputTokens = c.OutputNonReasoning + c.ReasoningTokens
+	c.CacheHitTokens = c.CacheRead
 	if c.PromptTokens > 0 {
 		c.CacheHitRatio = float64(c.CacheHitTokens) / float64(c.PromptTokens)
 	}
+	c.InputTokens, c.CacheCreation, c.CachedTokens = c.PromptTokens, c.CacheWrite, c.CacheRead
 }
 
 // Bucket is one time slice of the summary series.
@@ -75,7 +134,7 @@ type Bucket struct {
 	Counts
 }
 
-// Group is a per-account or per-model breakdown row.
+// Group is a breakdown row.
 type Group struct {
 	Key      string `json:"key"`
 	Label    string `json:"label"`
@@ -83,8 +142,8 @@ type Group struct {
 	Counts
 }
 
-// Sessions summarises session affinity: how many client sessions were seen and how many were
-// served by more than one account (each switch costs a prompt-cache rebuild).
+// Sessions summarises session affinity: sessions seen, and how many were served by more than
+// one account (each switch costs a prompt-cache rebuild).
 type Sessions struct {
 	Total     int64 `json:"total"`
 	MultiAuth int64 `json:"multi_auth"`
@@ -99,26 +158,29 @@ type Summary struct {
 	Buckets       []Bucket         `json:"buckets"`
 	ByAuth        []Group          `json:"by_auth"`
 	ByModel       []Group          `json:"by_model"`
+	BySource      []Group          `json:"by_source"`
 	Sessions      Sessions         `json:"sessions"`
 	Writer        map[string]int64 `json:"writer"`
 }
 
-// Summarize aggregates rows with ts in [from, to).
-func (s *Store) Summarize(ctx context.Context, from, to time.Time, bucket time.Duration) (*Summary, error) {
+// Summarize aggregates rows matching f.
+func (s *Store) Summarize(ctx context.Context, f Filter, bucket time.Duration) (*Summary, error) {
 	if bucket < time.Minute {
 		bucket = time.Minute
 	}
-	out := &Summary{From: from, To: to, BucketSeconds: int64(bucket.Seconds()), Writer: s.Stats()}
-	where := ` FROM ` + s.table() + ` WHERE ts >= $1 AND ts < $2`
+	out := &Summary{From: f.From, To: f.To, BucketSeconds: int64(bucket.Seconds()), Writer: s.Stats()}
+	where, args := f.where()
+	from := ` FROM ` + s.table() + where
 
-	if err := s.db.QueryRowContext(ctx, `SELECT`+countsSelect+where, from, to).
+	if err := s.db.QueryRowContext(ctx, `SELECT`+countsSelect+from, args...).
 		Scan(out.Totals.scanTargets()...); err != nil {
 		return nil, fmt.Errorf("totals: %w", err)
 	}
 	out.Totals.finish()
 
-	rows, err := s.db.QueryContext(ctx, `SELECT date_bin(make_interval(secs => $3), ts, $1) AS b,`+
-		countsSelect+where+` GROUP BY b ORDER BY b`, from, to, bucket.Seconds())
+	bucketArg := len(args) + 1
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`SELECT date_bin(make_interval(secs => $%d), ts, $1) AS b,`,
+		bucketArg)+countsSelect+from+` GROUP BY b ORDER BY b`, append(args, bucket.Seconds())...)
 	if err != nil {
 		return nil, fmt.Errorf("buckets: %w", err)
 	}
@@ -133,25 +195,26 @@ func (s *Store) Summarize(ctx context.Context, from, to time.Time, bucket time.D
 	}
 	_ = rows.Close()
 
-	if out.ByAuth, err = s.groups(ctx, where, from, to,
-		`auth_id`, `max(auth_label)`); err != nil {
+	if out.ByAuth, err = s.groups(ctx, from, args, `auth_id`, `max(auth_label)`); err != nil {
 		return nil, fmt.Errorf("by auth: %w", err)
 	}
-	if out.ByModel, err = s.groups(ctx, where, from, to, `model`, `max(model)`); err != nil {
+	if out.ByModel, err = s.groups(ctx, from, args, `model`, `max(model)`); err != nil {
 		return nil, fmt.Errorf("by model: %w", err)
 	}
-
+	if out.BySource, err = s.groups(ctx, from, args, `source`, `max(source)`); err != nil {
+		return nil, fmt.Errorf("by source: %w", err)
+	}
 	if err = s.db.QueryRowContext(ctx, `SELECT count(*), count(*) FILTER (WHERE auths > 1) FROM (
-		SELECT session_id, count(DISTINCT auth_id) AS auths`+where+` AND session_id <> ''
-		GROUP BY session_id) s`, from, to).Scan(&out.Sessions.Total, &out.Sessions.MultiAuth); err != nil {
+		SELECT session_id, count(DISTINCT auth_id) AS auths`+from+` AND session_id <> ''
+		GROUP BY session_id) s`, args...).Scan(&out.Sessions.Total, &out.Sessions.MultiAuth); err != nil {
 		return nil, fmt.Errorf("sessions: %w", err)
 	}
 	return out, nil
 }
 
-func (s *Store) groups(ctx context.Context, where string, from, to time.Time, keyExpr, labelExpr string) ([]Group, error) {
+func (s *Store) groups(ctx context.Context, from string, args []any, keyExpr, labelExpr string) ([]Group, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+keyExpr+`, `+labelExpr+`, max(provider),`+
-		countsSelect+where+` GROUP BY `+keyExpr+` ORDER BY count(*) DESC LIMIT 100`, from, to)
+		countsSelect+from+` GROUP BY `+keyExpr+` ORDER BY count(*) DESC LIMIT 100`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -168,19 +231,6 @@ func (s *Store) groups(ctx context.Context, where string, from, to time.Time, ke
 	return out, rows.Err()
 }
 
-// ListFilter selects rows for the list endpoint. Empty fields don't filter.
-type ListFilter struct {
-	From      time.Time
-	To        time.Time
-	Outcome   string
-	Provider  string
-	AuthID    string
-	Model     string
-	SessionID string
-	BeforeID  int64
-	Limit     int
-}
-
 // Item is one row as returned by the list endpoint.
 type Item struct {
 	ID int64 `json:"id"`
@@ -188,38 +238,18 @@ type Item struct {
 }
 
 // List returns rows newest first, paged by id.
-func (s *Store) List(ctx context.Context, f ListFilter) ([]Item, error) {
-	if f.Limit <= 0 || f.Limit > 500 {
-		f.Limit = 100
+func (s *Store) List(ctx context.Context, f Filter, beforeID int64, limit int) ([]Item, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
 	}
-	conds := []string{"ts >= $1", "ts < $2"}
-	args := []any{f.From, f.To}
-	add := func(cond string, v any) {
-		args = append(args, v)
-		conds = append(conds, fmt.Sprintf(cond, len(args)))
+	where, args := f.where()
+	if beforeID > 0 {
+		args = append(args, beforeID)
+		where += fmt.Sprintf(" AND id < $%d", len(args))
 	}
-	if f.Outcome != "" {
-		add("outcome = $%d", f.Outcome)
-	}
-	if f.Provider != "" {
-		add("provider = $%d", f.Provider)
-	}
-	if f.AuthID != "" {
-		add("auth_id = $%d", f.AuthID)
-	}
-	if f.Model != "" {
-		add("model = $%d", f.Model)
-	}
-	if f.SessionID != "" {
-		add("session_id = $%d", f.SessionID)
-	}
-	if f.BeforeID > 0 {
-		add("id < $%d", f.BeforeID)
-	}
-	args = append(args, f.Limit)
-	q := `SELECT id, ` + insertColumns + ` FROM ` + s.table() + ` WHERE ` +
-		strings.Join(conds, " AND ") + fmt.Sprintf(` ORDER BY id DESC LIMIT $%d`, len(args))
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, `+insertColumns+` FROM `+s.table()+where+
+		fmt.Sprintf(` ORDER BY id DESC LIMIT $%d`, len(args)), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -227,16 +257,96 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]Item, error) {
 	items := []Item{}
 	for rows.Next() {
 		var it Item
-		r := &it.Row
-		if errScan := rows.Scan(&it.ID, &r.TS, &r.RequestID, &r.TraceID, &r.SessionID, &r.Provider,
-			&r.Executor, &r.Model, &r.Alias, &r.ResponseModel, &r.AuthID, &r.AuthIndex, &r.AuthLabel,
-			&r.AuthType, &r.APIKeyHash, &r.AccessProvider, &r.ClientIP, &r.UserAgent, &r.Stream,
-			&r.Outcome, &r.StatusCode, &r.Error, &r.LatencyMs, &r.TTFTMs, &r.InputTokens,
-			&r.OutputTokens, &r.ReasoningTokens, &r.CachedTokens, &r.CacheRead, &r.CacheCreation,
-			&r.TotalTokens, &r.ReasoningEffort, &r.ServiceTier); errScan != nil {
+		if errScan := rows.Scan(append([]any{&it.ID}, rowFields(&it.Row)...)...); errScan != nil {
 			return nil, errScan
 		}
+		it.loadImportRef()
 		items = append(items, it)
 	}
 	return items, rows.Err()
+}
+
+// RollupDims are the dimensions a rollup may group by.
+var RollupDims = map[string]bool{
+	"source": true, "provider": true, "model": true, "response_model": true, "auth_id": true,
+	"api_key_hash": true, "machine": true, "outcome": true, "accounting_quality": true,
+}
+
+// RollupRow is one cell of the rollup cube.
+type RollupRow struct {
+	Start    time.Time         `json:"start"`
+	Dims     map[string]string `json:"dims"`
+	Attempts int64             `json:"attempts"`
+	Success  int64             `json:"success"`
+	Failed   int64             `json:"failed"`
+	Canceled int64             `json:"canceled"`
+	// Normalised tokens; see Counts.
+	UncachedInput      int64 `json:"uncached_input"`
+	CacheRead          int64 `json:"cache_read"`
+	CacheWrite         int64 `json:"cache_write"`
+	OutputNonReasoning int64 `json:"output_non_reasoning"`
+	ReasoningTokens    int64 `json:"reasoning_tokens"`
+	TotalTokens        int64 `json:"total_tokens"`
+	Incomplete         int64 `json:"incomplete_accounting"`
+}
+
+// Rollup groups rows into calendar buckets ("hour" or "day") in time zone tz, by dims.
+// Buckets start at local midnight / local hour boundaries (IST is +05:30, so its hours differ
+// from UTC hours).
+func (s *Store) Rollup(ctx context.Context, f Filter, unit, tz string, dims []string, maxRows int) ([]RollupRow, bool, error) {
+	if unit != "hour" && unit != "day" {
+		return nil, false, fmt.Errorf("bucket must be 1h or 1d")
+	}
+	for _, d := range dims {
+		if !RollupDims[d] {
+			return nil, false, fmt.Errorf("unknown dim %q", d)
+		}
+	}
+	where, args := f.where()
+	args = append(args, tz)
+	tzArg := len(args)
+	bucketExpr := fmt.Sprintf("(date_trunc('%s', ts AT TIME ZONE $%d) AT TIME ZONE $%d)", unit, tzArg, tzArg)
+	cols := []string{bucketExpr + " AS b"}
+	group := []string{"b"}
+	for _, d := range dims {
+		cols = append(cols, d)
+		group = append(group, d)
+	}
+	args = append(args, maxRows+1)
+	q := `SELECT ` + strings.Join(cols, ", ") + `,
+		count(*), count(*) FILTER (WHERE outcome = 'success'), count(*) FILTER (WHERE outcome = 'failed'),
+		count(*) FILTER (WHERE outcome = 'canceled'), COALESCE(sum(uncached_input), 0), COALESCE(sum(cache_read), 0),
+		COALESCE(sum(cache_write), 0), COALESCE(sum(output_non_reasoning), 0), COALESCE(sum(reasoning_tokens), 0),
+		COALESCE(sum(total_tokens), 0), count(*) FILTER (WHERE accounting_quality NOT IN ('complete', ''))
+		FROM ` + s.table() + where + ` GROUP BY ` + strings.Join(group, ", ") +
+		` ORDER BY ` + strings.Join(group, ", ") + fmt.Sprintf(` LIMIT $%d`, len(args))
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := []RollupRow{}
+	for rows.Next() {
+		var r RollupRow
+		vals := make([]string, len(dims))
+		targets := []any{&r.Start}
+		for i := range vals {
+			targets = append(targets, &vals[i])
+		}
+		targets = append(targets, &r.Attempts, &r.Success, &r.Failed, &r.Canceled, &r.UncachedInput,
+			&r.CacheRead, &r.CacheWrite, &r.OutputNonReasoning, &r.ReasoningTokens, &r.TotalTokens, &r.Incomplete)
+		if err = rows.Scan(targets...); err != nil {
+			return nil, false, err
+		}
+		r.Dims = make(map[string]string, len(dims))
+		for i, d := range dims {
+			r.Dims[d] = vals[i]
+		}
+		out = append(out, r)
+	}
+	truncated := len(out) > maxRows
+	if truncated {
+		out = out[:maxRows]
+	}
+	return out, truncated, rows.Err()
 }

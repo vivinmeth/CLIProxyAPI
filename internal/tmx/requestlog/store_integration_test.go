@@ -27,16 +27,16 @@ func TestStoreRoundTrip(t *testing.T) {
 
 	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Minute)
 	rows := []Row{
-		{TS: base, TraceID: "t1", SessionID: "s1", Provider: "claude", Model: "opus", AuthID: "a", AuthLabel: "a@x", Outcome: OutcomeSuccess, InputTokens: 10, CacheRead: 90, CacheCreation: 0, OutputTokens: 5, LatencyMs: 1000, TTFTMs: 200},
+		{TS: base, TraceID: "t1", SessionID: "s1", Provider: "claude", Model: "opus", AuthID: "a", AuthLabel: "a@x", Outcome: OutcomeSuccess, UncachedInput: 10, CacheRead: 90, OutputNonReasoning: 5, LatencyMs: 1000, TTFTMs: 200},
 		{TS: base.Add(time.Minute), TraceID: "t2", SessionID: "s1", Provider: "claude", Model: "opus", AuthID: "b", AuthLabel: "b@x", Outcome: OutcomeCanceled, StatusCode: 499},
-		{TS: base.Add(2 * time.Minute), TraceID: "t3", SessionID: "s2", Provider: "codex", Model: "gpt", AuthID: "c", AuthLabel: "c@x", Outcome: OutcomeFailed, StatusCode: 429, Error: "rate limited", InputTokens: 100, CachedTokens: 40},
-		{TS: base.Add(3 * time.Minute), TraceID: "t3", SessionID: "s2", Provider: "codex", Model: "gpt", AuthID: "c", AuthLabel: "c@x", Outcome: OutcomeSuccess, InputTokens: 100, CachedTokens: 60, LatencyMs: 3000, TTFTMs: 400},
+		{TS: base.Add(2 * time.Minute), TraceID: "t3", SessionID: "s2", Provider: "codex", Model: "gpt", AuthID: "c", AuthLabel: "c@x", Outcome: OutcomeFailed, StatusCode: 429, Error: "rate limited", UncachedInput: 60, CacheRead: 40},
+		{TS: base.Add(3 * time.Minute), TraceID: "t3", SessionID: "s2", Provider: "codex", Model: "gpt", AuthID: "c", AuthLabel: "c@x", Outcome: OutcomeSuccess, UncachedInput: 40, CacheRead: 60, LatencyMs: 3000, TTFTMs: 400},
 	}
 	if err := store.insert(rows); err != nil {
 		t.Fatal(err)
 	}
 
-	sum, err := store.Summarize(ctx, base.Add(-time.Minute), base.Add(10*time.Minute), 5*time.Minute)
+	sum, err := store.Summarize(ctx, Filter{From: base.Add(-time.Minute), To: base.Add(10 * time.Minute)}, 5*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestStoreRoundTrip(t *testing.T) {
 	if tot.Attempts != 4 || tot.Requests != 3 || tot.Success != 2 || tot.Failed != 1 || tot.Canceled != 1 {
 		t.Fatalf("totals = %+v", tot)
 	}
-	// prompt: claude 10+90 (+0), codex 100+100 = 300; hits: 90 + 40 + 60 = 190
+	// prompt = uncached + cache_read + cache_write = 300; hits = cache_read = 190
 	if tot.PromptTokens != 300 || tot.CacheHitTokens != 190 {
 		t.Fatalf("cache = prompt %d hits %d", tot.PromptTokens, tot.CacheHitTokens)
 	}
@@ -55,18 +55,18 @@ func TestStoreRoundTrip(t *testing.T) {
 		t.Fatalf("groups auth=%d model=%d buckets=%d", len(sum.ByAuth), len(sum.ByModel), len(sum.Buckets))
 	}
 
-	items, err := store.List(ctx, ListFilter{From: base.Add(-time.Minute), To: base.Add(time.Hour), Outcome: OutcomeFailed})
+	items, err := store.List(ctx, Filter{From: base.Add(-time.Minute), To: base.Add(time.Hour), Outcome: OutcomeFailed}, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(items) != 1 || items[0].Error != "rate limited" || items[0].StatusCode != 429 {
 		t.Fatalf("failed items = %+v", items)
 	}
-	page, err := store.List(ctx, ListFilter{From: base.Add(-time.Minute), To: base.Add(time.Hour), Limit: 2})
+	page, err := store.List(ctx, Filter{From: base.Add(-time.Minute), To: base.Add(time.Hour)}, 0, 2)
 	if err != nil || len(page) != 2 {
 		t.Fatalf("page = %d, %v", len(page), err)
 	}
-	rest, err := store.List(ctx, ListFilter{From: base.Add(-time.Minute), To: base.Add(time.Hour), BeforeID: page[1].ID})
+	rest, err := store.List(ctx, Filter{From: base.Add(-time.Minute), To: base.Add(time.Hour)}, page[1].ID, 0)
 	if err != nil || len(rest) != 2 {
 		t.Fatalf("rest = %d, %v", len(rest), err)
 	}

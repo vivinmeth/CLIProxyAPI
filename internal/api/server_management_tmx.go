@@ -3,12 +3,14 @@ package api
 // tokenmaxx fork: management routes for the persistent request log (internal/tmx/requestlog).
 
 import (
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/archive"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
 )
 
@@ -17,6 +19,8 @@ const tmxMaxSummaryRange = 400 * 24 * time.Hour
 func registerTMXManagementRoutes(v8 *gin.RouterGroup) {
 	v8.GET("/tmx/requests/summary", tmxRequestSummary)
 	v8.GET("/tmx/requests", tmxRequestList)
+	v8.GET("/tmx/requests/rollup", tmxRequestRollup)
+	registerTMXArchiveRoutes(v8)
 }
 
 // tmxRange parses from/to (unix seconds) with a default of the last 24 hours.
@@ -58,17 +62,41 @@ func defaultBucket(span time.Duration) time.Duration {
 	return 7 * 24 * time.Hour
 }
 
+// tmxFilter reads the shared filter query parameters.
+func tmxFilter(c *gin.Context) (requestlog.Filter, bool) {
+	from, to, ok := tmxRange(c)
+	if !ok {
+		return requestlog.Filter{}, false
+	}
+	f := requestlog.Filter{
+		From:            from,
+		To:              to,
+		IncludeShadowed: c.Query("include_shadowed") == "1" || c.Query("include_shadowed") == "true",
+		Outcome:         strings.TrimSpace(c.Query("outcome")),
+		Provider:        strings.TrimSpace(c.Query("provider")),
+		AuthID:          strings.TrimSpace(c.Query("auth_id")),
+		Model:           strings.TrimSpace(c.Query("model")),
+		SessionID:       strings.TrimSpace(c.Query("session_id")),
+		APIKeyHash:      strings.TrimSpace(c.Query("api_key_hash")),
+		Machine:         strings.TrimSpace(c.Query("machine")),
+	}
+	if raw := strings.TrimSpace(c.Query("source")); raw != "" {
+		f.Sources = strings.Split(raw, ",")
+	}
+	return f, true
+}
+
 func tmxRequestSummary(c *gin.Context) {
 	store := requestlog.Default()
 	if store == nil {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
 		return
 	}
-	from, to, ok := tmxRange(c)
+	f, ok := tmxFilter(c)
 	if !ok {
 		return
 	}
-	bucket := defaultBucket(to.Sub(from))
+	bucket := defaultBucket(f.To.Sub(f.From))
 	if raw := strings.TrimSpace(c.Query("bucket")); raw != "" {
 		n, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || n < 60 {
@@ -76,12 +104,12 @@ func tmxRequestSummary(c *gin.Context) {
 			return
 		}
 		bucket = time.Duration(n) * time.Second
-		if to.Sub(from)/bucket > 2000 {
+		if f.To.Sub(f.From)/bucket > 2000 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "too many buckets"})
 			return
 		}
 	}
-	summary, err := store.Summarize(c.Request.Context(), from, to, bucket)
+	summary, err := store.Summarize(c.Request.Context(), f, bucket)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -95,35 +123,53 @@ func tmxRequestList(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"enabled": false, "items": []any{}})
 		return
 	}
-	from, to, ok := tmxRange(c)
+	f, ok := tmxFilter(c)
 	if !ok {
 		return
 	}
-	f := requestlog.ListFilter{
-		From:      from,
-		To:        to,
-		Outcome:   strings.TrimSpace(c.Query("outcome")),
-		Provider:  strings.TrimSpace(c.Query("provider")),
-		AuthID:    strings.TrimSpace(c.Query("auth_id")),
-		Model:     strings.TrimSpace(c.Query("model")),
-		SessionID: strings.TrimSpace(c.Query("session_id")),
-	}
-	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
-		f.Limit, _ = strconv.Atoi(raw)
-	}
-	if raw := strings.TrimSpace(c.Query("before_id")); raw != "" {
-		f.BeforeID, _ = strconv.ParseInt(raw, 10, 64)
-	}
-	items, err := store.List(c.Request.Context(), f)
+	limit, _ := strconv.Atoi(strings.TrimSpace(c.Query("limit")))
+	beforeID, _ := strconv.ParseInt(strings.TrimSpace(c.Query("before_id")), 10, 64)
+	items, err := store.List(c.Request.Context(), f, beforeID, limit)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	next := int64(0)
-	if len(items) > 0 && len(items) == normalizedLimit(f.Limit) {
+	if len(items) > 0 && len(items) == normalizedLimit(limit) {
 		next = items[len(items)-1].ID
 	}
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "items": items, "next_before_id": next})
+}
+
+// tmxRequestRollup: GET /tmx/requests/rollup?from&to&bucket=1h|1d&tz=Asia/Kolkata&dims=a,b
+// plus the shared filters. Returns at most 50k cells; "truncated" tells the caller to narrow.
+func tmxRequestRollup(c *gin.Context) {
+	store := requestlog.Default()
+	if store == nil {
+		c.JSON(http.StatusOK, gin.H{"enabled": false, "rows": []any{}})
+		return
+	}
+	f, ok := tmxFilter(c)
+	if !ok {
+		return
+	}
+	unit := map[string]string{"1h": "hour", "hour": "hour", "1d": "day", "day": "day"}[strings.TrimSpace(c.DefaultQuery("bucket", "1d"))]
+	tz := strings.TrimSpace(c.DefaultQuery("tz", "UTC"))
+	if _, err := time.LoadLocation(tz); err != nil || unit == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bucket must be 1h or 1d and tz a valid IANA zone"})
+		return
+	}
+	var dims []string
+	if raw := strings.TrimSpace(c.Query("dims")); raw != "" {
+		dims = strings.Split(raw, ",")
+	}
+	rows, truncated, err := store.Rollup(c.Request.Context(), f, unit, tz, dims, 50000)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "bucket": unit, "tz": tz, "dims": dims,
+		"rows": rows, "truncated": truncated})
 }
 
 func normalizedLimit(n int) int {
@@ -131,4 +177,170 @@ func normalizedLimit(n int) int {
 		return 100
 	}
 	return n
+}
+
+// ---- archive (internal/tmx/archive): full exchange capture + session ingest ----
+
+const tmxMaxBlobBytes = 512 << 20
+
+func registerTMXArchiveRoutes(v8 *gin.RouterGroup) {
+	g := v8.Group("/tmx/archive")
+	g.GET("/status", tmxArchive(func(c *gin.Context, a *archive.Archive) {
+		c.JSON(http.StatusOK, gin.H{"enabled": true, "stats": a.Stats()})
+	}))
+	g.POST("/blobs/missing", tmxArchive(tmxBlobsMissing))
+	g.PUT("/blobs/:hash", tmxArchive(tmxBlobPut))
+	g.GET("/blobs/:hash", tmxArchive(tmxBlobGet))
+	g.PUT("/sessions", tmxArchive(tmxSessionIngest))
+	g.GET("/sessions", tmxArchive(tmxSessionList))
+	g.GET("/sessions/*id", tmxArchive(tmxSessionGet))
+	g.GET("/exchanges", tmxArchive(tmxExchangeList))
+	g.GET("/exchanges/:trace", tmxArchive(tmxExchangeGet))
+}
+
+func tmxArchive(h func(*gin.Context, *archive.Archive)) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		a := archive.Default()
+		if a == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"enabled": false, "error": "archive is off (TMX_ARCHIVE)"})
+			return
+		}
+		h(c, a)
+	}
+}
+
+func tmxBlobsMissing(c *gin.Context, a *archive.Archive) {
+	var body struct {
+		Hashes []string `json:"hashes"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || len(body.Hashes) > 10000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {\"hashes\": [sha256...]} (max 10000)"})
+		return
+	}
+	for _, h := range body.Hashes {
+		if !archive.ValidHash(h) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid hash " + h})
+			return
+		}
+	}
+	missing, err := a.Blobs().Missing(c.Request.Context(), body.Hashes)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"missing": missing})
+}
+
+func tmxBlobPut(c *gin.Context, a *archive.Archive) {
+	hash := strings.ToLower(c.Param("hash"))
+	if !archive.ValidHash(hash) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "path must be the sha256 hex of the body"})
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(c.Request.Body, tmxMaxBlobBytes+1))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if len(data) > tmxMaxBlobBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "blob larger than 512 MiB; split it"})
+		return
+	}
+	if got := archive.HashOf(data); got != hash {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "sha256 mismatch", "got": got})
+		return
+	}
+	kind := strings.TrimSpace(c.GetHeader("X-Tmx-Blob-Kind"))
+	if kind == "" {
+		kind = "import.source"
+	}
+	if _, err = a.Blobs().Put(c.Request.Context(), data, c.ContentType(), kind); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"hash": hash, "size": len(data)})
+}
+
+func tmxBlobGet(c *gin.Context, a *archive.Archive) {
+	hash := strings.ToLower(c.Param("hash"))
+	data, err := a.Blobs().Get(c.Request.Context(), hash)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	mt := a.Blobs().MediaType(c.Request.Context(), hash)
+	if mt == "" {
+		mt = "application/octet-stream"
+	}
+	c.Data(http.StatusOK, mt, data)
+}
+
+func tmxSessionIngest(c *gin.Context, a *archive.Archive) {
+	var in archive.SessionIngest
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	res, err := a.IngestSession(c.Request.Context(), in)
+	if err != nil {
+		status := http.StatusBadRequest
+		if res != nil && len(res.MissingBlobs) > 0 {
+			status = http.StatusConflict
+		}
+		c.JSON(status, gin.H{"error": err.Error(), "result": res})
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+func tmxSessionList(c *gin.Context, a *archive.Archive) {
+	since := time.Unix(0, 0)
+	if raw := strings.TrimSpace(c.Query("since")); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "since must be unix seconds"})
+			return
+		}
+		since = time.Unix(n, 0)
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	items, err := a.ListSessions(c.Request.Context(), c.Query("harness"), c.Query("machine"), since, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
+func tmxSessionGet(c *gin.Context, a *archive.Archive) {
+	id := strings.TrimPrefix(c.Param("id"), "/")
+	out, err := a.GetSession(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+func tmxExchangeList(c *gin.Context, a *archive.Archive) {
+	from, to, ok := tmxRange(c)
+	if !ok {
+		return
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	items, err := a.ListExchanges(c.Request.Context(), c.Query("session_id"), from, to, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
+func tmxExchangeGet(c *gin.Context, a *archive.Archive) {
+	out, err := a.GetExchange(c.Request.Context(), c.Param("trace"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, out)
 }

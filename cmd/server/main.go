@@ -34,6 +34,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/safemode"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/store"
+	tmxarchive "github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/archive"
 	tmxrequestlog "github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tui"
@@ -681,8 +682,14 @@ func main() {
 		sdkAuth.RegisterTokenStore(sdkAuth.NewFileTokenStore())
 	}
 
-	// tokenmaxx fork: persistent request log (no-op without TMX_REQUESTLOG_DSN / PGSTORE_DSN).
-	tmxrequestlog.StartFromEnv(context.Background())
+	// tokenmaxx fork: persistent request log (no-op without TMX_REQUESTLOG_DSN / PGSTORE_DSN) and
+	// the full-traffic archive (TMX_ARCHIVE=on). Both flush their queues on a clean shutdown.
+	tmxRequestLog := tmxrequestlog.StartFromEnv(context.Background())
+	tmxArchive := tmxarchive.StartFromEnv(context.Background())
+	defer func() {
+		tmxArchive.Close()
+		tmxRequestLog.Close()
+	}()
 
 	// Register built-in access providers before constructing services.
 	configaccess.Register(&cfg.SDKConfig)

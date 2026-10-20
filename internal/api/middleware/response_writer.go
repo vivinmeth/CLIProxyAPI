@@ -49,6 +49,7 @@ type ResponseWriterWrapper struct {
 	headers             map[string][]string        // headers stores the response headers.
 	logOnErrorOnly      bool                       // logOnErrorOnly enables logging only when an error response is detected.
 	firstChunkTimestamp time.Time                  // firstChunkTimestamp captures TTFB for streaming responses.
+	tmx                 *tmxCapture                // tokenmaxx fork: lossless capture (response_writer_tmx.go).
 }
 
 // NewResponseWriterWrapper creates and initializes a new ResponseWriterWrapper.
@@ -83,6 +84,7 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 
 	// CRITICAL: Write to client first (zero latency)
 	n, err := w.ResponseWriter.Write(data)
+	w.tmxTee(data[:max(n, 0)])
 
 	// THEN: Handle logging based on response type
 	if w.isStreaming && w.chunkChannel != nil {
@@ -136,6 +138,7 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 
 	// CRITICAL: Write to client first (zero latency)
 	n, err := w.ResponseWriter.WriteString(data)
+	w.tmxTee([]byte(data[:max(n, 0)]))
 
 	// THEN: Capture for logging
 	if w.isStreaming && w.chunkChannel != nil {
@@ -283,6 +286,8 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 			finalStatusCode = 200
 		}
 	}
+
+	w.tmxSubmit(c, finalStatusCode) // tokenmaxx fork: full capture, before sources are cleaned up
 
 	var slicesAPIResponseError []*interfaces.ErrorMessage
 	apiResponseError, isExist := c.Get("API_RESPONSE_ERROR")
