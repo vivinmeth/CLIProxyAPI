@@ -14,6 +14,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/codexturn"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -301,6 +302,9 @@ func shouldExposeResponsesUpstreamError(errMsg *interfaces.ErrorMessage) bool {
 		return false
 	}
 	if coreauth.IsTerminalAuthError(errMsg.Error) {
+		return true
+	}
+	if codexturn.IsTurnRateLimit(responsesWebsocketErrorStatus(errMsg), errMsg.Error) { // tmx: let Codex honor Retry-After
 		return true
 	}
 	return clienterror.IsRequestFault(responsesWebsocketErrorStatus(errMsg), errMsg.Error)
