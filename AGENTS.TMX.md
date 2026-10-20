@@ -35,7 +35,9 @@ but are **parked**. Don't work there; see `../wiki/parked-fork-clones.md`.)
   `tmxTee`/`tmxSubmit` (logic in `middleware/response_writer_tmx.go`). Keep these when merging
   upstream. Contract: `../wiki/archive-ingest.md`.
 - **Reset credits** (`internal/tmx/resets/`): list/redeem Codex + Claude banked resets,
-  `GET /tmx/resets`, `POST /tmx/resets/redeem` (routes in `internal/api/server_management_tmx_resets.go`,
+  `GET /tmx/resets`, `POST /tmx/resets/poll`, `GET /tmx/resets/history`, `POST /tmx/resets/redeem`
+  (fleet contract `../wiki/reset-credits-api.md`; verdicts in `verdict.go`; routes + contract test in
+  `internal/api/server_management_tmx_resets*.go`,
   one hook line in `server_management_v8.go`; handler helpers in
   `handlers/management/tmx_resets_backend.go`). Every claim is journaled in `tmx.reset_redemptions`
   before it is sent. Upstream-package hook: `sdk/cliproxy/auth/tmx_quota_signals.go`
