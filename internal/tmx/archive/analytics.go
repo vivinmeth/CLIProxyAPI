@@ -33,6 +33,8 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+const trgmIndexSQL = `CREATE INDEX IF NOT EXISTS items_text_trgm_idx ON items USING gin (text gin_trgm_ops)`
+
 const (
 	// analyticsVersion is bumped when extraction changes; sessions extracted by an older version
 	// are rewritten on the next backfill.
@@ -169,7 +171,6 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 			PRIMARY KEY (session_id, seq, idx),
 			FOREIGN KEY (session_id, seq) REFERENCES messages (session_id, seq) ON DELETE CASCADE
 		)`,
-		`CREATE INDEX IF NOT EXISTS items_text_trgm_idx ON items USING gin (text gin_trgm_ops)`,
 		`CREATE INDEX IF NOT EXISTS items_kind_name_idx ON items (kind, name)`,
 		`CREATE INDEX IF NOT EXISTS items_call_idx ON items (call_id) WHERE call_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS items_ts_idx ON items (ts)`,
@@ -183,6 +184,15 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 	}
 	for _, stmt := range stmts {
 		if _, err := an.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("analytics schema: %w", err)
+		}
+	}
+	// The trigram index is dropped while a backfill runs (maintaining it per insert is most of
+	// the cost) and rebuilt once the journal is drained; see buildDeferredIndexes.
+	if pending, err := an.getState(ctx, "trgm_index"); err != nil {
+		return err
+	} else if pending != "pending" {
+		if _, err = an.db.ExecContext(ctx, trgmIndexSQL); err != nil {
 			return fmt.Errorf("analytics schema: %w", err)
 		}
 	}
@@ -249,6 +259,7 @@ func (an *analytics) run() {
 				break
 			}
 			if !more {
+				an.buildDeferredIndexes()
 				break
 			}
 			select {
@@ -430,6 +441,36 @@ func (an *analytics) step() (bool, error) {
 		return false, nil // wait for the next poll before retrying
 	}
 	return len(entries) == journalBatch || moreReq, nil
+}
+
+// buildDeferredIndexes rebuilds the trigram index after a backfill has drained the journal.
+func (an *analytics) buildDeferredIndexes() {
+	an.mu.Lock()
+	defer an.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	defer cancel()
+	if v, err := an.getState(ctx, "trgm_index"); err != nil || v != "pending" || an.backfilling.Load() {
+		return
+	}
+	var backlog sql.NullInt64
+	cursor, _ := an.stateInt(ctx, "journal_id")
+	if an.a.db.QueryRowContext(ctx, `SELECT count(*) FROM `+journalTable+` WHERE id > $1`, cursor).Scan(&backlog) != nil || backlog.Int64 > 0 {
+		return
+	}
+	conn, err := an.db.Conn(ctx)
+	if err != nil {
+		an.setErr(err)
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	start := time.Now()
+	_, _ = conn.ExecContext(ctx, `SET maintenance_work_mem = '512MB'`)
+	if _, err = conn.ExecContext(ctx, trgmIndexSQL); err != nil {
+		an.setErr(fmt.Errorf("trigram index: %w", err))
+		return
+	}
+	_ = an.setState(ctx, "trgm_index", "built")
+	log.Infof("tmx analytics: trigram index built in %s", time.Since(start).Round(time.Second))
 }
 
 func (an *analytics) prune() {
@@ -974,6 +1015,12 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 	an.backfilling.Store(true)
 	defer an.backfilling.Store(false)
 	res := &BackfillResult{Requests: "restarted"}
+	if err := an.setState(ctx, "trgm_index", "pending"); err != nil {
+		return nil, err
+	}
+	if _, err := an.db.ExecContext(ctx, `DROP INDEX IF EXISTS items_text_trgm_idx`); err != nil {
+		return nil, err
+	}
 	n, err := an.exchMirror.copy(ctx, `TRUE`)
 	if err != nil {
 		return nil, fmt.Errorf("exchanges: %w", err)
@@ -1035,6 +1082,10 @@ func (a *Archive) AnalyticsStatus(ctx context.Context) (map[string]any, error) {
 		_ = rows.Close()
 	}
 	lastErr, _ := an.lastErr.Load().(string)
+	trgm, _ := an.getState(ctx, "trgm_index")
+	if trgm == "" {
+		trgm = "built"
+	}
 	backlog := int64(0)
 	if maxJournal.Valid && maxJournal.Int64 > cursor {
 		backlog = maxJournal.Int64 - cursor
@@ -1053,6 +1104,7 @@ func (a *Archive) AnalyticsStatus(ctx context.Context) (map[string]any, error) {
 		"last_error":       lastErr,
 		"last_run":         time.Unix(an.lastRunUnix.Load(), 0).UTC(),
 		"backfilling":      an.backfilling.Load(),
+		"trgm_index":       trgm,
 	}, nil
 }
 

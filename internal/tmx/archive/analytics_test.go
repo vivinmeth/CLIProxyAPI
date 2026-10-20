@@ -220,6 +220,10 @@ func TestAnalyticsProxyShadowAndBackfill(t *testing.T) {
 		t.Fatalf("backfill = %+v %v", res, err)
 	}
 	drain(t, an)
+	an.buildDeferredIndexes()
+	if n := count(t, an, `SELECT count(*) FROM pg_indexes WHERE indexname = 'items_text_trgm_idx'`); n != 1 {
+		t.Fatal("trigram index not rebuilt after backfill")
+	}
 	if n := count(t, an, `SELECT count(*) FROM sessions`); n != 2 {
 		t.Fatalf("sessions after backfill = %d", n)
 	}
