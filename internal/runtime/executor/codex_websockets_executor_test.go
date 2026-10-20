@@ -19,6 +19,7 @@ import (
 	internalcache "github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/codexturn"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
@@ -1877,9 +1878,12 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 		t.Fatalf("NewRequest() error = %v", err)
 	}
 	auth := &cliproxyauth.Auth{
+		ID:       "codex-identity-headers.json",
 		Provider: "codex",
 		Metadata: map[string]any{"email": "user@example.com"},
 	}
+	// tmx: turn state is only replayed on the auth that issued it.
+	codexturn.Remember(http.Header{"X-Codex-Turn-State": {"opaque-turn-state"}}, auth.ID)
 	req = req.WithContext(contextWithGinHeaders(map[string]string{
 		"Originator":            "Codex Desktop",
 		"Version":               "0.115.0-alpha.27",
