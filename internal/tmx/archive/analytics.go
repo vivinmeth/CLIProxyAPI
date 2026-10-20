@@ -34,7 +34,13 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-const trgmIndexSQL = `CREATE INDEX IF NOT EXISTS items_text_trgm_idx ON items USING gin (text gin_trgm_ops)`
+// trgmIndexSQL: substring search over every item, plus a small one over prose (kind = 'text':
+// user/assistant/system text) — tool outputs are most of the bytes and make prose searches with
+// common trigrams recheck far more rows.
+var trgmIndexSQL = []string{
+	`CREATE INDEX IF NOT EXISTS items_text_trgm_idx ON items USING gin (text gin_trgm_ops)`,
+	`CREATE INDEX IF NOT EXISTS items_prose_trgm_idx ON items USING gin (text gin_trgm_ops) WHERE kind = 'text'`,
+}
 
 const (
 	// analyticsVersion is bumped when extraction changes; sessions extracted by an older version
@@ -198,8 +204,10 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 	if pending, err := an.getState(ctx, "trgm_index"); err != nil {
 		return err
 	} else if pending != "pending" {
-		if _, err = an.db.ExecContext(ctx, trgmIndexSQL); err != nil {
-			return fmt.Errorf("analytics schema: %w", err)
+		for _, stmt := range trgmIndexSQL {
+			if _, err = an.db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("analytics schema: %w", err)
+			}
 		}
 	}
 	// Old versions read the journal with a cursor (and could skip late commits); the entries they
@@ -486,9 +494,11 @@ func (an *analytics) buildDeferredIndexes() {
 	defer func() { _ = conn.Close() }()
 	start := time.Now()
 	_, _ = conn.ExecContext(ctx, `SET maintenance_work_mem = '512MB'`)
-	if _, err = conn.ExecContext(ctx, trgmIndexSQL); err != nil {
-		an.setErr(fmt.Errorf("trigram index: %w", err))
-		return
+	for _, stmt := range trgmIndexSQL {
+		if _, err = conn.ExecContext(ctx, stmt); err != nil {
+			an.setErr(fmt.Errorf("trigram index: %w", err))
+			return
+		}
 	}
 	_ = an.setState(ctx, "trgm_index", "built")
 	log.Infof("tmx analytics: trigram index built in %s", time.Since(start).Round(time.Second))
@@ -1158,7 +1168,7 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 	an.idxMu.Lock()
 	err := an.setState(ctx, "trgm_index", "pending")
 	if err == nil {
-		_, err = an.db.ExecContext(ctx, `DROP INDEX IF EXISTS items_text_trgm_idx`)
+		_, err = an.db.ExecContext(ctx, `DROP INDEX IF EXISTS items_text_trgm_idx, items_prose_trgm_idx`)
 	}
 	an.idxMu.Unlock()
 	if err != nil {

@@ -339,7 +339,8 @@ func tmxAnalyticsBackfill(c *gin.Context, a *archive.Archive) {
 
 // tmxAnalyticsSearch: GET /tmx/analytics/search?q=&role=&kind=&name=&harness=&machine=
 // &session_kind=imported|proxy&session_id=&from=&to=(unix s)&include_shadowed=1&limit=(≤500) —
-// conversation items containing q (case-insensitive substring), newest first.
+// conversation items containing q (case-insensitive substring), newest first. kind=text (prose)
+// uses a small dedicated index and is much faster than searching tool output too.
 func tmxAnalyticsSearch(c *gin.Context, a *archive.Archive) {
 	q := archive.SearchQuery{Q: c.Query("q"), Role: c.Query("role"), Kind: c.Query("kind"), Name: c.Query("name"),
 		Harness: c.Query("harness"), Machine: c.Query("machine"), SessionKind: c.Query("session_kind"),
