@@ -34,6 +34,12 @@ but are **parked**. Don't work there; see `../wiki/parked-fork-clones.md`.)
   `openai/openai_responses_websocket.go`, `middleware/request_logging.go`; the response writer calls
   `tmxTee`/`tmxSubmit` (logic in `middleware/response_writer_tmx.go`). Keep these when merging
   upstream. Contract: `../wiki/archive-ingest.md`.
+- **Reset credits** (`internal/tmx/resets/`): list/redeem Codex + Claude banked resets,
+  `GET /tmx/resets`, `POST /tmx/resets/redeem` (routes in `internal/api/server_management_tmx_resets.go`,
+  one hook line in `server_management_v8.go`; handler helpers in
+  `handlers/management/tmx_resets_backend.go`). Every claim is journaled in `tmx.reset_redemptions`
+  before it is sent. Upstream-package hook: `sdk/cliproxy/auth/tmx_quota_signals.go`
+  (`Manager.ClearQuotaSignals`). Details: `../wiki/reset-credits.md`.
 - Put new fork-only code under `internal/tmx/` and keep upstream-file edits to small hooks.
 
 ## Git
