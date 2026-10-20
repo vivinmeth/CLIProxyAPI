@@ -349,7 +349,7 @@ func (an *analytics) step() (bool, error) {
 		}
 		entries = append(entries, e)
 	}
-	if err = rows.Close(); err != nil {
+	if err = closeRows(rows); err != nil {
 		return false, err
 	}
 	if len(entries) == 0 {
@@ -358,6 +358,7 @@ func (an *analytics) step() (bool, error) {
 
 	// Collapse the batch: work is state-based, so each session is processed once.
 	var traces, requestIDs []string
+	requestsTruncated := false
 	imported := map[string]bool{}
 	proxy := map[string]bool{}
 	byRef := map[string][]journalEntry{}
@@ -371,6 +372,8 @@ func (an *analytics) step() (bool, error) {
 			proxy[e.ref] = true
 		case "request":
 			requestIDs = append(requestIDs, e.ref)
+		case "requests_truncate":
+			requestsTruncated = true
 		}
 		byRef[e.kind+"\x00"+e.ref] = append(byRef[e.kind+"\x00"+e.ref], e)
 	}
@@ -378,6 +381,11 @@ func (an *analytics) step() (bool, error) {
 	fail := func(kind, ref string, err error) {
 		for _, e := range byRef[kind+"\x00"+ref] {
 			failedIDs[e.id] = err
+		}
+	}
+	if requestsTruncated {
+		if _, errT := an.reconcileAllRequests(ctx); errT != nil {
+			fail("requests_truncate", "*", errT)
 		}
 	}
 	if len(requestIDs) > 0 {
@@ -500,7 +508,9 @@ func installRequestTriggers(ctx context.Context, db *sql.DB, table string) error
 	stmts := []string{
 		`CREATE OR REPLACE FUNCTION ` + schema + `.analytics_journal_requests() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN
-			IF TG_OP = 'DELETE' THEN
+			IF TG_OP = 'TRUNCATE' THEN
+				INSERT INTO ` + journalTable + ` (kind, ref) VALUES ('requests_truncate', '*');
+			ELSIF TG_OP = 'DELETE' THEN
 				INSERT INTO ` + journalTable + ` (kind, ref) SELECT 'request', id::text FROM old_rows;
 			ELSE
 				INSERT INTO ` + journalTable + ` (kind, ref) SELECT 'request', id::text FROM new_rows;
@@ -513,6 +523,8 @@ func installRequestTriggers(ctx context.Context, db *sql.DB, table string) error
 			` REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION ` + schema + `.analytics_journal_requests()`,
 		`CREATE OR REPLACE TRIGGER analytics_journal_del AFTER DELETE ON ` + table +
 			` REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION ` + schema + `.analytics_journal_requests()`,
+		`CREATE OR REPLACE TRIGGER analytics_journal_trunc AFTER TRUNCATE ON ` + table +
+			` FOR EACH STATEMENT EXECUTE FUNCTION ` + schema + `.analytics_journal_requests()`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
@@ -524,7 +536,7 @@ func installRequestTriggers(ctx context.Context, db *sql.DB, table string) error
 
 // dropRequestTriggers stops journaling tmx.requests (analytics turned off).
 func dropRequestTriggers(ctx context.Context, db *sql.DB, table string) {
-	for _, t := range []string{"analytics_journal_ins", "analytics_journal_upd", "analytics_journal_del"} {
+	for _, t := range []string{"analytics_journal_ins", "analytics_journal_upd", "analytics_journal_del", "analytics_journal_trunc"} {
 		_, _ = db.ExecContext(ctx, `DROP TRIGGER IF EXISTS `+t+` ON `+table)
 	}
 }
@@ -551,7 +563,7 @@ func (an *analytics) syncRequestRows(ctx context.Context, ids []string) error {
 		}
 		present[id] = true
 	}
-	if err = rows.Close(); err != nil {
+	if err = closeRows(rows); err != nil {
 		return err
 	}
 	var gone []string
@@ -589,7 +601,7 @@ func (an *analytics) reconcileAllRequests(ctx context.Context) (int, error) {
 		}
 		src[id] = true
 	}
-	if err = rows.Close(); err != nil {
+	if err = closeRows(rows); err != nil {
 		return n, err
 	}
 	rows, err = an.db.QueryContext(ctx, `SELECT id FROM requests`)
@@ -607,7 +619,7 @@ func (an *analytics) reconcileAllRequests(ctx context.Context) (int, error) {
 			gone = append(gone, fmt.Sprint(id))
 		}
 	}
-	if err = rows.Close(); err != nil {
+	if err = closeRows(rows); err != nil {
 		return n, err
 	}
 	for start := 0; start < len(gone); start += 5000 {
@@ -686,7 +698,7 @@ func (an *analytics) writeSession(ctx context.Context, s sessionRow, msgs []msgR
 		}
 		existing[seq] = d
 	}
-	if err = rows.Close(); err != nil {
+	if err = closeRows(rows); err != nil {
 		return err
 	}
 	first := 0
@@ -890,7 +902,7 @@ func (an *analytics) extractImported(ctx context.Context, id string) error {
 		}
 		msgs = append(msgs, m)
 	}
-	if err = rows.Close(); err != nil {
+	if err = closeRows(rows); err != nil {
 		return err
 	}
 	if err = an.writeSession(ctx, s, msgs); err != nil {
@@ -941,7 +953,7 @@ func (an *analytics) extractProxy(ctx context.Context, key string) error {
 			alt[e.sessionID] = true
 		}
 	}
-	if err = rows.Close(); err != nil {
+	if err = closeRows(rows); err != nil {
 		return err
 	}
 	if len(exch) == 0 {
@@ -1109,7 +1121,9 @@ func (an *analytics) importedGhosts(ctx context.Context) ([]string, error) {
 		}
 		have[id] = true
 	}
-	_ = rows.Close()
+	if err = closeRows(rows); err != nil {
+		return nil, err
+	}
 	rows, err = an.db.QueryContext(ctx, `SELECT id FROM sessions WHERE kind = 'imported'`)
 	if err != nil {
 		return nil, err
@@ -1168,7 +1182,7 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 		replay = append(replay, [2]string{k, r})
 		replayedFailed = append(replayedFailed, fmt.Sprint(jid))
 	}
-	if err = rows.Close(); err != nil {
+	if err = closeRows(rows); err != nil {
 		return nil, err
 	}
 	ghosts, err := an.importedGhosts(ctx)
@@ -1202,7 +1216,11 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 		return nil, err
 	}
 	res.Proxy, _ = tag.RowsAffected()
-	if res.RequestRows, err = an.reconcileAllRequests(ctx); err != nil {
+	// Under the worker lock: a row mirrored by step() during the scan must not be judged absent.
+	an.mu.Lock()
+	res.RequestRows, err = an.reconcileAllRequests(ctx)
+	an.mu.Unlock()
+	if err != nil {
 		return nil, fmt.Errorf("requests: %w", err)
 	}
 	if len(replayedFailed) > 0 {
@@ -1299,7 +1317,7 @@ func ensureMirror(ctx context.Context, src, dst *sql.DB, srcSchema, srcName, dst
 		}
 		cols = append(cols, c)
 	}
-	if err = rows.Close(); err != nil {
+	if err = closeRows(rows); err != nil {
 		return nil, err
 	}
 	m := &mirror{src: src, dst: dst, srcTable: srcSchema + "." + srcName, dstTable: dstTable, key: key}
@@ -1427,6 +1445,16 @@ func insertRows(ctx context.Context, ex interface {
 }
 
 // ---- helpers ----
+
+// closeRows reports an iteration error (a stream cut short) before closing: a partial read must
+// never pass for a complete one.
+func closeRows(r *sql.Rows) error {
+	if err := r.Err(); err != nil {
+		_ = r.Close()
+		return err
+	}
+	return r.Close()
+}
 
 func quoteIdent(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
 

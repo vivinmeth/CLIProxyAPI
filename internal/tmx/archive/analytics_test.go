@@ -341,5 +341,13 @@ func TestAnalyticsRequestRowsFollowSource(t *testing.T) {
 	if n := count(t, an, `SELECT count(*) FROM requests WHERE id = $1`, earlyID); n != 0 {
 		t.Fatal("delete not copied")
 	}
+	// TRUNCATE fires no row triggers; its statement trigger queues a full reconcile.
+	if _, err = rl.src.Exec(`TRUNCATE ` + rl.srcTable); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, an)
+	if n := count(t, an, `SELECT count(*) FROM requests`); n != 0 {
+		t.Fatalf("copies after truncate = %d", n)
+	}
 	_ = a
 }
