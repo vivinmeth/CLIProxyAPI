@@ -300,6 +300,67 @@ func registerTMXArchiveRoutes(v8 *gin.RouterGroup) {
 	g.GET("/conversation", tmxArchive(tmxConversation))
 	g.GET("/exchanges", tmxArchive(tmxExchangeList))
 	g.GET("/exchanges/:trace", tmxArchive(tmxExchangeGet))
+
+	// Derived query layer (archive/analytics.go): its own Postgres, fed from the archive.
+	an := v8.Group("/tmx/analytics")
+	an.GET("/status", tmxArchive(tmxAnalyticsStatus))
+	an.POST("/backfill", tmxArchive(tmxAnalyticsBackfill))
+	an.GET("/search", tmxArchive(tmxAnalyticsSearch))
+}
+
+func tmxAnalyticsError(c *gin.Context, err error) {
+	if errors.Is(err, archive.ErrAnalyticsOff) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"enabled": false, "error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+}
+
+// tmxAnalyticsStatus: GET /tmx/analytics/status — journal progress, counts, last error.
+func tmxAnalyticsStatus(c *gin.Context, a *archive.Archive) {
+	st, err := a.AnalyticsStatus(c.Request.Context())
+	if err != nil {
+		tmxAnalyticsError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, st)
+}
+
+// tmxAnalyticsBackfill: POST /tmx/analytics/backfill — queue every archived session (imported and
+// proxied), recopy exchanges and tmx.requests. Idempotent; progress on /tmx/analytics/status.
+func tmxAnalyticsBackfill(c *gin.Context, a *archive.Archive) {
+	res, err := a.AnalyticsBackfill(c.Request.Context())
+	if err != nil {
+		tmxAnalyticsError(c, err)
+		return
+	}
+	c.JSON(http.StatusAccepted, res)
+}
+
+// tmxAnalyticsSearch: GET /tmx/analytics/search?q=&role=&kind=&name=&harness=&machine=
+// &session_kind=imported|proxy&session_id=&from=&to=(unix s)&include_shadowed=1&limit=(≤500) —
+// conversation items containing q (case-insensitive substring), newest first.
+func tmxAnalyticsSearch(c *gin.Context, a *archive.Archive) {
+	q := archive.SearchQuery{Q: c.Query("q"), Role: c.Query("role"), Kind: c.Query("kind"), Name: c.Query("name"),
+		Harness: c.Query("harness"), Machine: c.Query("machine"), SessionKind: c.Query("session_kind"),
+		SessionID: c.Query("session_id"), IncludeShadowed: c.Query("include_shadowed") == "1"}
+	q.Limit, _ = strconv.Atoi(c.Query("limit"))
+	for key, dst := range map[string]*time.Time{"from": &q.From, "to": &q.To} {
+		if raw := strings.TrimSpace(c.Query(key)); raw != "" {
+			sec, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": key + " must be unix seconds"})
+				return
+			}
+			*dst = time.Unix(sec, 0).UTC()
+		}
+	}
+	hits, err := a.AnalyticsSearch(c.Request.Context(), q)
+	if err != nil {
+		tmxAnalyticsError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": hits})
 }
 
 func tmxArchive(h func(*gin.Context, *archive.Archive)) gin.HandlerFunc {

@@ -16,12 +16,15 @@ import (
 // ConvItem is one displayable piece of a conversation, normalised across Anthropic Messages,
 // OpenAI Responses / Chat Completions and imported harness transcripts.
 type ConvItem struct {
-	Role  string     `json:"role"` // system | user | assistant | tool | event
-	Kind  string     `json:"kind"` // text | thinking | tool_call | tool_result | image | other
-	Text  string     `json:"text,omitempty"`
-	Name  string     `json:"name,omitempty"` // tool name
-	TS    *time.Time `json:"ts,omitempty"`
-	Model string     `json:"model,omitempty"`
+	Role string `json:"role"` // system | user | assistant | tool | event
+	Kind string `json:"kind"` // text | thinking | tool_call | tool_result | image | other
+	Text string `json:"text,omitempty"`
+	Name string `json:"name,omitempty"` // tool name
+	// CallID links a tool_call to its tool_result (Anthropic tool_use id, OpenAI call_id).
+	CallID  string     `json:"call_id,omitempty"`
+	IsError bool       `json:"is_error,omitempty"` // tool_result reported an error
+	TS      *time.Time `json:"ts,omitempty"`
+	Model   string     `json:"model,omitempty"`
 }
 
 // ConvExchange is one captured proxied request of the session.
@@ -44,6 +47,7 @@ type Conversation struct {
 	Truncated bool           `json:"truncated,omitempty"`
 	TraceID   string         `json:"trace_id,omitempty"` // proxy: the exchange the items come from
 	Exchanges []ConvExchange `json:"exchanges,omitempty"`
+	Source    string         `json:"source,omitempty"` // analytics | archive
 }
 
 // ErrNoConversation is returned when nothing is archived for the session.
@@ -64,6 +68,17 @@ func (a *Archive) Conversation(ctx context.Context, sessionID, harness, traceID,
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" && traceID == "" {
 		return nil, fmt.Errorf("session_id or trace_id is required")
+	}
+	// Served from the analytics DB when the session is extracted there; a specific exchange
+	// (trace_id) and sessions not extracted yet are rebuilt from the archive.
+	if a.analytics != nil && traceID == "" {
+		conv, ok, err := a.analytics.conversation(ctx, sessionID, harness, kind)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return conv, nil
+		}
 	}
 	if kind == "imported" {
 		return a.importedConversation(ctx, sessionID, harness)
@@ -251,9 +266,9 @@ func normalizeMessage(m gjson.Result, fallbackRole string) []ConvItem {
 	switch m.Get("type").String() {
 	case "function_call", "custom_tool_call", "local_shell_call":
 		args := firstNonEmptyStr(m.Get("arguments").String(), m.Get("input").String(), m.Get("action").Raw)
-		return []ConvItem{item("assistant", "tool_call", args, m.Get("name").String())}
+		return []ConvItem{withCall(item("assistant", "tool_call", args, m.Get("name").String()), m.Get("call_id").String(), false)}
 	case "function_call_output", "custom_tool_call_output", "local_shell_call_output":
-		return []ConvItem{item("tool", "tool_result", outputText(m.Get("output")), "")}
+		return []ConvItem{withCall(item("tool", "tool_result", outputText(m.Get("output")), ""), m.Get("call_id").String(), false)}
 	case "reasoning":
 		var parts []string
 		m.Get("summary").ForEach(func(_, s gjson.Result) bool {
@@ -275,12 +290,15 @@ func normalizeMessage(m gjson.Result, fallbackRole string) []ConvItem {
 	items := contentItems(content, role)
 	// Chat Completions tool calls live next to content.
 	m.Get("tool_calls").ForEach(func(_, tc gjson.Result) bool {
-		items = append(items, item(role, "tool_call", tc.Get("function.arguments").String(), tc.Get("function.name").String()))
+		items = append(items, withCall(item(role, "tool_call", tc.Get("function.arguments").String(), tc.Get("function.name").String()), tc.Get("id").String(), false))
 		return true
 	})
 	if role == "tool" && len(items) > 0 {
 		for i := range items {
 			items[i].Kind = "tool_result"
+			if items[i].CallID == "" {
+				items[i].CallID = m.Get("tool_call_id").String()
+			}
 		}
 	}
 	return items
@@ -308,9 +326,9 @@ func contentItems(content gjson.Result, role string) []ConvItem {
 		case "thinking", "redacted_thinking":
 			out = append(out, item(role, "thinking", firstNonEmptyStr(b.Get("thinking").String(), "[redacted thinking]"), ""))
 		case "tool_use", "server_tool_use":
-			out = append(out, item(role, "tool_call", b.Get("input").Raw, b.Get("name").String()))
+			out = append(out, withCall(item(role, "tool_call", b.Get("input").Raw, b.Get("name").String()), b.Get("id").String(), false))
 		case "tool_result":
-			out = append(out, item("tool", "tool_result", outputText(b.Get("content")), ""))
+			out = append(out, withCall(item("tool", "tool_result", outputText(b.Get("content")), ""), b.Get("tool_use_id").String(), b.Get("is_error").Bool()))
 		case "image", "input_image", "document", "input_file":
 			out = append(out, item(role, "image", "["+t+"]", ""))
 		default:
@@ -377,7 +395,7 @@ func responseItems(body []byte) []ConvItem {
 		case "content_block_start":
 			if cb := ev.Get("content_block"); cb.Get("type").String() == "tool_use" {
 				idx := int(ev.Get("index").Int())
-				tools[idx] = &ConvItem{Role: "assistant", Kind: "tool_call", Name: cb.Get("name").String()}
+				tools[idx] = &ConvItem{Role: "assistant", Kind: "tool_call", Name: cb.Get("name").String(), CallID: cb.Get("id").String()}
 				toolOrder = append(toolOrder, idx)
 			}
 		case "content_block_delta":
@@ -400,7 +418,7 @@ func responseItems(body []byte) []ConvItem {
 			if it := ev.Get("item"); strings.HasSuffix(it.Get("type").String(), "call") {
 				idx := 1000 + len(toolOrder)
 				tools[idx] = &ConvItem{Role: "assistant", Kind: "tool_call", Name: it.Get("name").String(),
-					Text: firstNonEmptyStr(it.Get("arguments").String(), it.Get("input").String())}
+					Text: firstNonEmptyStr(it.Get("arguments").String(), it.Get("input").String()), CallID: it.Get("call_id").String()}
 				toolOrder = append(toolOrder, idx)
 			}
 		default:
@@ -419,9 +437,14 @@ func responseItems(body []byte) []ConvItem {
 	}
 	for _, idx := range toolOrder {
 		t := *tools[idx]
-		out = append(out, item(t.Role, t.Kind, t.Text, t.Name))
+		out = append(out, withCall(item(t.Role, t.Kind, t.Text, t.Name), t.CallID, false))
 	}
 	return out
+}
+
+func withCall(it ConvItem, callID string, isError bool) ConvItem {
+	it.CallID, it.IsError = callID, isError
+	return it
 }
 
 func item(role, kind, text, name string) ConvItem {

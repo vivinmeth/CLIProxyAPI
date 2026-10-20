@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"io"
 	"os"
 	"sort"
 	"sync"
@@ -113,12 +112,10 @@ func (b *BlobStore) Prefetch(ctx context.Context, hashes []string) {
 				if j.end >= 0 && opts.SetRange(j.start, j.end) != nil {
 					continue
 				}
-				obj, errGet := b.r2.GetObject(ctx, b.bucket, j.key, opts)
-				if errGet != nil {
-					continue
+				data, errRead := b.readObject(ctx, j.key, opts)
+				if errRead != nil && j.end < 0 {
+					data, errRead = b.readFallback(ctx, j.refs[0].hash, errRead)
 				}
-				data, errRead := io.ReadAll(obj)
-				_ = obj.Close()
 				if errRead != nil {
 					continue
 				}

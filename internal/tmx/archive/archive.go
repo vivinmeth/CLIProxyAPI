@@ -43,6 +43,8 @@ type Archive struct {
 	cost    costTracker
 	storage storageCache
 
+	analytics *analytics // derived query layer; nil when TMX_ANALYTICS_DSN is unset
+
 	queue      chan *capture.Exchange
 	queueBytes atomic.Int64
 	captured   atomic.Int64
@@ -114,6 +116,7 @@ func StartFromEnv(ctx context.Context) *Archive {
 		log.WithError(err).Error("tmx archive: disabled")
 		return nil
 	}
+	a.startAnalytics(ctx)
 	current.Store(a)
 	if !strings.EqualFold(strings.TrimSpace(os.Getenv("TMX_ARCHIVE_CAPTURE")), "off") {
 		capture.SetSink(a.enqueue)
@@ -245,6 +248,13 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 			size        BIGINT NOT NULL DEFAULT 0,
 			ingested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			PRIMARY KEY (session_id, name, blob)
+		)`,
+		// Changes for the analytics worker (analytics.go), written with the change itself.
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.analytics_journal (
+			id         BIGSERIAL PRIMARY KEY,
+			kind       TEXT NOT NULL, -- session | exchange | proxy
+			ref        TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 	}
 	for _, stmt := range stmts {
@@ -393,17 +403,26 @@ func (a *Archive) storeExchange(ctx context.Context, ex *capture.Exchange) error
 	if traceID == "" {
 		traceID = "anon-" + HashOf([]byte(fmt.Sprintf("%s|%s|%d", ex.URL, ex.StartedAt, len(ex.RequestBody))))[:24]
 	}
-	_, err = a.db.ExecContext(ctx, `INSERT INTO `+schema+`.exchanges (trace_id, ts, finished_at,
+	insert := `INSERT INTO ` + schema + `.exchanges (trace_id, ts, finished_at,
 		session_id, method, url, status, streaming, first_chunk_ms, duration_ms, request_headers,
 		request_body, response_headers, response_body, response_chunks, upstream_request,
 		upstream_response, ws_timeline, upstream_ws_timeline, errors, request_bytes, response_bytes,
 		client_session_id)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
-		ON CONFLICT (trace_id) DO NOTHING`,
+		ON CONFLICT (trace_id) DO NOTHING`
+	if a.analytics != nil {
+		// One statement, so the journal entry exists exactly when the exchange row does.
+		insert = `WITH ins AS (` + insert + ` RETURNING trace_id) INSERT INTO ` + journalTable +
+			` (kind, ref) SELECT 'exchange', trace_id FROM ins`
+	}
+	_, err = a.db.ExecContext(ctx, insert,
 		traceID, ex.StartedAt.UTC(), nullTime(ex.FinishedAt), ex.SessionID, ex.Method, ex.URL, ex.Status,
 		ex.Streaming, firstChunk, duration, row.reqHeaders, row.reqBody, row.respHeaders, row.respBody,
 		row.chunks, row.upReq, row.upResp, row.ws, row.upWS, string(errorsJSON),
 		len(ex.RequestBody), len(ex.ResponseBody), clientSession)
+	if err == nil && a.analytics != nil {
+		a.analytics.poke()
+	}
 	if err == nil {
 		// Requests the proxy refused before trying any account never reach the usage plugin;
 		// record them here so they show up in the request log as "rejected".
@@ -474,6 +493,7 @@ func (a *Archive) Stats() map[string]any {
 		"upload_failures":  a.blobs.failures.Load(),
 		"spool_backlog":    a.blobs.SpoolBacklog(),
 		"r2_configured":    a.blobs.r2 != nil,
+		"analytics":        a.analytics != nil,
 	}
 }
 
@@ -489,6 +509,9 @@ func (a *Archive) Close() {
 		close(a.queue)
 		a.queueMu.Unlock()
 		a.wg.Wait()
+		if a.analytics != nil {
+			a.analytics.close()
+		}
 		a.blobs.close()
 		_ = a.db.Close()
 	})

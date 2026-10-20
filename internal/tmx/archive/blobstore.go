@@ -39,7 +39,11 @@ type BlobStore struct {
 	r2     *minio.Client
 	bucket string
 	prefix string // "<env>/blobs"
-	spool  string
+	// readPrefixes are other environments' blob folders tried for loose blobs this environment
+	// doesn't have (TMX_ARCHIVE_READ_FALLBACK_ENVS, e.g. staging running on a copy of prod's
+	// index). Read-only: uploads always go to prefix.
+	readPrefixes []string
+	spool        string
 
 	enc *zstd.Encoder
 	dec *zstd.Decoder
@@ -73,6 +77,11 @@ func newBlobStore(db *sql.DB, schema string, r2 *minio.Client, bucket, env, spoo
 		db: db, schema: schema, r2: r2, bucket: bucket, prefix: env + "/blobs", spool: spool,
 		enc: enc, dec: dec, known: newLRUSet(200000), cache: newBlobCache(spool),
 		kick: make(chan struct{}, 1), stop: make(chan struct{}), stopped: make(chan struct{}),
+	}
+	for _, fb := range strings.Split(os.Getenv("TMX_ARCHIVE_READ_FALLBACK_ENVS"), ",") {
+		if fb = strings.TrimSpace(fb); fb != "" && fb != env {
+			b.readPrefixes = append(b.readPrefixes, fb+"/blobs")
+		}
 	}
 	go b.uploadLoop()
 	return b, nil
@@ -192,17 +201,36 @@ func (b *BlobStore) Get(ctx context.Context, hash string) ([]byte, error) {
 				return nil, errRange
 			}
 		}
-		obj, errGet := b.r2.GetObject(ctx, b.bucket, key, opts)
-		if errGet != nil {
-			return nil, errGet
-		}
-		defer func() { _ = obj.Close() }()
-		if compressed, err = io.ReadAll(obj); err != nil {
-			return nil, err
+		if compressed, err = b.readObject(ctx, key, opts); err != nil {
+			if packKey.Valid && packKey.String != "" {
+				return nil, err
+			}
+			if compressed, err = b.readFallback(ctx, hash, err); err != nil {
+				return nil, err
+			}
 		}
 		b.cache.put(hash, compressed)
 	}
 	return b.dec.DecodeAll(compressed, nil)
+}
+
+func (b *BlobStore) readObject(ctx context.Context, key string, opts minio.GetObjectOptions) ([]byte, error) {
+	obj, err := b.r2.GetObject(ctx, b.bucket, key, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = obj.Close() }()
+	return io.ReadAll(obj)
+}
+
+// readFallback tries the fallback environments for a loose blob; first is the original error.
+func (b *BlobStore) readFallback(ctx context.Context, hash string, first error) ([]byte, error) {
+	for _, p := range b.readPrefixes {
+		if data, err := b.readObject(ctx, p+"/"+hash[:2]+"/"+hash[2:4]+"/"+hash+".zst", minio.GetObjectOptions{}); err == nil {
+			return data, nil
+		}
+	}
+	return nil, first
 }
 
 // MediaType returns the stored media type of a blob ("" when unknown).

@@ -248,6 +248,9 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 			res.Sources++
 		}
 	}
+	if err = a.journal(ctx, tx, "session", id); err != nil {
+		return nil, fmt.Errorf("analytics journal: %w", err)
+	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -264,6 +267,8 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 			return res, fmt.Errorf("replace usage rows: %w", err)
 		}
 	}
+	// Usage rows are written after the commit; journal again so analytics copies them.
+	_ = a.journal(ctx, a.db, "session", id)
 	return res, nil
 }
 
@@ -294,6 +299,9 @@ func (a *Archive) DeleteSession(ctx context.Context, id string) (*DeleteResult, 
 	}
 	if n, _ := tag.RowsAffected(); n == 0 {
 		return nil, ErrSessionNotFound
+	}
+	if err = a.journal(ctx, tx, "session", id); err != nil {
+		return nil, fmt.Errorf("analytics journal: %w", err)
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, err

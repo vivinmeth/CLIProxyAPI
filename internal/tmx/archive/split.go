@@ -205,6 +205,19 @@ func (a *Archive) putJSON(ctx context.Context, v any, kind string) (string, erro
 
 // rebuildBody reconstructs a body from its manifest blob.
 func (a *Archive) rebuildBody(ctx context.Context, manifestHash string) ([]byte, error) {
+	return a.rebuild(ctx, manifestHash, true)
+}
+
+// mediaPlaceholderPrefix marks extracted media in bodies rebuilt without it ("tmx-media:<sha256>").
+const mediaPlaceholderPrefix = "tmx-media:"
+
+// rebuildBodyNoMedia is rebuildBody with extracted media left out: each media value becomes
+// "tmx-media:<sha256>" (fetch the bytes from the blob store when needed). Used for analytics.
+func (a *Archive) rebuildBodyNoMedia(ctx context.Context, manifestHash string) ([]byte, error) {
+	return a.rebuild(ctx, manifestHash, false)
+}
+
+func (a *Archive) rebuild(ctx context.Context, manifestHash string, media bool) ([]byte, error) {
 	if manifestHash == "" {
 		return nil, nil
 	}
@@ -225,7 +238,7 @@ func (a *Archive) rebuildBody(ctx context.Context, manifestHash string) ([]byte,
 			var piece []byte
 			var errPart error
 			if part.Body != "" {
-				piece, errPart = a.rebuildBody(ctx, part.Body)
+				piece, errPart = a.rebuild(ctx, part.Body, media)
 			} else if part.Text != "" {
 				piece, errPart = a.blobs.Get(ctx, part.Text)
 			}
@@ -243,6 +256,13 @@ func (a *Archive) rebuildBody(ctx context.Context, manifestHash string) ([]byte,
 		}
 		for _, md := range m.Media {
 			if md.Key != key || md.Item != item {
+				continue
+			}
+			if !media {
+				var errSet error
+				if el, errSet = sjson.SetBytes(el, md.Path, mediaPlaceholderPrefix+md.Blob); errSet != nil {
+					return nil, errSet
+				}
 				continue
 			}
 			data, errMedia := a.blobs.Get(ctx, md.Blob)
