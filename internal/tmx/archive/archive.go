@@ -21,6 +21,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/capture"
+	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -311,6 +312,16 @@ func redactHeaders(h map[string][]string) map[string][]string {
 }
 
 func (a *Archive) storeExchange(ctx context.Context, ex *capture.Exchange) error {
+	if ex.SessionID == "" {
+		// The middleware runs before session resolution; derive it the same way upstream does so
+		// exchanges join tmx.requests.session_id.
+		if info, ok := coresession.ExtractSessionInfo(http.Header(ex.RequestHeaders), ex.RequestBody, nil); ok {
+			ex.SessionID = coresession.NormalizeToCanonicalUUID(info.SessionID)
+			if ex.SessionID == "" {
+				ex.SessionID = info.SessionID
+			}
+		}
+	}
 	put := func(data []byte, mediaType, kind string) (string, error) {
 		if len(data) == 0 {
 			return "", nil
