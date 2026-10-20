@@ -12,6 +12,7 @@ type ExchangeMeta struct {
 	TS                 time.Time       `json:"ts"`
 	FinishedAt         *time.Time      `json:"finished_at"`
 	SessionID          string          `json:"session_id"`
+	ClientSessionID    string          `json:"client_session_id"`
 	Method             string          `json:"method"`
 	URL                string          `json:"url"`
 	Status             int             `json:"status"`
@@ -35,7 +36,7 @@ type ExchangeMeta struct {
 const exchangeColumns = `trace_id, ts, finished_at, session_id, method, url, status, streaming,
 	first_chunk_ms, duration_ms, request_headers, request_body, response_headers, response_body,
 	response_chunks, upstream_request, upstream_response, ws_timeline, upstream_ws_timeline, errors,
-	request_bytes, response_bytes`
+	request_bytes, response_bytes, client_session_id`
 
 type scanner interface{ Scan(...any) error }
 
@@ -46,7 +47,7 @@ func scanExchange(r scanner) (*ExchangeMeta, error) {
 		&e.Streaming, &e.FirstChunkMs, &e.DurationMs, &e.RequestHeaders, &e.RequestBody,
 		&e.ResponseHeaders, &e.ResponseBody, &e.ResponseChunks, &e.UpstreamRequest,
 		&e.UpstreamResponse, &e.WSTimeline, &e.UpstreamWSTimeline, &errs, &e.RequestBytes,
-		&e.ResponseBytes); err != nil {
+		&e.ResponseBytes, &e.ClientSessionID); err != nil {
 		return nil, err
 	}
 	e.Errors = errs
@@ -59,7 +60,7 @@ func (a *Archive) ListExchanges(ctx context.Context, sessionID string, from, to 
 		limit = 100
 	}
 	rows, err := a.db.QueryContext(ctx, `SELECT `+exchangeColumns+` FROM `+schema+`.exchanges
-		WHERE ts >= $1 AND ts < $2 AND ($3 = '' OR session_id = $3) ORDER BY ts DESC LIMIT $4`,
+		WHERE ts >= $1 AND ts < $2 AND ($3 = '' OR session_id = $3 OR client_session_id = $3) ORDER BY ts DESC LIMIT $4`,
 		from, to, sessionID, limit)
 	if err != nil {
 		return nil, err

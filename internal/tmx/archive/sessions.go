@@ -151,7 +151,7 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 	if viaProxy == nil {
 		var linked bool
 		if errLink := a.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM `+schema+`.exchanges
-			WHERE session_id = $1)`, in.ExternalID).Scan(&linked); errLink == nil && linked {
+			WHERE client_session_id = $1 OR session_id = $1)`, in.ExternalID).Scan(&linked); errLink == nil && linked {
 			viaProxy = &linked
 		}
 	}

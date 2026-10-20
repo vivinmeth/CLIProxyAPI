@@ -221,7 +221,8 @@ func TestIngestSessionIdempotentWithUsage(t *testing.T) {
 	}
 
 	// Same session also captured by the proxy -> imported usage becomes shadowed.
-	if err = a.storeExchange(ctx, &capture.Exchange{TraceID: "t-proxy", SessionID: "abc-123", StartedAt: ts}); err != nil {
+	if err = a.storeExchange(ctx, &capture.Exchange{TraceID: "t-proxy", SessionID: "canonical-other-id", StartedAt: ts,
+		RequestHeaders: map[string][]string{"X-Claude-Code-Session-Id": {"abc-123"}}}); err != nil {
 		t.Fatal(err)
 	}
 	in2 := in
