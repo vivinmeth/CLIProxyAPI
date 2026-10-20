@@ -1,0 +1,188 @@
+// Package requestlog persists one row per upstream model call to Postgres (tokenmaxx fork).
+//
+// Rows come from the usage plugin hook, are buffered in memory and written in batches by a
+// single background goroutine, so request handling never waits on the database. Nothing here
+// stores prompts or responses; error bodies are truncated and keys are never recorded (only a
+// short hash of the client API key).
+package requestlog
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+)
+
+// Outcome values stored in the outcome column.
+const (
+	OutcomeSuccess  = "success"
+	OutcomeFailed   = "failed"
+	OutcomeCanceled = "canceled"
+)
+
+const maxErrorLen = 2000
+
+// Row is one upstream execution attempt. Retries of the same inbound request share TraceID.
+type Row struct {
+	TS              time.Time `json:"ts"`
+	RequestID       string    `json:"request_id"`
+	TraceID         string    `json:"trace_id"`
+	SessionID       string    `json:"session_id"`
+	Provider        string    `json:"provider"`
+	Executor        string    `json:"executor"`
+	Model           string    `json:"model"`
+	Alias           string    `json:"alias"`
+	ResponseModel   string    `json:"response_model"`
+	AuthID          string    `json:"auth_id"`
+	AuthIndex       string    `json:"auth_index"`
+	AuthLabel       string    `json:"auth_label"`
+	AuthType        string    `json:"auth_type"`
+	APIKeyHash      string    `json:"api_key_hash"`
+	AccessProvider  string    `json:"access_provider"`
+	ClientIP        string    `json:"client_ip"`
+	UserAgent       string    `json:"user_agent"`
+	Stream          bool      `json:"stream"`
+	Outcome         string    `json:"outcome"`
+	StatusCode      int       `json:"status_code"`
+	Error           string    `json:"error"`
+	LatencyMs       int64     `json:"latency_ms"`
+	TTFTMs          int64     `json:"ttft_ms"`
+	InputTokens     int64     `json:"input_tokens"`
+	OutputTokens    int64     `json:"output_tokens"`
+	ReasoningTokens int64     `json:"reasoning_tokens"`
+	CachedTokens    int64     `json:"cached_tokens"`
+	CacheRead       int64     `json:"cache_read"`
+	CacheCreation   int64     `json:"cache_creation"`
+	TotalTokens     int64     `json:"total_tokens"`
+	ReasoningEffort string    `json:"reasoning_effort"`
+	ServiceTier     string    `json:"service_tier"`
+}
+
+// classify maps a usage record to success / failed / canceled. A client that goes away (Esc in
+// Claude Code, closed socket) surfaces as 499 or a context.Canceled error; those are not
+// upstream failures and are kept apart so they don't read as incidents.
+func classify(ctx context.Context, record coreusage.Record) (string, int) {
+	status := record.Fail.StatusCode
+	if !record.Failed {
+		return OutcomeSuccess, status
+	}
+	if status == clienterror.StatusClientClosedRequest {
+		return OutcomeCanceled, status
+	}
+	body := strings.ToLower(record.Fail.Body)
+	if strings.Contains(body, "context canceled") || strings.Contains(body, "client disconnected") {
+		return OutcomeCanceled, status
+	}
+	if ctx != nil && errors.Is(ctx.Err(), context.Canceled) {
+		return OutcomeCanceled, status
+	}
+	return OutcomeFailed, status
+}
+
+func hashAPIKey(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+func truncate(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	cut := s[:n]
+	for !utf8.ValidString(cut) && len(cut) > 0 {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "…"
+}
+
+// rowFromRecord builds a Row from a usage record and the request context.
+func rowFromRecord(ctx context.Context, record coreusage.Record) Row {
+	ts := record.RequestedAt
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	meta := internallogging.GetClientRequestMetadata(ctx)
+	clientIP := strings.TrimSpace(meta.ResolvedClientIP)
+	if clientIP == "" {
+		clientIP = strings.TrimSpace(meta.ClientIP)
+	}
+	traceID := strings.TrimSpace(record.TraceID)
+	if traceID == "" {
+		traceID = strings.TrimSpace(internallogging.GetRequestID(ctx))
+	}
+	sessionID := strings.TrimSpace(record.SessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(meta.SessionID)
+	}
+	sessionID = coresession.NormalizeToCanonicalUUID(sessionID)
+	accessProvider := strings.TrimSpace(record.AccessProvider)
+	if accessProvider == "" {
+		accessProvider = strings.TrimSpace(coreusage.AccessProviderFromContext(ctx))
+	}
+	effort := strings.TrimSpace(record.ReasoningEffort)
+	if effort == "" {
+		effort = coreusage.ReasoningEffortFromContext(ctx)
+	}
+	tier := strings.TrimSpace(record.ServiceTier)
+	if tier == "" {
+		tier = strings.TrimSpace(record.RequestServiceTier)
+	}
+	stream := record.Stream
+	if !stream {
+		stream = coreusage.StreamFromContext(ctx)
+	}
+	detail := coreusage.EnsureTokenBreakdownForProvider(record.Detail, record.Provider, record.ExecutorType)
+	outcome, status := classify(ctx, record)
+	errText := ""
+	if outcome != OutcomeSuccess {
+		errText = truncate(record.Fail.Body, maxErrorLen)
+	}
+
+	return Row{
+		TS:              ts.UTC(),
+		RequestID:       strings.TrimSpace(record.RequestID),
+		TraceID:         traceID,
+		SessionID:       sessionID,
+		Provider:        strings.TrimSpace(record.Provider),
+		Executor:        strings.TrimSpace(record.ExecutorType),
+		Model:           strings.TrimSpace(record.Model),
+		Alias:           strings.TrimSpace(record.Alias),
+		ResponseModel:   strings.TrimSpace(record.ResponseModel),
+		AuthID:          strings.TrimSpace(record.AuthID),
+		AuthIndex:       strings.TrimSpace(record.AuthIndex),
+		AuthLabel:       strings.TrimSpace(record.Source),
+		AuthType:        strings.TrimSpace(record.AuthType),
+		APIKeyHash:      hashAPIKey(record.APIKey),
+		AccessProvider:  accessProvider,
+		ClientIP:        clientIP,
+		UserAgent:       truncate(meta.UserAgent, 300),
+		Stream:          stream,
+		Outcome:         outcome,
+		StatusCode:      status,
+		Error:           errText,
+		LatencyMs:       record.Latency.Milliseconds(),
+		TTFTMs:          record.TTFT.Milliseconds(),
+		InputTokens:     detail.InputTokens,
+		OutputTokens:    detail.OutputTokens,
+		ReasoningTokens: detail.ReasoningTokens,
+		CachedTokens:    detail.CachedTokens,
+		CacheRead:       detail.CacheReadTokens,
+		CacheCreation:   detail.CacheCreationTokens,
+		TotalTokens:     detail.TotalTokens,
+		ReasoningEffort: effort,
+		ServiceTier:     tier,
+	}
+}
