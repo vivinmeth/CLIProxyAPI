@@ -28,6 +28,12 @@ but are **parked**. Don't work there; see `../wiki/parked-fork-clones.md`.)
   Upstream files only carry one-line hooks (`server_management_v8.go`, `cmd/server/main.go`).
   Integration test needs `TMX_REQUESTLOG_TEST_DSN` (throwaway `postgres:18-alpine` container).
   Details: `../wiki/observability-plan.md`.
+- **Archive** (`internal/tmx/archive/`, `internal/tmx/capture/`): full exchange capture + session
+  ingest. Upstream hooks: `capture.Enabled()` added to the request-log gates in
+  `runtime/executor/helps/logging_helpers.go`, `sdk/api/handlers/handlers.go`, `handlers_errors.go`,
+  `openai/openai_responses_websocket.go`, `middleware/request_logging.go`; the response writer calls
+  `tmxTee`/`tmxSubmit` (logic in `middleware/response_writer_tmx.go`). Keep these when merging
+  upstream. Contract: `../wiki/archive-ingest.md`.
 - Put new fork-only code under `internal/tmx/` and keep upstream-file edits to small hooks.
 
 ## Git
