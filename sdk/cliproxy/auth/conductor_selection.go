@@ -72,7 +72,7 @@ func (m *Manager) PluginSchedulerWantsAcrossPriorities() bool {
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector:
+	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector, *ResetSoonestSelector:
 		return true
 	default:
 		return false
@@ -1734,7 +1734,13 @@ func (m *Manager) useSchedulerFastPath() bool {
 	if m == nil || m.scheduler == nil {
 		return false
 	}
-	return isBuiltInSelector(m.Selector())
+	selector := m.Selector()
+	if _, resetSoonest := selector.(*ResetSoonestSelector); resetSoonest {
+		// Reset-soonest orders by live quota observations that the scheduler shards do not
+		// track, so it always uses the selector path over the manager's current auths.
+		return false
+	}
+	return isBuiltInSelector(selector)
 }
 
 func shouldRetrySchedulerPick(err error) bool {
