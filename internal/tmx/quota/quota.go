@@ -325,8 +325,11 @@ func (s *Service) record(ctx context.Context, authID string, windows []Window, s
 		if cur, ok := a.current[w.Window]; ok && cur.ObservedAt.After(at) {
 			continue
 		}
-		a.current[w.Window] = Current{Window: w, ObservedAt: at, Source: source}
 		last, ok := a.written[w.Window]
+		if w.Status == "" && ok {
+			w.Status = last.status // the usage API has no status; keep the last one the headers gave
+		}
+		a.current[w.Window] = Current{Window: w, ObservedAt: at, Source: source}
 		if ok && !changed(last, w) && at.Sub(last.writtAt) < heartbeatEvery {
 			continue
 		}
