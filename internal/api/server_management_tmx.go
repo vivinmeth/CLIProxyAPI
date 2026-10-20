@@ -286,6 +286,7 @@ func registerTMXArchiveRoutes(v8 *gin.RouterGroup) {
 	g.GET("/status", tmxArchive(func(c *gin.Context, a *archive.Archive) {
 		c.JSON(http.StatusOK, gin.H{"enabled": true, "stats": a.Stats()})
 	}))
+	g.GET("/storage", tmxArchive(tmxArchiveStorage))
 	g.POST("/blobs/missing", tmxArchive(tmxBlobsMissing))
 	g.PUT("/blobs/:hash", tmxArchive(tmxBlobPut))
 	g.GET("/blobs/:hash", tmxArchive(tmxBlobGet))
@@ -419,6 +420,25 @@ func tmxSessionGet(c *gin.Context, a *archive.Archive) {
 		return
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+// tmxArchiveStorage: GET /tmx/archive/storage[?refresh=1] — objects and bytes in the archive
+// bucket per environment folder, the bucket's storage cost at list price, and this environment's
+// cost estimate. Listing is cached for an hour (refresh: at most once a minute).
+func tmxArchiveStorage(c *gin.Context, a *archive.Archive) {
+	usage, err := a.Storage(c.Request.Context(), c.Query("refresh") == "1" || c.Query("refresh") == "true")
+	cost, errCost := a.Cost(c.Request.Context())
+	if errCost != nil {
+		cost = nil
+	}
+	switch {
+	case errors.Is(err, archive.ErrNoR2):
+		c.JSON(http.StatusOK, gin.H{"enabled": true, "r2_configured": false, "cost_estimate": cost})
+	case err != nil:
+		c.JSON(http.StatusBadGateway, gin.H{"error": "bucket listing failed: " + err.Error(), "cost_estimate": cost})
+	default:
+		c.JSON(http.StatusOK, gin.H{"enabled": true, "r2_configured": true, "storage": usage, "cost_estimate": cost})
+	}
 }
 
 // tmxSessionDelete: DELETE /tmx/archive/sessions/<harness>:<id> — removes an imported session,

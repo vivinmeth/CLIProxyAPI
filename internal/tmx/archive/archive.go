@@ -36,10 +36,11 @@ const (
 
 // Archive is the running archive service.
 type Archive struct {
-	db    *sql.DB
-	blobs *BlobStore
-	env   string
-	cost  costTracker
+	db      *sql.DB
+	blobs   *BlobStore
+	env     string
+	cost    costTracker
+	storage storageCache
 
 	queue      chan *capture.Exchange
 	queueBytes atomic.Int64
