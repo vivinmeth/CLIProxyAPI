@@ -152,6 +152,14 @@ func Default() *Service {
 	return current
 }
 
+// SetDefaultForTest replaces the running service (nil clears it) so route tests in one process
+// don't inherit a service started by an earlier test with a different backend.
+func SetDefaultForTest(s *Service) {
+	defaultMu.Lock()
+	defer defaultMu.Unlock()
+	current = s
+}
+
 // Start creates the journal table and the service once. db/schema are the request-log database
 // ("tmx"); without a db the journal is in memory. TMX_RESETS=off disables it.
 func Start(db *sql.DB, schema string, backend Backend) *Service {

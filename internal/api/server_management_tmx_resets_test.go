@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/resets"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
@@ -33,6 +34,8 @@ func (resetsTestBackend) TmxClearQuotaSignals(string) bool               { retur
 
 func TestTMXResetRoutesContract(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	resets.SetDefaultForTest(nil)
+	t.Cleanup(func() { resets.SetDefaultForTest(nil) })
 	r := gin.New()
 	registerTMXResetRoutes(r.Group("/v8/management"), resetsTestBackend{})
 	call := func(method, path, body string) (int, map[string]any) {
