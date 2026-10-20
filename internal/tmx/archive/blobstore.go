@@ -202,7 +202,10 @@ func (b *BlobStore) uploadLoop() {
 	}
 }
 
-// uploadPending pushes every spooled blob to R2. Without R2 (dev) blobs simply stay spooled.
+const uploadConcurrency = 8
+
+// uploadPending pushes every spooled blob to R2 with a few parallel uploads (bulk imports produce
+// thousands of small blobs). Without R2 (dev) blobs simply stay spooled.
 func (b *BlobStore) uploadPending() {
 	if b.r2 == nil {
 		return
@@ -211,37 +214,59 @@ func (b *BlobStore) uploadPending() {
 	if err != nil {
 		return
 	}
+	work := make(chan string)
+	var failed atomic.Bool
+	var wg sync.WaitGroup
+	for i := 0; i < uploadConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for hash := range work {
+				if failed.Load() {
+					continue
+				}
+				if errUp := b.uploadOne(hash); errUp != nil {
+					failed.Store(true)
+					if b.failures.Add(1)%50 == 1 {
+						log.WithError(errUp).Warn("tmx archive: upload to R2 failed; blobs stay spooled and will retry")
+					}
+				}
+			}
+		}()
+	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasSuffix(name, ".zst") {
-			continue
-		}
 		hash := strings.TrimSuffix(name, ".zst")
-		if !ValidHash(hash) {
+		if !strings.HasSuffix(name, ".zst") || !ValidHash(hash) {
 			continue
 		}
-		path := filepath.Join(b.spool, name)
-		data, errRead := os.ReadFile(path)
-		if errRead != nil {
-			continue
+		if failed.Load() {
+			break
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		_, errPut := b.r2.PutObject(ctx, b.bucket, b.objectKey(hash), bytes.NewReader(data), int64(len(data)),
-			minio.PutObjectOptions{ContentType: "application/zstd"})
-		if errPut == nil {
-			_, errPut = b.db.ExecContext(ctx,
-				`UPDATE `+b.schema+`.blobs SET uploaded_at = now() WHERE hash = $1`, hash)
-		}
-		cancel()
-		if errPut != nil {
-			if b.failures.Add(1)%50 == 1 {
-				log.WithError(errPut).Warn("tmx archive: upload to R2 failed; blobs stay spooled and will retry")
-			}
-			return
-		}
-		_ = os.Remove(path)
-		b.uploaded.Add(1)
+		work <- hash
 	}
+	close(work)
+	wg.Wait()
+}
+
+func (b *BlobStore) uploadOne(hash string) error {
+	path := b.spoolPath(hash)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil // already uploaded by another pass
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if _, err = b.r2.PutObject(ctx, b.bucket, b.objectKey(hash), bytes.NewReader(data), int64(len(data)),
+		minio.PutObjectOptions{ContentType: "application/zstd"}); err != nil {
+		return err
+	}
+	if _, err = b.db.ExecContext(ctx, `UPDATE `+b.schema+`.blobs SET uploaded_at = now() WHERE hash = $1`, hash); err != nil {
+		return err
+	}
+	_ = os.Remove(path)
+	b.uploaded.Add(1)
+	return nil
 }
 
 // SpoolBacklog counts blobs waiting for upload.
