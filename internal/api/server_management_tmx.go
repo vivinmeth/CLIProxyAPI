@@ -296,6 +296,7 @@ func registerTMXArchiveRoutes(v8 *gin.RouterGroup) {
 	g.GET("/sessions", tmxArchive(tmxSessionList))
 	g.GET("/sessions/*id", tmxArchive(tmxSessionGet))
 	g.DELETE("/sessions/*id", tmxArchive(tmxSessionDelete))
+	g.POST("/usage/rebuild", tmxArchive(tmxUsageRebuild))
 	g.GET("/exchanges", tmxArchive(tmxExchangeList))
 	g.GET("/exchanges/:trace", tmxArchive(tmxExchangeGet))
 }
@@ -441,6 +442,18 @@ func tmxArchiveStorage(c *gin.Context, a *archive.Archive) {
 	default:
 		c.JSON(http.StatusOK, gin.H{"enabled": true, "r2_configured": true, "storage": usage, "cost_estimate": cost})
 	}
+}
+
+// tmxUsageRebuild: POST /tmx/archive/usage/rebuild?harness=&dry_run=1 — restore imported usage
+// rows missing from tmx.requests from the archive's stored messages. Never overwrites rows.
+func tmxUsageRebuild(c *gin.Context, a *archive.Archive) {
+	dry := c.Query("dry_run") == "1" || c.Query("dry_run") == "true"
+	res, err := a.RebuildUsage(c.Request.Context(), strings.TrimSpace(c.Query("harness")), dry)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "result": res})
+		return
+	}
+	c.JSON(http.StatusOK, res)
 }
 
 // tmxSessionDelete: DELETE /tmx/archive/sessions/<harness>:<id> — removes an imported session,

@@ -19,7 +19,7 @@ import (
 
 const (
 	defaultSchema        = "tmx"
-	defaultRetentionDays = 365
+	defaultRetentionDays = 0 // keep forever: the request log is the long-term usage record
 	queueSize            = 10000
 	batchSize            = 200
 	flushInterval        = 2 * time.Second
@@ -51,7 +51,8 @@ func Default() *Store { return current.Load() }
 //	TMX_REQUESTLOG=off                 disable
 //	TMX_REQUESTLOG_DSN                 Postgres DSN (falls back to PGSTORE_DSN)
 //	TMX_REQUESTLOG_SCHEMA              schema name (default "tmx")
-//	TMX_REQUESTLOG_RETENTION_DAYS      rows older than this are pruned (default 365, 0 = keep)
+//	TMX_REQUESTLOG_RETENTION_DAYS      live proxy rows older than this are pruned (default 0 = keep
+//	                                   forever); imported rows (extern:*) are never pruned
 //
 // Failure to connect is logged and leaves logging disabled; it never blocks startup.
 func StartFromEnv(ctx context.Context) *Store {
@@ -464,7 +465,10 @@ func (s *Store) prune() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	res, err := s.db.ExecContext(ctx,
-		"DELETE FROM "+s.table()+" WHERE ts < now() - make_interval(days => $1)", s.retentionDays)
+		// Only live proxy rows age out. Imported rows are the only copy of external history in the
+		// request log and must never be pruned.
+		"DELETE FROM "+s.table()+" WHERE ts < now() - make_interval(days => $1) AND source = 'tmx-proxy' AND import_ref IS NULL",
+		s.retentionDays)
 	if err != nil {
 		log.WithError(err).Warn("tmx request log: prune failed")
 		return

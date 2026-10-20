@@ -115,3 +115,51 @@ func TestHarnessColumnsWrittenAndGrouped(t *testing.T) {
 		t.Fatalf("harness filter sessions = %+v %v", sessions, err)
 	}
 }
+
+// Retention may age out live proxy rows but never imported history.
+func TestPruneKeepsImportedRows(t *testing.T) {
+	dsn := os.Getenv("TMX_REQUESTLOG_TEST_DSN")
+	if dsn == "" {
+		t.Skip("TMX_REQUESTLOG_TEST_DSN not set")
+	}
+	ctx := context.Background()
+	schema := fmt.Sprintf("tmx_test_%d", time.Now().UnixNano())
+	store, err := Open(ctx, dsn, schema, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.db.Exec("DROP SCHEMA " + schema + " CASCADE")
+		store.Close()
+	})
+	old := time.Now().UTC().AddDate(-2, 0, 0)
+	if err = store.insert([]Row{
+		{TS: old, TraceID: "live-old", Source: SourceProxy, Outcome: OutcomeSuccess},
+		{TS: old, TraceID: "imp-old", Source: "extern:cursor", ImportRef: "cursor:s1#m1", Outcome: OutcomeSuccess},
+		{TS: time.Now().UTC(), TraceID: "live-new", Source: SourceProxy, Outcome: OutcomeSuccess},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.prune() // retention 0: nothing goes
+	var n int
+	_ = store.db.QueryRow("SELECT count(*) FROM " + store.table()).Scan(&n)
+	if n != 3 {
+		t.Fatalf("retention 0 deleted rows: %d left", n)
+	}
+	store.retentionDays = 365
+	store.prune()
+	rows, err := store.db.Query("SELECT trace_id FROM " + store.table() + " ORDER BY trace_id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var left []string
+	for rows.Next() {
+		var id string
+		_ = rows.Scan(&id)
+		left = append(left, id)
+	}
+	_ = rows.Close()
+	if fmt.Sprint(left) != "[imp-old live-new]" {
+		t.Fatalf("after 365-day prune = %v, want imported row kept", left)
+	}
+}
