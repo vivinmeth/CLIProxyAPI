@@ -263,3 +263,39 @@ func TestAnalyticsJournalOutOfOrderCommit(t *testing.T) {
 		t.Fatalf("late entry not processed: %d left %v", left, err)
 	}
 }
+
+func TestSanitizeJSONEscapes(t *testing.T) {
+	for in, want := range map[string]string{
+		`{"a":"x\u0000y"}`:           `{"a":"x�y"}`,
+		`{"a":"lit \\u0000 text"}`:   `{"a":"lit \\u0000 text"}`, // escaped backslash: literal text
+		`{"a":"😀 ok"}`:               `{"a":"😀 ok"}`,             // valid pair kept
+		`{"a":"lone \ud83d end"}`:    `{"a":"lone � end"}`,
+		`{"a":"low \ude00"}`:         `{"a":"low �"}`,
+		`{"n":1.000000000000000001}`: `{"n":1.000000000000000001}`, // numbers untouched
+	} {
+		if got := string(cleanJSON([]byte(in))); got != want {
+			t.Errorf("cleanJSON(%s) = %s, want %s", in, got, want)
+		}
+	}
+}
+
+func TestAnalyticsStoresHostileJSON(t *testing.T) {
+	a, an := openTestAnalytics(t)
+	ctx := context.Background()
+	if _, err := a.IngestSession(ctx, SessionIngest{Harness: "opencode", ExternalID: "nul-1", Messages: []MessageIngest{
+		{ExternalID: "m1", Seq: 1, Role: "user", Message: json.RawMessage(`{"role":"user","content":"bad \u0000 and \ud83d here, literal \\u0000"}`)},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, an)
+	var text string
+	if err := an.db.QueryRow(`SELECT text FROM items WHERE session_id = 'opencode:nul-1'`).Scan(&text); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, `literal \u0000`) || strings.ContainsRune(text, 0) {
+		t.Fatalf("text = %q", text)
+	}
+	if n := count(t, an, `SELECT count(*) FROM messages WHERE session_id = 'opencode:nul-1' AND jsonb_typeof(message) = 'object'`); n != 1 {
+		t.Fatal("message not stored as a JSON object")
+	}
+}

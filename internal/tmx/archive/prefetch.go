@@ -145,6 +145,12 @@ func (b *BlobStore) Prefetch(ctx context.Context, hashes []string) {
 // prefetchBodies warms the cache for everything needed to rebuild the given manifests (two
 // rounds: the manifests, then every element, media and part they point at).
 func (a *Archive) prefetchBodies(ctx context.Context, manifests []string) {
+	a.prefetchBodiesOpt(ctx, manifests, true)
+}
+
+// prefetchBodiesOpt is prefetchBodies; media=false skips extracted media (analytics rebuilds
+// bodies without it).
+func (a *Archive) prefetchBodiesOpt(ctx context.Context, manifests []string, media bool) {
 	for depth := 0; depth < 3 && len(manifests) > 0; depth++ {
 		a.blobs.Prefetch(ctx, manifests)
 		var leaves, nested []string
@@ -167,7 +173,9 @@ func (a *Archive) prefetchBodies(ctx context.Context, manifests []string) {
 				leaves = append(leaves, k.Items...)
 			}
 			for _, md := range m.Media {
-				leaves = append(leaves, md.Blob)
+				if media {
+					leaves = append(leaves, md.Blob)
+				}
 			}
 			for _, p := range m.Parts {
 				if p.Text != "" {

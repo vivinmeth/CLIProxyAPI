@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
@@ -74,9 +75,9 @@ func (a *Archive) Conversation(ctx context.Context, sessionID, harness, traceID,
 	if a.analytics != nil && traceID == "" {
 		conv, ok, err := a.analytics.conversation(ctx, sessionID, harness, kind)
 		if err != nil {
-			return nil, err
-		}
-		if ok {
+			// The archive is the source of truth; an analytics outage must not break reading.
+			log.WithError(err).Warn("tmx analytics: conversation read failed, using the archive")
+		} else if ok {
 			return conv, nil
 		}
 	}

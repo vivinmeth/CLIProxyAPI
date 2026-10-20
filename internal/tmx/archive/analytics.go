@@ -13,6 +13,7 @@ package archive
 // first changed message, so replays are harmless and live proxied sessions only append.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -63,7 +64,12 @@ type analytics struct {
 	extracted   atomic.Int64
 	failures    atomic.Int64
 	backfilling atomic.Bool
-	resetReqs   atomic.Bool  // backfill asked to recopy tmx.requests from the start
+	resetGen    atomic.Int64 // bumped by backfill: recopy tmx.requests from the start
+	appliedGen  atomic.Int64 // last resetGen the requests copy has started over for
+	idxMu       sync.Mutex   // trigram index state + DDL (backfill vs deferred build)
+	ctx         context.Context
+	cancel      context.CancelFunc
+	lastRecon   time.Time
 	lastErr     atomic.Value // string
 	lastRunUnix atomic.Int64
 	mu          sync.Mutex // serialises step() and backfill bookkeeping
@@ -101,6 +107,7 @@ func openAnalytics(ctx context.Context, a *Archive, dsn string) (*analytics, err
 	}
 	an := &analytics{a: a, db: db, wake: make(chan struct{}, 1), stop: make(chan struct{}),
 		done: make(chan struct{})}
+	an.ctx, an.cancel = context.WithCancel(context.Background())
 	if err = an.ensureSchema(pingCtx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -243,6 +250,7 @@ func (an *analytics) poke() {
 }
 
 func (an *analytics) close() {
+	an.cancel() // in-flight work is abandoned; the journal keeps it for the next start
 	close(an.stop)
 	<-an.done
 	_ = an.db.Close()
@@ -322,7 +330,7 @@ type journalEntry struct {
 func (an *analytics) step() (bool, error) {
 	an.mu.Lock()
 	defer an.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(an.ctx, 30*time.Minute)
 	defer cancel()
 	an.lastRunUnix.Store(time.Now().Unix())
 
@@ -447,9 +455,9 @@ func (an *analytics) step() (bool, error) {
 
 // buildDeferredIndexes rebuilds the trigram index after a backfill has drained the journal.
 func (an *analytics) buildDeferredIndexes() {
-	an.mu.Lock()
-	defer an.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	an.idxMu.Lock()
+	defer an.idxMu.Unlock()
+	ctx, cancel := context.WithTimeout(an.ctx, 2*time.Hour)
 	defer cancel()
 	if v, err := an.getState(ctx, "trgm_index"); err != nil || v != "pending" || an.backfilling.Load() {
 		return
@@ -484,8 +492,17 @@ func (an *analytics) syncRequests(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if an.resetReqs.Swap(false) {
+	gen := an.resetGen.Load()
+	if gen != an.appliedGen.Load() {
+		if err = an.setState(ctx, "requests_id", "0"); err != nil {
+			return false, err
+		}
+		_ = an.setState(ctx, "requests_recon_id", "0")
+		an.appliedGen.Store(gen)
 		cursor = 0
+	}
+	if err = an.reconcileRequests(ctx, cursor); err != nil {
+		return false, err
 	}
 	var maxID sql.NullInt64
 	if err = an.reqMirror.src.QueryRowContext(ctx, `SELECT max(id) FROM (SELECT id FROM `+an.reqMirror.srcTable+
@@ -503,6 +520,26 @@ func (an *analytics) syncRequests(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	return n >= requestsBatch, nil
+}
+
+// reconcileRequests recopies, every 5 minutes, the rows above the cursor as it was at the
+// previous pass. Rows can commit after a higher id was already copied (concurrent imports); this
+// picks them up within ~5 minutes. Upserts make the overlap harmless.
+func (an *analytics) reconcileRequests(ctx context.Context, cursor int64) error {
+	if time.Since(an.lastRecon) < 5*time.Minute {
+		return nil
+	}
+	from, err := an.stateInt(ctx, "requests_recon_id")
+	if err != nil {
+		return err
+	}
+	if from < cursor {
+		if _, err = an.reqMirror.copy(ctx, `id > $1 AND id <= $2`, from, cursor); err != nil {
+			return err
+		}
+	}
+	an.lastRecon = time.Now()
+	return an.setState(ctx, "requests_recon_id", fmt.Sprint(cursor))
 }
 
 // proxyKeysForTraces maps captured exchanges to their proxy session keys.
@@ -675,7 +712,7 @@ func (an *analytics) extractImportedBatch(ctx context.Context, ids []string) map
 			manifests = append(manifests, hs...)
 			end++
 		}
-		an.a.prefetchBodies(ctx, manifests)
+		an.a.prefetchBodiesOpt(ctx, manifests, false)
 		for _, id := range ids[start:end] {
 			if failed[id] != nil {
 				continue
@@ -877,7 +914,7 @@ func (an *analytics) extractProxy(ctx context.Context, key string) error {
 			_ = rl.DB().QueryRowContext(ctx, `SELECT harness, machine FROM `+rl.Schema()+`.requests
 				WHERE trace_id = $1 ORDER BY id LIMIT 1`, b.traceID).Scan(&s.harness, &s.machine)
 		}
-		an.a.prefetchBodies(ctx, []string{b.reqBody})
+		an.a.prefetchBodiesOpt(ctx, []string{b.reqBody}, false)
 		an.a.blobs.Prefetch(ctx, []string{b.resBody})
 		if msgs, s.model, err = an.proxyMessages(ctx, b); err != nil {
 			return err
@@ -991,6 +1028,41 @@ type BackfillResult struct {
 	Proxy     int64  `json:"proxy_sessions"`
 	Exchanges int64  `json:"exchanges"`
 	Requests  string `json:"requests"`
+	Replayed  int    `json:"replayed"` // failed entries + sessions deleted from the archive
+}
+
+// importedGhosts lists imported sessions in analytics that the archive no longer has.
+func (an *analytics) importedGhosts(ctx context.Context) ([]string, error) {
+	have := map[string]bool{}
+	rows, err := an.a.db.QueryContext(ctx, `SELECT id FROM `+schema+`.sessions`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		have[id] = true
+	}
+	_ = rows.Close()
+	rows, err = an.db.QueryContext(ctx, `SELECT id FROM sessions WHERE kind = 'imported'`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if !have[id] {
+			out = append(out, id)
+		}
+	}
+	return out, rows.Err()
 }
 
 // ErrAnalyticsOff is returned when TMX_ANALYTICS_DSN is not configured.
@@ -1006,15 +1078,43 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 	an.backfilling.Store(true)
 	defer an.backfilling.Store(false)
 	res := &BackfillResult{Requests: "restarted"}
-	if err := an.setState(ctx, "trgm_index", "pending"); err != nil {
-		return nil, err
+	an.idxMu.Lock()
+	err := an.setState(ctx, "trgm_index", "pending")
+	if err == nil {
+		_, err = an.db.ExecContext(ctx, `DROP INDEX IF EXISTS items_text_trgm_idx`)
 	}
-	if _, err := an.db.ExecContext(ctx, `DROP INDEX IF EXISTS items_text_trgm_idx`); err != nil {
-		return nil, err
-	}
-	n, err := an.exchMirror.copy(ctx, `TRUE`)
+	an.idxMu.Unlock()
 	if err != nil {
-		return nil, fmt.Errorf("exchanges: %w", err)
+		return nil, err
+	}
+	// Replay what failed before, and drop imported sessions the archive no longer has (a delete
+	// whose journal entry failed): extractImported deletes them.
+	var replay [][2]string
+	if rows, errF := an.db.QueryContext(ctx, `SELECT kind, ref FROM failed`); errF == nil {
+		for rows.Next() {
+			var k, r string
+			if rows.Scan(&k, &r) == nil {
+				replay = append(replay, [2]string{k, r})
+			}
+		}
+		_ = rows.Close()
+	}
+	ghosts, err := an.importedGhosts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, g := range ghosts {
+		replay = append(replay, [2]string{"session", g})
+	}
+	for _, r := range replay {
+		if _, err = a.db.ExecContext(ctx, `INSERT INTO `+journalTable+` (kind, ref) VALUES ($1, $2)`, r[0], r[1]); err != nil {
+			return nil, err
+		}
+	}
+	res.Replayed = len(replay)
+	n, errX := an.exchMirror.copy(ctx, `TRUE`)
+	if errX != nil {
+		return nil, fmt.Errorf("exchanges: %w", errX)
 	}
 	res.Exchanges = int64(n)
 	tag, err := a.db.ExecContext(ctx, `INSERT INTO `+journalTable+` (kind, ref)
@@ -1030,7 +1130,7 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 		return nil, err
 	}
 	res.Proxy, _ = tag.RowsAffected()
-	an.resetReqs.Store(true)
+	an.resetGen.Add(1)
 	_, _ = an.db.ExecContext(ctx, `DELETE FROM failed`)
 	an.poke()
 	return res, nil
@@ -1293,13 +1393,87 @@ func cleanText(s string) string {
 // cleanJSON makes raw JSON storable as jsonb (which rejects \u0000 and invalid UTF-8). Invalid
 // JSON is stored as a JSON string.
 func cleanJSON(raw []byte) []byte {
-	s := cleanText(string(raw))
-	s = strings.ReplaceAll(s, `\u0000`, `�`)
-	if !json.Valid([]byte(s)) {
-		out, _ := json.Marshal(s)
+	b := sanitizeJSONEscapes([]byte(cleanText(string(raw))))
+	if !json.Valid(b) {
+		out, _ := json.Marshal(string(b))
 		return out
 	}
-	return []byte(s)
+	return b
+}
+
+// sanitizeJSONEscapes rewrites the \u escapes jsonb rejects — \u0000 and unpaired surrogates —
+// to �. It walks the document token by token, so an escaped backslash followed by "u0000"
+// (literal text) is left alone, and structure and numbers are untouched.
+func sanitizeJSONEscapes(b []byte) []byte {
+	if !bytes.Contains(b, []byte(`\u`)) {
+		return b
+	}
+	hex4 := func(i int) (rune, bool) {
+		if i+6 > len(b) || b[i] != '\\' || b[i+1] != 'u' {
+			return 0, false
+		}
+		var r rune
+		for _, c := range b[i+2 : i+6] {
+			switch {
+			case c >= '0' && c <= '9':
+				r = r<<4 | rune(c-'0')
+			case c >= 'a' && c <= 'f':
+				r = r<<4 | rune(c-'a'+10)
+			case c >= 'A' && c <= 'F':
+				r = r<<4 | rune(c-'A'+10)
+			default:
+				return 0, false
+			}
+		}
+		return r, true
+	}
+	const repl = `�`
+	out := make([]byte, 0, len(b))
+	inString := false
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if !inString {
+			if c == '"' {
+				inString = true
+			}
+			out = append(out, c)
+			continue
+		}
+		switch c {
+		case '"':
+			inString = false
+			out = append(out, c)
+		case '\\':
+			r, ok := hex4(i)
+			if !ok {
+				out = append(out, c)
+				if i+1 < len(b) {
+					out = append(out, b[i+1])
+					i++
+				}
+				continue
+			}
+			switch {
+			case r == 0, r >= 0xDC00 && r <= 0xDFFF:
+				out = append(out, repl...)
+				i += 5
+			case r >= 0xD800 && r <= 0xDBFF:
+				if lo, ok2 := hex4(i + 6); ok2 && lo >= 0xDC00 && lo <= 0xDFFF {
+					out = append(out, b[i:i+12]...)
+					i += 11
+				} else {
+					out = append(out, repl...)
+					i += 5
+				}
+			default:
+				out = append(out, b[i:i+6]...)
+				i += 5
+			}
+		default:
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func nullableJSON(raw []byte) any {
