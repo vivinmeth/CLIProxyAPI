@@ -290,7 +290,7 @@ func finalInterceptorHeaders(current, intercepted http.Header) http.Header {
 
 func downstreamHeadersFromExecutor(headers http.Header, passthrough bool) http.Header {
 	if !passthrough {
-		return nil
+		return tmxProtocolHeaders(headers, nil)
 	}
 	return FilterUpstreamHeaders(headers)
 }
@@ -299,7 +299,7 @@ func downstreamHeadersAfterInterceptors(baseRaw, finalRaw http.Header, passthrou
 	if passthrough {
 		return FilterUpstreamHeaders(finalRaw)
 	}
-	return FilterUpstreamHeaders(diffHeaders(baseRaw, finalRaw))
+	return tmxProtocolHeaders(finalRaw, FilterUpstreamHeaders(diffHeaders(baseRaw, finalRaw)))
 }
 
 func diffHeaders(base, next http.Header) http.Header {
