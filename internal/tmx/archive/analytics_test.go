@@ -235,3 +235,31 @@ func TestAnalyticsProxyShadowAndBackfill(t *testing.T) {
 		t.Fatalf("status = %+v %v", st, err)
 	}
 }
+
+// A journal entry whose transaction commits after a later entry's must still be processed.
+func TestAnalyticsJournalOutOfOrderCommit(t *testing.T) {
+	a, an := openTestAnalytics(t)
+	ctx := context.Background()
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = a.journal(ctx, tx, "session", "late:1"); err != nil { // lower id, commits last
+		t.Fatal(err)
+	}
+	if err = a.journal(ctx, a.db, "session", "early:2"); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, an)
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var left int
+	if err = a.db.QueryRow(`SELECT count(*) FROM ` + journalTable).Scan(&left); err != nil || left != 1 {
+		t.Fatalf("journal after first drain = %d %v", left, err)
+	}
+	drain(t, an)
+	if err = a.db.QueryRow(`SELECT count(*) FROM ` + journalTable).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("late entry not processed: %d left %v", left, err)
+	}
+}

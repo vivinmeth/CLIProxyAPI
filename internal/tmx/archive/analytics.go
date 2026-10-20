@@ -55,10 +55,9 @@ type analytics struct {
 	reqMirror  *mirror // tmx.requests -> requests (nil when the request log is off)
 	exchMirror *mirror // tmx_archive.exchanges -> exchanges
 
-	wake     chan struct{}
-	stop     chan struct{}
-	done     chan struct{}
-	attempts map[int64]int
+	wake chan struct{}
+	stop chan struct{}
+	done chan struct{}
 
 	processed   atomic.Int64
 	extracted   atomic.Int64
@@ -101,7 +100,7 @@ func openAnalytics(ctx context.Context, a *Archive, dsn string) (*analytics, err
 		return nil, fmt.Errorf("ping: %w", err)
 	}
 	an := &analytics{a: a, db: db, wake: make(chan struct{}, 1), stop: make(chan struct{}),
-		done: make(chan struct{}), attempts: map[int64]int{}}
+		done: make(chan struct{})}
 	if err = an.ensureSchema(pingCtx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -196,6 +195,17 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 			return fmt.Errorf("analytics schema: %w", err)
 		}
 	}
+	// The journal used to be read with a cursor; entries up to it are done.
+	if old, err := an.stateInt(ctx, "journal_id"); err != nil {
+		return err
+	} else if old > 0 {
+		if _, err = an.a.db.ExecContext(ctx, `DELETE FROM `+journalTable+` WHERE id <= $1`, old); err != nil {
+			return err
+		}
+		if _, err = an.db.ExecContext(ctx, `DELETE FROM state WHERE key = 'journal_id'`); err != nil {
+			return err
+		}
+	}
 	var err error
 	if an.exchMirror, err = ensureMirror(ctx, an.a.db, an.db, schema, "exchanges", "exchanges", "trace_id",
 		[]string{"ts", "session_id", "client_session_id"}); err != nil {
@@ -242,7 +252,6 @@ func (an *analytics) run() {
 	defer close(an.done)
 	tick := time.NewTicker(analyticsPoll)
 	defer tick.Stop()
-	lastPrune := time.Time{}
 	for {
 		select {
 		case <-an.stop:
@@ -267,10 +276,6 @@ func (an *analytics) run() {
 				return
 			default:
 			}
-		}
-		if time.Since(lastPrune) > 10*time.Minute {
-			an.prune()
-			lastPrune = time.Now()
 		}
 	}
 }
@@ -310,6 +315,7 @@ func (an *analytics) stateInt(ctx context.Context, key string) (int64, error) {
 type journalEntry struct {
 	id        int64
 	kind, ref string
+	attempts  int
 }
 
 // step processes one journal batch plus new tmx.requests rows. more = there is probably more.
@@ -324,19 +330,18 @@ func (an *analytics) step() (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("requests mirror: %w", err)
 	}
-	cursor, err := an.stateInt(ctx, "journal_id")
-	if err != nil {
-		return false, err
-	}
-	rows, err := an.a.db.QueryContext(ctx, `SELECT id, kind, ref FROM `+journalTable+`
-		WHERE id > $1 ORDER BY id LIMIT $2`, cursor, journalBatch)
+	// The journal is a queue: processed entries are deleted. (A cursor over the BIGSERIAL id
+	// would skip entries whose transaction commits after a later id's.) Failed entries back off
+	// and don't hold up the rest.
+	rows, err := an.a.db.QueryContext(ctx, `SELECT id, kind, ref, attempts FROM `+journalTable+`
+		WHERE not_before IS NULL OR not_before <= now() ORDER BY id LIMIT $1`, journalBatch)
 	if err != nil {
 		return false, err
 	}
 	var entries []journalEntry
 	for rows.Next() {
 		var e journalEntry
-		if err = rows.Scan(&e.id, &e.kind, &e.ref); err != nil {
+		if err = rows.Scan(&e.id, &e.kind, &e.ref, &e.attempts); err != nil {
 			_ = rows.Close()
 			return false, err
 		}
@@ -406,39 +411,36 @@ func (an *analytics) step() (bool, error) {
 		}
 	}
 
-	// Advance the cursor up to the first entry that failed and still has retries left; entries
-	// that keep failing go to the failed table (rerun them with a backfill).
-	next := entries[len(entries)-1].id
+	// Done entries are deleted; failed ones retry after 1, 2, ... minutes and after maxAttempts go
+	// to the failed table (a backfill reruns them).
+	var done []string
 	for _, e := range entries {
 		errE, bad := failedIDs[e.id]
+		if !bad || e.attempts+1 >= maxAttempts {
+			done = append(done, fmt.Sprint(e.id))
+		}
 		if !bad {
-			delete(an.attempts, e.id)
 			continue
 		}
-		an.attempts[e.id]++
-		if an.attempts[e.id] < maxAttempts {
-			next = e.id - 1
-			an.setErr(fmt.Errorf("%s %s: %w", e.kind, e.ref, errE))
-			break
+		an.setErr(fmt.Errorf("%s %s: %w", e.kind, e.ref, errE))
+		if e.attempts+1 >= maxAttempts {
+			_, _ = an.db.ExecContext(ctx, `INSERT INTO failed (journal_id, kind, ref, error) VALUES ($1,$2,$3,$4)
+				ON CONFLICT (journal_id) DO UPDATE SET error = EXCLUDED.error, failed_at = now()`,
+				e.id, e.kind, e.ref, cleanText(errE.Error()))
+			log.WithError(errE).Warnf("tmx analytics: giving up on %s %s", e.kind, e.ref)
+			continue
 		}
-		delete(an.attempts, e.id)
-		_, _ = an.db.ExecContext(ctx, `INSERT INTO failed (journal_id, kind, ref, error) VALUES ($1,$2,$3,$4)
-			ON CONFLICT (journal_id) DO UPDATE SET error = EXCLUDED.error, failed_at = now()`,
-			e.id, e.kind, e.ref, cleanText(errE.Error()))
-		log.WithError(errE).Warnf("tmx analytics: giving up on %s %s", e.kind, e.ref)
-	}
-	if next > cursor {
-		if err = an.setState(ctx, "journal_id", fmt.Sprint(next)); err != nil {
+		if _, err = an.a.db.ExecContext(ctx, `UPDATE `+journalTable+` SET attempts = attempts + 1,
+			not_before = now() + make_interval(mins => attempts + 1) WHERE id = $1`, e.id); err != nil {
 			return false, err
 		}
-		for _, e := range entries {
-			if e.id <= next {
-				an.processed.Add(1)
-			}
-		}
 	}
-	if next < entries[len(entries)-1].id {
-		return false, nil // wait for the next poll before retrying
+	if len(done) > 0 {
+		if _, err = an.a.db.ExecContext(ctx, `DELETE FROM `+journalTable+` WHERE id = ANY($1::bigint[])`,
+			"{"+strings.Join(done, ",")+"}"); err != nil {
+			return false, err
+		}
+		an.processed.Add(int64(len(done)))
 	}
 	return len(entries) == journalBatch || moreReq, nil
 }
@@ -452,9 +454,8 @@ func (an *analytics) buildDeferredIndexes() {
 	if v, err := an.getState(ctx, "trgm_index"); err != nil || v != "pending" || an.backfilling.Load() {
 		return
 	}
-	var backlog sql.NullInt64
-	cursor, _ := an.stateInt(ctx, "journal_id")
-	if an.a.db.QueryRowContext(ctx, `SELECT count(*) FROM `+journalTable+` WHERE id > $1`, cursor).Scan(&backlog) != nil || backlog.Int64 > 0 {
+	var backlog int64
+	if an.a.db.QueryRowContext(ctx, `SELECT count(*) FROM `+journalTable+` WHERE attempts = 0`).Scan(&backlog) != nil || backlog > 0 {
 		return
 	}
 	conn, err := an.db.Conn(ctx)
@@ -471,16 +472,6 @@ func (an *analytics) buildDeferredIndexes() {
 	}
 	_ = an.setState(ctx, "trgm_index", "built")
 	log.Infof("tmx analytics: trigram index built in %s", time.Since(start).Round(time.Second))
-}
-
-func (an *analytics) prune() {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	cursor, err := an.stateInt(ctx, "journal_id")
-	if err != nil || cursor == 0 {
-		return
-	}
-	_, _ = an.a.db.ExecContext(ctx, `DELETE FROM `+journalTable+` WHERE id <= $1 AND created_at < now() - interval '1 day'`, cursor)
 }
 
 // syncRequests copies new tmx.requests rows (by id). Rewrites of imported rows are picked up by
@@ -1051,10 +1042,9 @@ func (a *Archive) AnalyticsStatus(ctx context.Context) (map[string]any, error) {
 	if an == nil {
 		return nil, ErrAnalyticsOff
 	}
-	cursor, _ := an.stateInt(ctx, "journal_id")
 	reqCursor, _ := an.stateInt(ctx, "requests_id")
-	var maxJournal sql.NullInt64
-	_ = a.db.QueryRowContext(ctx, `SELECT max(id) FROM `+journalTable).Scan(&maxJournal)
+	var backlog, retrying int64
+	_ = a.db.QueryRowContext(ctx, `SELECT count(*), count(*) FILTER (WHERE attempts > 0) FROM `+journalTable).Scan(&backlog, &retrying)
 	counts := map[string]int64{}
 	for _, t := range []string{"sessions", "messages", "items", "exchanges", "requests", "failed"} {
 		if t == "requests" && an.reqMirror == nil {
@@ -1086,15 +1076,11 @@ func (a *Archive) AnalyticsStatus(ctx context.Context) (map[string]any, error) {
 	if trgm == "" {
 		trgm = "built"
 	}
-	backlog := int64(0)
-	if maxJournal.Valid && maxJournal.Int64 > cursor {
-		backlog = maxJournal.Int64 - cursor
-	}
 	return map[string]any{
 		"enabled":          true,
 		"version":          analyticsVersion,
-		"journal_cursor":   cursor,
 		"journal_backlog":  backlog,
+		"journal_retrying": retrying,
 		"requests_cursor":  reqCursor,
 		"counts":           counts,
 		"sessions_by_kind": byKind,

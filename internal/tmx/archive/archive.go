@@ -256,6 +256,8 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 			ref        TEXT NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`ALTER TABLE ` + schema + `.analytics_journal ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + schema + `.analytics_journal ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
