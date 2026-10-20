@@ -70,3 +70,12 @@ func TestTruncateKeepsValidUTF8(t *testing.T) {
 		t.Fatalf("truncate = %q", got)
 	}
 }
+
+func TestClientAddressPrefersForwardedFor(t *testing.T) {
+	if got := clientAddress("10.64.0.64, 10.0.1.4", "10.0.1.4", "10.0.1.4"); got != "10.64.0.64" {
+		t.Fatalf("got %q", got)
+	}
+	if got := clientAddress("", "", "10.64.0.28"); got != "10.64.0.28" {
+		t.Fatalf("got %q", got)
+	}
+}

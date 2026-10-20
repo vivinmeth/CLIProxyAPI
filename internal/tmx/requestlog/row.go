@@ -87,6 +87,18 @@ func classify(ctx context.Context, record coreusage.Record) (string, int) {
 	return OutcomeFailed, status
 }
 
+// clientAddress prefers the first X-Forwarded-For hop: behind Traefik the socket peer is the
+// swarm overlay address, which says nothing about which machine sent the request.
+func clientAddress(forwardedFor, resolved, peer string) string {
+	if first, _, _ := strings.Cut(forwardedFor, ","); strings.TrimSpace(first) != "" {
+		return strings.TrimSpace(first)
+	}
+	if resolved = strings.TrimSpace(resolved); resolved != "" {
+		return resolved
+	}
+	return strings.TrimSpace(peer)
+}
+
 func hashAPIKey(key string) string {
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -115,10 +127,7 @@ func rowFromRecord(ctx context.Context, record coreusage.Record) Row {
 		ts = time.Now()
 	}
 	meta := internallogging.GetClientRequestMetadata(ctx)
-	clientIP := strings.TrimSpace(meta.ResolvedClientIP)
-	if clientIP == "" {
-		clientIP = strings.TrimSpace(meta.ClientIP)
-	}
+	clientIP := clientAddress(meta.XForwardedFor, meta.ResolvedClientIP, meta.ClientIP)
 	traceID := strings.TrimSpace(record.TraceID)
 	if traceID == "" {
 		traceID = strings.TrimSpace(internallogging.GetRequestID(ctx))
