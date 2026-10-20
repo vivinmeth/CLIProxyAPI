@@ -416,5 +416,8 @@ func (s *Store) prune() {
 // DB exposes the handle for tests and maintenance tooling.
 func (s *Store) DB() *sql.DB { return s.db }
 
+// Schema returns the schema the store writes to.
+func (s *Store) Schema() string { return s.schema }
+
 // SetDefaultForTest replaces the running store (tests only).
 func SetDefaultForTest(s *Store) { current.Store(s) }

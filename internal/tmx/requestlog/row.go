@@ -148,6 +148,51 @@ func clientAddress(forwardedFor, resolved, peer string) string {
 	return strings.TrimSpace(peer)
 }
 
+// machineEnvTokens are leading segments that name an environment, not a machine
+// ("sk-tmx-stg-macbook-…" is the macbook's staging key).
+var machineEnvTokens = map[string]bool{"stg": true, "staging": true, "prod": true, "dev": true}
+
+// MachineFromKey reads the machine name from a client key named "sk-tmx-[<env>-]<machine>-<secret>".
+// Random keys ("sk-tmx-<hex>") and anything else return "". The name must contain a letter so a
+// hex secret is never mistaken for one.
+func MachineFromKey(key string) string {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(key), "sk-tmx-")
+	if !ok {
+		return ""
+	}
+	parts := strings.Split(rest, "-")
+	for len(parts) > 2 && machineEnvTokens[strings.ToLower(parts[0])] {
+		parts = parts[1:]
+	}
+	if len(parts) < 2 {
+		return ""
+	}
+	name := strings.ToLower(parts[0])
+	hasLetter := false
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+			hasLetter = true
+		case r >= '0' && r <= '9', r == '_', r == '.':
+		default:
+			return ""
+		}
+	}
+	if !hasLetter || len(name) > 40 || isHex(name) || machineEnvTokens[name] {
+		return ""
+	}
+	return name
+}
+
+func isHex(s string) bool {
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return len(s) >= 8
+}
+
 func hashAPIKey(key string) string {
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -225,6 +270,7 @@ func rowFromRecord(ctx context.Context, record coreusage.Record) Row {
 		AuthLabel:       strings.TrimSpace(record.Source),
 		AuthType:        strings.TrimSpace(record.AuthType),
 		APIKeyHash:      hashAPIKey(record.APIKey),
+		Machine:         MachineFromKey(record.APIKey),
 		AccessProvider:  accessProvider,
 		ClientIP:        clientIP,
 		UserAgent:       truncate(meta.UserAgent, 300),

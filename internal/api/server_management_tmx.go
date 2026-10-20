@@ -11,16 +11,66 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/archive"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/quota"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
 )
 
 const tmxMaxSummaryRange = 400 * 24 * time.Hour
 
-func registerTMXManagementRoutes(v8 *gin.RouterGroup) {
+func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher) {
 	v8.GET("/tmx/requests/summary", tmxRequestSummary)
 	v8.GET("/tmx/requests", tmxRequestList)
 	v8.GET("/tmx/requests/rollup", tmxRequestRollup)
+	v8.GET("/tmx/requests/sessions", tmxRequestSessions)
 	registerTMXArchiveRoutes(v8)
+	if store := requestlog.Default(); store != nil {
+		quota.Start(store.DB(), store.Schema(), fetcher)
+	}
+	v8.GET("/tmx/quota/current", tmxQuotaCurrent)
+	v8.GET("/tmx/quota/history", tmxQuotaHistory)
+}
+
+// tmxQuotaCurrent: GET /tmx/quota/current — latest reading of every window of every account.
+func tmxQuotaCurrent(c *gin.Context) {
+	svc := quota.Default()
+	if svc == nil {
+		c.JSON(http.StatusOK, gin.H{"enabled": false, "accounts": []any{}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "accounts": svc.Accounts()})
+}
+
+// tmxQuotaHistory: GET /tmx/quota/history?auth_id&window&from&to&limit — snapshots oldest first
+// (default last 7 days, limit 20000, max 100000).
+func tmxQuotaHistory(c *gin.Context) {
+	svc := quota.Default()
+	if svc == nil {
+		c.JSON(http.StatusOK, gin.H{"enabled": false, "snapshots": []any{}})
+		return
+	}
+	to := time.Now().UTC()
+	from := to.Add(-7 * 24 * time.Hour)
+	for key, dst := range map[string]*time.Time{"from": &from, "to": &to} {
+		if raw := strings.TrimSpace(c.Query(key)); raw != "" {
+			n, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid " + key})
+				return
+			}
+			*dst = time.Unix(n, 0).UTC()
+		}
+	}
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20000"))
+	if limit <= 0 || limit > 100000 {
+		limit = 20000
+	}
+	rows, truncated, err := svc.History(c.Request.Context(), strings.TrimSpace(c.Query("auth_id")),
+		strings.TrimSpace(c.Query("window")), from, to, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "snapshots": rows, "truncated": truncated})
 }
 
 // tmxRange parses from/to (unix seconds) with a default of the last 24 hours.
@@ -170,6 +220,27 @@ func tmxRequestRollup(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "bucket": unit, "tz": tz, "dims": dims,
 		"rows": rows, "truncated": truncated})
+}
+
+// tmxRequestSessions: GET /tmx/requests/sessions?from&to&order=tokens|recent&limit plus the shared
+// filters — per-session totals, largest first (limit ≤ 1000, default 100).
+func tmxRequestSessions(c *gin.Context) {
+	store := requestlog.Default()
+	if store == nil {
+		c.JSON(http.StatusOK, gin.H{"enabled": false, "sessions": []any{}})
+		return
+	}
+	f, ok := tmxFilter(c)
+	if !ok {
+		return
+	}
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
+	sessions, err := store.SessionTotals(c.Request.Context(), f, strings.TrimSpace(c.Query("order")), limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "sessions": sessions})
 }
 
 func normalizedLimit(n int) int {

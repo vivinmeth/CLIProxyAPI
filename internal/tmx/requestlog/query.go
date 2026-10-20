@@ -270,6 +270,7 @@ func (s *Store) List(ctx context.Context, f Filter, beforeID int64, limit int) (
 var RollupDims = map[string]bool{
 	"source": true, "provider": true, "model": true, "response_model": true, "auth_id": true,
 	"api_key_hash": true, "machine": true, "outcome": true, "accounting_quality": true,
+	"session_id": true,
 }
 
 // RollupRow is one cell of the rollup cube.
@@ -349,4 +350,118 @@ func (s *Store) Rollup(ctx context.Context, f Filter, unit, tz string, dims []st
 		out = out[:maxRows]
 	}
 	return out, truncated, rows.Err()
+}
+
+// SessionTotal is one session's usage across a time range.
+type SessionTotal struct {
+	SessionID string    `json:"session_id"`
+	FirstTS   time.Time `json:"first_ts"`
+	LastTS    time.Time `json:"last_ts"`
+	Models    []string  `json:"models"`
+	AuthIDs   []string  `json:"auth_ids"`
+	Machines  []string  `json:"machines"`
+	Sources   []string  `json:"sources"`
+	KeyHashes []string  `json:"api_key_hashes"`
+	Attempts  int64     `json:"attempts"`
+	Success   int64     `json:"success"`
+	Failed    int64     `json:"failed"`
+	Canceled  int64     `json:"canceled"`
+	// Normalised tokens; see Counts.
+	UncachedInput      int64 `json:"uncached_input"`
+	CacheRead          int64 `json:"cache_read"`
+	CacheWrite         int64 `json:"cache_write"`
+	OutputNonReasoning int64 `json:"output_non_reasoning"`
+	ReasoningTokens    int64 `json:"reasoning_tokens"`
+	TotalTokens        int64 `json:"total_tokens"`
+	Incomplete         int64 `json:"incomplete_accounting"`
+}
+
+// SessionTotals returns per-session totals for rows matching f, largest total_tokens first (or
+// most recent first with order "recent"). Rows without a session id are skipped. Pricing per
+// model is the caller's job: use a rollup with dims=session_id,model for that.
+func (s *Store) SessionTotals(ctx context.Context, f Filter, order string, limit int) ([]SessionTotal, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	where, args := f.where()
+	orderBy := "sum(total_tokens) DESC"
+	if order == "recent" {
+		orderBy = "max(ts) DESC"
+	}
+	args = append(args, limit)
+	agg := func(col string) string {
+		return "COALESCE(array_agg(DISTINCT " + col + ") FILTER (WHERE " + col + " <> ''), '{}')"
+	}
+	q := `SELECT session_id, min(ts), max(ts), ` + agg("model") + `, ` + agg("auth_id") + `, ` +
+		agg("machine") + `, ` + agg("source") + `, ` + agg("api_key_hash") + `,
+		count(*), count(*) FILTER (WHERE outcome = 'success'), count(*) FILTER (WHERE outcome = 'failed'),
+		count(*) FILTER (WHERE outcome = 'canceled'), COALESCE(sum(uncached_input), 0), COALESCE(sum(cache_read), 0),
+		COALESCE(sum(cache_write), 0), COALESCE(sum(output_non_reasoning), 0), COALESCE(sum(reasoning_tokens), 0),
+		COALESCE(sum(total_tokens), 0), count(*) FILTER (WHERE accounting_quality NOT IN ('complete', ''))
+		FROM ` + s.table() + where + ` AND session_id <> '' GROUP BY session_id ORDER BY ` + orderBy +
+		fmt.Sprintf(` LIMIT $%d`, len(args))
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := []SessionTotal{}
+	for rows.Next() {
+		var r SessionTotal
+		var models, auths, machines, sources, keys pgTextArray
+		if err = rows.Scan(&r.SessionID, &r.FirstTS, &r.LastTS, &models, &auths, &machines, &sources, &keys,
+			&r.Attempts, &r.Success, &r.Failed, &r.Canceled, &r.UncachedInput, &r.CacheRead, &r.CacheWrite,
+			&r.OutputNonReasoning, &r.ReasoningTokens, &r.TotalTokens, &r.Incomplete); err != nil {
+			return nil, err
+		}
+		r.Models, r.AuthIDs, r.Machines, r.Sources, r.KeyHashes = models, auths, machines, sources, keys
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// pgTextArray scans a Postgres text[] in its text form ("{a,b,\"c d\"}").
+type pgTextArray []string
+
+func (a *pgTextArray) Scan(src any) error {
+	var s string
+	switch v := src.(type) {
+	case nil:
+		*a = []string{}
+		return nil
+	case []byte:
+		s = string(v)
+	case string:
+		s = v
+	default:
+		return fmt.Errorf("pgTextArray: unsupported %T", src)
+	}
+	s = strings.TrimSuffix(strings.TrimPrefix(s, "{"), "}")
+	out := []string{}
+	var cur strings.Builder
+	inQuote, escaped, seen := false, false, false
+	for _, r := range s {
+		switch {
+		case escaped:
+			cur.WriteRune(r)
+			escaped = false
+		case r == '\\':
+			escaped = true
+		case r == '"':
+			inQuote = !inQuote
+			seen = true
+		case r == ',' && !inQuote:
+			out = append(out, cur.String())
+			cur.Reset()
+			seen = false
+		default:
+			cur.WriteRune(r)
+			seen = true
+		}
+	}
+	if seen || cur.Len() > 0 {
+		out = append(out, cur.String())
+	}
+	*a = out
+	return nil
 }
