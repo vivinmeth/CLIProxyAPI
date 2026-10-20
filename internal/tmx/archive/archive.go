@@ -39,6 +39,7 @@ type Archive struct {
 	db    *sql.DB
 	blobs *BlobStore
 	env   string
+	cost  costTracker
 
 	queue      chan *capture.Exchange
 	queueBytes atomic.Int64
@@ -156,6 +157,7 @@ func Open(ctx context.Context, dsn string, r2 *minio.Client, bucket, env, spool 
 		a.wg.Add(1)
 		go a.worker()
 	}
+	go a.costWatch()
 	return a, nil
 }
 
@@ -199,6 +201,8 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS exchanges_session_idx ON ` + schema + `.exchanges (session_id, ts) WHERE session_id <> ''`,
 		// The client's own session id (Claude Code transcript id, Codex session) - what imports use.
 		`ALTER TABLE ` + schema + `.exchanges ADD COLUMN IF NOT EXISTS client_session_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE ` + schema + `.blobs ADD COLUMN IF NOT EXISTS pack_key TEXT`,
+		`ALTER TABLE ` + schema + `.blobs ADD COLUMN IF NOT EXISTS pack_offset BIGINT`,
 		`CREATE INDEX IF NOT EXISTS exchanges_client_session_idx ON ` + schema + `.exchanges (client_session_id) WHERE client_session_id <> ''`,
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.sessions (
 			id              TEXT PRIMARY KEY,
@@ -437,20 +441,28 @@ func sniffMediaType(b []byte) string {
 
 // Stats for the status endpoint.
 func (a *Archive) Stats() map[string]any {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cost, errCost := a.Cost(ctx)
+	if errCost != nil {
+		log.WithError(errCost).Debug("tmx archive: cost estimate failed")
+	}
 	return map[string]any{
-		"env":             a.env,
-		"capture":         capture.Enabled(),
-		"captured":        a.captured.Load(),
-		"dropped":         a.dropped.Load(),
-		"failed":          a.failed.Load(),
-		"queued":          len(a.queue),
-		"queued_bytes":    a.queueBytes.Load(),
-		"blobs_stored":    a.blobs.stored.Load(),
-		"blobs_deduped":   a.blobs.dedup.Load(),
-		"blobs_uploaded":  a.blobs.uploaded.Load(),
-		"upload_failures": a.blobs.failures.Load(),
-		"spool_backlog":   a.blobs.SpoolBacklog(),
-		"r2_configured":   a.blobs.r2 != nil,
+		"r2_cost_estimate": cost,
+		"env":              a.env,
+		"capture":          capture.Enabled(),
+		"captured":         a.captured.Load(),
+		"dropped":          a.dropped.Load(),
+		"failed":           a.failed.Load(),
+		"queued":           len(a.queue),
+		"queued_bytes":     a.queueBytes.Load(),
+		"blobs_stored":     a.blobs.stored.Load(),
+		"blobs_deduped":    a.blobs.dedup.Load(),
+		"blobs_uploaded":   a.blobs.uploaded.Load(),
+		"packs_uploaded":   a.blobs.packs.Load(),
+		"upload_failures":  a.blobs.failures.Load(),
+		"spool_backlog":    a.blobs.SpoolBacklog(),
+		"r2_configured":    a.blobs.r2 != nil,
 	}
 }
 

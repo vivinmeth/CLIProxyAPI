@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,11 @@ import (
 // Postgres, then uploaded to R2 by a background loop and removed from the spool. A blob is
 // readable from the spool until it is uploaded and from R2 afterwards, so an R2 outage never
 // blocks or loses a write.
+//
+// R2 bills per object written, and a request produces dozens of small blobs, so the upload loop
+// concatenates everything spooled since the last pass into one pack object and records each
+// blob's pack key and byte offset; reads fetch just that byte range. Blobs written before packs
+// existed, and blobs too big to be worth packing, are stored as one object per hash.
 type BlobStore struct {
 	db     *sql.DB
 	schema string
@@ -46,6 +52,7 @@ type BlobStore struct {
 	stored   atomic.Int64
 	dedup    atomic.Int64
 	uploaded atomic.Int64
+	packs    atomic.Int64
 	failures atomic.Int64
 }
 
@@ -167,7 +174,21 @@ func (b *BlobStore) Get(ctx context.Context, hash string) ([]byte, error) {
 		if b.r2 == nil {
 			return nil, fmt.Errorf("blob %s not found", hash)
 		}
-		obj, errGet := b.r2.GetObject(ctx, b.bucket, b.objectKey(hash), minio.GetObjectOptions{})
+		key, opts := b.objectKey(hash), minio.GetObjectOptions{}
+		var packKey sql.NullString
+		var packOffset, storedSize sql.NullInt64
+		if errIdx := b.db.QueryRowContext(ctx, `SELECT pack_key, pack_offset, stored_size FROM `+b.schema+
+			`.blobs WHERE hash = $1`, hash).Scan(&packKey, &packOffset, &storedSize); errIdx != nil &&
+			!errors.Is(errIdx, sql.ErrNoRows) {
+			return nil, errIdx
+		}
+		if packKey.Valid && packKey.String != "" {
+			key = packKey.String
+			if errRange := opts.SetRange(packOffset.Int64, packOffset.Int64+storedSize.Int64-1); errRange != nil {
+				return nil, errRange
+			}
+		}
+		obj, errGet := b.r2.GetObject(ctx, b.bucket, key, opts)
 		if errGet != nil {
 			return nil, errGet
 		}
@@ -188,24 +209,41 @@ func (b *BlobStore) MediaType(ctx context.Context, hash string) string {
 
 func (b *BlobStore) uploadLoop() {
 	defer close(b.stopped)
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(packInterval)
 	defer ticker.Stop()
 	for {
-		b.uploadPending()
 		select {
 		case <-b.stop:
 			b.uploadPending()
 			return
 		case <-b.kick:
+			// Upload early only once enough has piled up (bulk imports); otherwise wait for the
+			// ticker so each pass makes one pack instead of one object per request.
+			if b.SpoolBacklog() < packMaxBlobs {
+				continue
+			}
 		case <-ticker.C:
 		}
+		b.uploadPending()
 	}
 }
 
-const uploadConcurrency = 8
+const (
+	uploadConcurrency = 4
+	packInterval      = 30 * time.Second
+	packMaxBytes      = 32 << 20 // per pack object
+	packMaxBlobs      = 5000
+	packLoneBytes     = 8 << 20 // blobs at least this big get their own object
+)
 
-// uploadPending pushes every spooled blob to R2 with a few parallel uploads (bulk imports produce
-// thousands of small blobs). Without R2 (dev) blobs simply stay spooled.
+// spooled is one blob waiting in the spool.
+type spooled struct {
+	hash string
+	data []byte
+}
+
+// uploadPending pushes every spooled blob to R2, grouped into pack objects. Without R2 (dev) blobs
+// simply stay spooled.
 func (b *BlobStore) uploadPending() {
 	if b.r2 == nil {
 		return
@@ -214,18 +252,24 @@ func (b *BlobStore) uploadPending() {
 	if err != nil {
 		return
 	}
-	work := make(chan string)
+	jobs := make(chan []spooled)
 	var failed atomic.Bool
 	var wg sync.WaitGroup
 	for i := 0; i < uploadConcurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for hash := range work {
+			for group := range jobs {
 				if failed.Load() {
 					continue
 				}
-				if errUp := b.uploadOne(hash); errUp != nil {
+				var errUp error
+				if len(group) == 1 && len(group[0].data) >= packLoneBytes {
+					errUp = b.uploadOne(group[0])
+				} else {
+					errUp = b.uploadPack(group)
+				}
+				if errUp != nil {
 					failed.Store(true)
 					if b.failures.Add(1)%50 == 1 {
 						log.WithError(errUp).Warn("tmx archive: upload to R2 failed; blobs stay spooled and will retry")
@@ -234,39 +278,105 @@ func (b *BlobStore) uploadPending() {
 			}
 		}()
 	}
+	var group []spooled
+	size := 0
+	flush := func() {
+		if len(group) > 0 && !failed.Load() {
+			jobs <- group
+		}
+		group, size = nil, 0
+	}
 	for _, entry := range entries {
+		if failed.Load() {
+			break
+		}
 		name := entry.Name()
 		hash := strings.TrimSuffix(name, ".zst")
 		if !strings.HasSuffix(name, ".zst") || !ValidHash(hash) {
 			continue
 		}
-		if failed.Load() {
-			break
+		data, errRead := os.ReadFile(b.spoolPath(hash))
+		if errRead != nil {
+			continue // uploaded by another pass
 		}
-		work <- hash
+		if len(data) >= packLoneBytes {
+			jobs <- []spooled{{hash: hash, data: data}}
+			continue
+		}
+		if size+len(data) > packMaxBytes || len(group) >= packMaxBlobs {
+			flush()
+		}
+		group = append(group, spooled{hash: hash, data: data})
+		size += len(data)
 	}
-	close(work)
+	flush()
+	close(jobs)
 	wg.Wait()
 }
 
-func (b *BlobStore) uploadOne(hash string) error {
-	path := b.spoolPath(hash)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil // already uploaded by another pass
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+// uploadOne stores a single blob as its own object (legacy layout, used for very large blobs).
+func (b *BlobStore) uploadOne(blob spooled) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	if _, err = b.r2.PutObject(ctx, b.bucket, b.objectKey(hash), bytes.NewReader(data), int64(len(data)),
-		minio.PutObjectOptions{ContentType: "application/zstd"}); err != nil {
+	if _, err := b.r2.PutObject(ctx, b.bucket, b.objectKey(blob.hash), bytes.NewReader(blob.data),
+		int64(len(blob.data)), minio.PutObjectOptions{ContentType: "application/zstd"}); err != nil {
 		return err
 	}
-	if _, err = b.db.ExecContext(ctx, `UPDATE `+b.schema+`.blobs SET uploaded_at = now() WHERE hash = $1`, hash); err != nil {
+	if _, err := b.db.ExecContext(ctx, `UPDATE `+b.schema+`.blobs SET uploaded_at = now() WHERE hash = $1`,
+		blob.hash); err != nil {
 		return err
 	}
-	_ = os.Remove(path)
+	_ = os.Remove(b.spoolPath(blob.hash))
 	b.uploaded.Add(1)
 	return nil
+}
+
+// uploadPack concatenates blobs into one object, then records each blob's pack and offset. If the
+// index update fails the blobs stay spooled and go into a later pack; the orphaned pack only
+// wastes its bytes.
+func (b *BlobStore) uploadPack(group []spooled) error {
+	var buf bytes.Buffer
+	hashes := make([]string, len(group))
+	offsets := make([]int64, len(group))
+	for i, blob := range group {
+		hashes[i] = blob.hash
+		offsets[i] = int64(buf.Len())
+		buf.Write(blob.data)
+	}
+	now := time.Now().UTC()
+	key := fmt.Sprintf("%s/packs/%s/%s-%s.pack", strings.TrimSuffix(b.prefix, "/blobs"),
+		now.Format("2006/01/02"), now.Format("150405.000000000"), group[0].hash[:12])
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if _, err := b.r2.PutObject(ctx, b.bucket, key, bytes.NewReader(buf.Bytes()), int64(buf.Len()),
+		minio.PutObjectOptions{ContentType: "application/octet-stream"}); err != nil {
+		return err
+	}
+	if _, err := b.db.ExecContext(ctx, `UPDATE `+b.schema+`.blobs AS b
+		SET uploaded_at = now(), pack_key = $1, pack_offset = u.off
+		FROM unnest($2::text[], $3::bigint[]) AS u(hash, off) WHERE b.hash = u.hash`,
+		key, pgArray(hashes), pgInt64Array(offsets)); err != nil {
+		return err
+	}
+	for _, h := range hashes {
+		_ = os.Remove(b.spoolPath(h))
+	}
+	b.uploaded.Add(int64(len(group)))
+	b.packs.Add(1)
+	return nil
+}
+
+// pgArray / pgInt64Array render Postgres array literals (lib-agnostic; hashes are hex only).
+func pgArray(items []string) string {
+	return "{" + strings.Join(items, ",") + "}"
+}
+
+func pgInt64Array(items []int64) string {
+	parts := make([]string, len(items))
+	for i, v := range items {
+		parts[i] = strconv.FormatInt(v, 10)
+	}
+	return "{" + strings.Join(parts, ",") + "}"
 }
 
 // SpoolBacklog counts blobs waiting for upload.
