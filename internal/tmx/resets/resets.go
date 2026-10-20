@@ -97,6 +97,7 @@ type Account struct {
 	AuthIndex string     `json:"auth_index"`
 	Provider  string     `json:"provider"`
 	Label     string     `json:"label"`
+	Plan      string     `json:"plan"` // from quota tracking, filled by the API layer
 	CheckedAt *time.Time `json:"checked_at"`
 	Error     string     `json:"error,omitempty"`
 	Status
@@ -361,17 +362,52 @@ func (s *Service) Accounts(ctx context.Context, refresh bool) []Account {
 		if c == nil {
 			continue
 		}
-		acct := c.acct
-		for i := range pending {
-			if pending[i].AuthID == id {
-				p := pending[i]
-				acct.Pending = &p
-				break
-			}
-		}
-		out = append(out, acct)
+		out = append(out, s.view(c.acct, pending))
 	}
 	return out
+}
+
+// view is a response copy of a cached account: pending claim attached, verdicts filled.
+func (s *Service) view(cachedAcct Account, pending []Redemption) Account {
+	acct := own(cachedAcct)
+	acct.Pending = nil
+	for i := range pending {
+		if pending[i].AuthID == acct.AuthID {
+			p := pending[i]
+			acct.Pending = &p
+			break
+		}
+	}
+	decorate(&acct, s.now())
+	return acct
+}
+
+// PollNow re-reads one account and returns it. Throttled (read within the last 30 s) returns the
+// cached reading without a provider call.
+func (s *Service) PollNow(ctx context.Context, authID string) (*Account, bool, error) {
+	auth, provider, err := s.findAuth(strings.TrimSpace(authID))
+	if err != nil {
+		return nil, false, err
+	}
+	s.mu.Lock()
+	c := s.cache[auth.ID]
+	throttled := c != nil && s.now().Sub(c.readAt) < refreshMinGap
+	s.mu.Unlock()
+	if !throttled {
+		s.store(s.read(ctx, auth, provider))
+	}
+	pending, errPending := s.journal.unsettled(ctx, s.now().Add(-pendingReuse))
+	if errPending != nil {
+		log.WithError(errPending).Warn("tmx resets: reading pending claims")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c = s.cache[auth.ID]
+	if c == nil {
+		return nil, throttled, ErrReadFailed
+	}
+	acct := s.view(c.acct, pending)
+	return &acct, throttled, nil
 }
 
 // store caches a reading, keeping the previous credits when the new read failed outright.
@@ -387,12 +423,12 @@ func (s *Service) store(acct Account) {
 	s.cache[acct.AuthID] = &cached{acct: acct, readAt: s.now()}
 }
 
-// History returns the most recent claims, newest first.
-func (s *Service) History(ctx context.Context, limit int) ([]Redemption, error) {
-	if limit <= 0 || limit > 200 {
-		limit = historyDefault
+// History returns claims matching q, newest first.
+func (s *Service) History(ctx context.Context, q HistoryQuery) ([]Redemption, error) {
+	if q.Limit <= 0 || q.Limit > 500 {
+		q.Limit = historyDefault
 	}
-	return s.journal.recent(ctx, limit)
+	return s.journal.list(ctx, q)
 }
 
 func (s *Service) lockFor(authID string) *sync.Mutex {
@@ -527,7 +563,6 @@ func (s *Service) Redeem(ctx context.Context, authID, creditID, actor string) (*
 		s.backend.TmxClearQuotaSignals(authID)
 		after := s.read(context.Background(), auth, provider)
 		s.store(after)
-		res.Account = &after
 		if after.Error == "" {
 			r.After = after.Windows
 			r.Confirmed = confirmed(r.Before, after.Windows, clears)
@@ -540,18 +575,16 @@ func (s *Service) Redeem(ctx context.Context, authID, creditID, actor string) (*
 		log.WithError(err).Warn("tmx resets: journaling claim answer")
 	}
 	res.Redemption = *r
-	if res.Account == nil {
-		s.mu.Lock()
-		if c := s.cache[authID]; c != nil {
-			acct := c.acct
-			res.Account = &acct
-		}
-		s.mu.Unlock()
+	var pending []Redemption
+	if r.State == "pending" {
+		pending = []Redemption{*r}
 	}
-	if res.Account != nil && r.State == "pending" {
-		p := *r
-		res.Account.Pending = &p
+	s.mu.Lock()
+	if c := s.cache[authID]; c != nil {
+		acct := s.view(c.acct, pending)
+		res.Account = &acct
 	}
+	s.mu.Unlock()
 	return res, nil
 }
 

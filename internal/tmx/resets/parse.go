@@ -31,6 +31,7 @@ type Credit struct {
 	ResetsLeft int        `json:"resets_left"`
 	Blocker    string     `json:"blocker,omitempty"`
 	Warning    string     `json:"warning,omitempty"`
+	Verdict    *Verdict   `json:"verdict,omitempty"` // filled per response (verdict.go)
 }
 
 // Status is everything one account's provider says about its reset credits.

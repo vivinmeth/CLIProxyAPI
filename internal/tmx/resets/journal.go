@@ -6,9 +6,34 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
+
+// HistoryQuery filters the claim journal. Zero values match everything; BeforeID pages (claims
+// with a smaller id), Limit is applied by Service.History.
+type HistoryQuery struct {
+	AuthID   string
+	Provider string
+	Outcome  string
+	State    string
+	From     time.Time
+	To       time.Time
+	BeforeID int64
+	Limit    int
+}
+
+func (q HistoryQuery) matches(r Redemption) bool {
+	return (q.AuthID == "" || r.AuthID == q.AuthID) &&
+		(q.Provider == "" || r.Provider == q.Provider) &&
+		(q.Outcome == "" || r.Outcome == q.Outcome) &&
+		(q.State == "" || r.State == q.State) &&
+		(q.From.IsZero() || !r.CreatedAt.Before(q.From)) &&
+		(q.To.IsZero() || r.CreatedAt.Before(q.To)) &&
+		(q.BeforeID <= 0 || r.ID < q.BeforeID)
+}
 
 // journal records every claim before it is sent, so a retry reuses its request id.
 type journal interface {
@@ -18,7 +43,8 @@ type journal interface {
 	unsettled(ctx context.Context, since time.Time) ([]Redemption, error)
 	insert(ctx context.Context, r *Redemption) error
 	settle(ctx context.Context, r *Redemption) error
-	recent(ctx context.Context, limit int) ([]Redemption, error)
+	// list returns claims matching q, newest first, at most q.Limit.
+	list(ctx context.Context, q HistoryQuery) ([]Redemption, error)
 }
 
 // ---- memory (tests, or no request-log database) ----
@@ -76,13 +102,18 @@ func (m *memJournal) settle(_ context.Context, r *Redemption) error {
 	return fmt.Errorf("claim %d not found", r.ID)
 }
 
-func (m *memJournal) recent(_ context.Context, limit int) ([]Redemption, error) {
+func (m *memJournal) list(_ context.Context, q HistoryQuery) ([]Redemption, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := append([]Redemption(nil), m.rows...)
+	var out []Redemption
+	for _, r := range m.rows {
+		if q.matches(r) {
+			out = append(out, r)
+		}
+	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].ID > out[j].ID })
-	if len(out) > limit {
-		out = out[:limit]
+	if q.Limit > 0 && len(out) > q.Limit {
+		out = out[:q.Limit]
 	}
 	return out, nil
 }
@@ -182,8 +213,44 @@ func (j *pgJournal) unsettled(ctx context.Context, since time.Time) ([]Redemptio
 	return j.query(ctx, `WHERE state = 'pending' AND created_at > $1 ORDER BY id DESC LIMIT 100`, since)
 }
 
-func (j *pgJournal) recent(ctx context.Context, limit int) ([]Redemption, error) {
-	return j.query(ctx, `ORDER BY id DESC LIMIT $1`, limit)
+func (j *pgJournal) list(ctx context.Context, q HistoryQuery) ([]Redemption, error) {
+	var where []string
+	var args []any
+	add := func(cond string, v any) {
+		args = append(args, v)
+		where = append(where, strings.ReplaceAll(cond, "?", "$"+strconv.Itoa(len(args))))
+	}
+	if q.AuthID != "" {
+		add("auth_id = ?", q.AuthID)
+	}
+	if q.Provider != "" {
+		add("provider = ?", q.Provider)
+	}
+	if q.Outcome != "" {
+		add("outcome = ?", q.Outcome)
+	}
+	if q.State != "" {
+		add("state = ?", q.State)
+	}
+	if !q.From.IsZero() {
+		add("created_at >= ?", q.From)
+	}
+	if !q.To.IsZero() {
+		add("created_at < ?", q.To)
+	}
+	if q.BeforeID > 0 {
+		add("id < ?", q.BeforeID)
+	}
+	clause := ""
+	if len(where) > 0 {
+		clause = "WHERE " + strings.Join(where, " AND ")
+	}
+	limit := q.Limit
+	if limit <= 0 {
+		limit = historyDefault
+	}
+	args = append(args, limit)
+	return j.query(ctx, clause+` ORDER BY id DESC LIMIT $`+strconv.Itoa(len(args)), args...)
 }
 
 func jsonWindows(ws []Window) []byte {
