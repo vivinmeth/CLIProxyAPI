@@ -339,6 +339,25 @@ func (s *Store) UpsertImported(ctx context.Context, rows []Row) error {
 	return nil
 }
 
+// DeleteImported removes imported usage rows whose import_ref starts with prefix ("<session>#"),
+// except those listed in keep. It returns the number of rows removed.
+func (s *Store) DeleteImported(ctx context.Context, prefix string, keep []string) (int64, error) {
+	if s == nil || prefix == "" {
+		return 0, nil
+	}
+	quoted := make([]string, len(keep))
+	for i, k := range keep {
+		quoted[i] = `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(k) + `"`
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM `+s.table()+` WHERE import_ref IS NOT NULL
+		AND starts_with(import_ref, $1) AND NOT (import_ref = ANY($2::text[]))`, prefix,
+		"{"+strings.Join(quoted, ",")+"}")
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // backfillAccounting fills the normalised columns for rows written before they existed, using
 // the same upstream accounting code as live rows.
 func (s *Store) backfillAccounting() {

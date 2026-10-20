@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
 )
 
 // SessionIngest is the body of PUT /v8/management/tmx/archive/sessions. See
@@ -26,6 +28,9 @@ type SessionIngest struct {
 	Metadata       json.RawMessage `json:"metadata,omitempty"`
 	Messages       []MessageIngest `json:"messages"`
 	Sources        []SourceIngest  `json:"sources,omitempty"`
+	// Replace makes the body the complete session: stored messages and imported usage rows that
+	// are not in it are removed. Raw sources are never removed (the original always survives).
+	Replace bool `json:"replace,omitempty"`
 }
 
 // MessageIngest is one message/event of an ingested session.
@@ -59,6 +64,8 @@ type IngestResult struct {
 	MissingBlobs []string `json:"missing_blobs,omitempty"`
 	ViaProxy     *bool    `json:"via_proxy,omitempty"`
 	UsageRows    int      `json:"usage_rows"`
+	Removed      int      `json:"removed,omitempty"`       // messages dropped by replace
+	UsageRemoved int64    `json:"usage_removed,omitempty"` // usage rows dropped by replace
 }
 
 // SessionKey is the archive id of an ingested session.
@@ -216,6 +223,19 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 			return nil, fmt.Errorf("message %q: %w", p.m.ExternalID, err)
 		}
 	}
+	if in.Replace {
+		keep := make([]string, 0, len(prep))
+		for _, p := range prep {
+			keep = append(keep, p.m.ExternalID)
+		}
+		tag, errDel := tx.ExecContext(ctx, `DELETE FROM `+schema+`.session_messages WHERE session_id = $1
+			AND NOT (external_id = ANY($2::text[]))`, id, pgTextArray(keep))
+		if errDel != nil {
+			return nil, fmt.Errorf("replace: %w", errDel)
+		}
+		n, _ := tag.RowsAffected()
+		res.Removed = int(n)
+	}
 	for _, src := range in.Sources {
 		var size int64
 		_ = tx.QueryRowContext(ctx, `SELECT size FROM `+schema+`.blobs WHERE hash = $1`, src.Blob).Scan(&size)
@@ -235,7 +255,72 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 	if res.UsageRows, err = a.writeUsage(ctx, in, id, viaProxy); err != nil {
 		return res, fmt.Errorf("usage rows: %w", err)
 	}
+	if in.Replace {
+		keep := []string{}
+		for _, row := range usageRows(in, id, viaProxy) {
+			keep = append(keep, row.ImportRef)
+		}
+		if res.UsageRemoved, err = requestlog.Default().DeleteImported(ctx, id+"#", keep); err != nil {
+			return res, fmt.Errorf("replace usage rows: %w", err)
+		}
+	}
 	return res, nil
+}
+
+// DeleteResult reports what DeleteSession removed.
+type DeleteResult struct {
+	SessionID string `json:"session_id"`
+	Messages  int64  `json:"messages"`
+	Sources   int64  `json:"sources"`
+	UsageRows int64  `json:"usage_rows"`
+}
+
+// DeleteSession removes an imported session, its messages, source links and imported usage rows.
+// Content blobs stay (they are shared and content-addressed); proxied traffic is untouched.
+func (a *Archive) DeleteSession(ctx context.Context, id string) (*DeleteResult, error) {
+	res := &DeleteResult{SessionID: id}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err = tx.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM `+schema+`.session_messages WHERE session_id = $1),
+		(SELECT count(*) FROM `+schema+`.session_sources WHERE session_id = $1)`, id).Scan(&res.Messages, &res.Sources); err != nil {
+		return nil, err
+	}
+	tag, err := tx.ExecContext(ctx, `DELETE FROM `+schema+`.sessions WHERE id = $1`, id)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := tag.RowsAffected(); n == 0 {
+		return nil, ErrSessionNotFound
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	if res.UsageRows, err = requestlog.Default().DeleteImported(ctx, id+"#", nil); err != nil {
+		return res, fmt.Errorf("usage rows: %w", err)
+	}
+	return res, nil
+}
+
+// ErrSessionNotFound is returned when a session id is unknown.
+var ErrSessionNotFound = errors.New("session not found")
+
+// pgTextArray renders a Postgres text[] literal with every element quoted.
+func pgTextArray(items []string) string {
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, it := range items {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('"')
+		b.WriteString(strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(it))
+		b.WriteByte('"')
+	}
+	b.WriteByte('}')
+	return b.String()
 }
 
 func timePtr(t *time.Time) any {

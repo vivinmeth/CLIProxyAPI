@@ -3,6 +3,7 @@ package api
 // tokenmaxx fork: management routes for the persistent request log (internal/tmx/requestlog).
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -28,6 +29,7 @@ func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher) {
 	}
 	v8.GET("/tmx/quota/current", tmxQuotaCurrent)
 	v8.GET("/tmx/quota/history", tmxQuotaHistory)
+	v8.POST("/tmx/quota/poll", tmxQuotaPoll)
 }
 
 // tmxQuotaCurrent: GET /tmx/quota/current — latest reading of every window of every account.
@@ -38,6 +40,27 @@ func tmxQuotaCurrent(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "accounts": svc.Accounts()})
+}
+
+// tmxQuotaPoll: POST /tmx/quota/poll?auth_id=… — poll one account now and return its windows.
+// Throttled (30 s per account, or while paused after a 429/401) returns the current state.
+func tmxQuotaPoll(c *gin.Context) {
+	svc := quota.Default()
+	if svc == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "quota tracking is not running"})
+		return
+	}
+	acc, throttled, err := svc.PollNow(c.Request.Context(), strings.TrimSpace(c.Query("auth_id")))
+	switch {
+	case errors.Is(err, quota.ErrUnknownAccount):
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+	case errors.Is(err, quota.ErrUnsupportedProvider):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	case err != nil:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	default:
+		c.JSON(http.StatusOK, gin.H{"account": acc, "throttled": throttled})
+	}
 }
 
 // tmxQuotaHistory: GET /tmx/quota/history?auth_id&window&from&to&limit — snapshots oldest first
@@ -213,7 +236,11 @@ func tmxRequestRollup(c *gin.Context) {
 	if raw := strings.TrimSpace(c.Query("dims")); raw != "" {
 		dims = strings.Split(raw, ",")
 	}
-	rows, truncated, err := store.Rollup(c.Request.Context(), f, unit, tz, dims, 50000)
+	maxRows := 50000
+	if n, errLimit := strconv.Atoi(strings.TrimSpace(c.Query("limit"))); errLimit == nil && n > 0 && n < maxRows {
+		maxRows = n
+	}
+	rows, truncated, err := store.Rollup(c.Request.Context(), f, unit, tz, dims, maxRows)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -265,6 +292,7 @@ func registerTMXArchiveRoutes(v8 *gin.RouterGroup) {
 	g.PUT("/sessions", tmxArchive(tmxSessionIngest))
 	g.GET("/sessions", tmxArchive(tmxSessionList))
 	g.GET("/sessions/*id", tmxArchive(tmxSessionGet))
+	g.DELETE("/sessions/*id", tmxArchive(tmxSessionDelete))
 	g.GET("/exchanges", tmxArchive(tmxExchangeList))
 	g.GET("/exchanges/:trace", tmxArchive(tmxExchangeGet))
 }
@@ -391,6 +419,21 @@ func tmxSessionGet(c *gin.Context, a *archive.Archive) {
 		return
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+// tmxSessionDelete: DELETE /tmx/archive/sessions/<harness>:<id> — removes an imported session,
+// its messages, source links and imported usage rows (blobs stay).
+func tmxSessionDelete(c *gin.Context, a *archive.Archive) {
+	id := strings.TrimPrefix(c.Param("id"), "/")
+	res, err := a.DeleteSession(c.Request.Context(), id)
+	switch {
+	case errors.Is(err, archive.ErrSessionNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+	case err != nil:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "result": res})
+	default:
+		c.JSON(http.StatusOK, res)
+	}
 }
 
 func tmxExchangeList(c *gin.Context, a *archive.Archive) {

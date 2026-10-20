@@ -3,6 +3,7 @@ package quota
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -182,4 +183,27 @@ func TestQuotaServiceRecordsPassivePolledAndHistory(t *testing.T) {
 		t.Fatalf("history = %+v", hist)
 	}
 
+}
+
+func TestQuotaPollNow(t *testing.T) {
+	clock := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	auth := &coreauth.Auth{ID: "claude-now.json", Provider: "claude"}
+	codex := &coreauth.Auth{ID: "codex-now.json", Provider: "codex"}
+	f := &fakeFetcher{auths: []*coreauth.Auth{auth, codex}, usage: usageJSON(7, 8, 9), status: 200, calls: map[string]int{}}
+	s := openTestService(t, f, &clock)
+	ctx := context.Background()
+	acc, throttled, err := s.PollNow(ctx, "claude-now.json")
+	if err != nil || throttled || len(acc.Windows) != 3 || acc.Plan != "max_20x" {
+		t.Fatalf("poll now = %+v throttled=%v err=%v", acc, throttled, err)
+	}
+	clock = clock.Add(10 * time.Second)
+	if _, throttled, _ = s.PollNow(ctx, "claude-now.json"); !throttled || f.calls[claudeUsageURL] != 1 {
+		t.Fatalf("second poll within 30 s not throttled (calls %v)", f.calls)
+	}
+	if _, _, err = s.PollNow(ctx, "codex-now.json"); !errors.Is(err, ErrUnsupportedProvider) {
+		t.Fatalf("codex err = %v", err)
+	}
+	if _, _, err = s.PollNow(ctx, "nope"); !errors.Is(err, ErrUnknownAccount) {
+		t.Fatalf("unknown err = %v", err)
+	}
 }

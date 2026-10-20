@@ -14,6 +14,7 @@ package quota
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -33,6 +34,7 @@ const (
 	defaultPollMins = 10
 	rateLimitPause  = 30 * time.Minute
 	authErrorPause  = time.Hour
+	pollNowMinGap   = 30 * time.Second
 
 	claudeUsageURL   = "https://api.anthropic.com/api/oauth/usage"
 	claudeProfileURL = "https://api.anthropic.com/api/oauth/profile"
@@ -358,12 +360,65 @@ func changed(last written, w Window) bool {
 	return last.status != w.Status && w.Status != ""
 }
 
+// ErrUnknownAccount / ErrUnsupportedProvider are returned by PollNow.
+var (
+	ErrUnknownAccount      = errors.New("unknown auth_id")
+	ErrUnsupportedProvider = errors.New("quota polling supports claude accounts only")
+)
+
+// PollNow polls one account immediately and returns its fresh state. A second call within 30 s,
+// or while the account is paused after a 429/401, returns the current state without calling the
+// provider (throttled = true).
+func (s *Service) PollNow(ctx context.Context, authID string) (Account, bool, error) {
+	var auth *coreauth.Auth
+	for _, candidate := range s.fetch.TmxAuths() {
+		if candidate != nil && candidate.ID == authID {
+			auth = candidate
+			break
+		}
+	}
+	if auth == nil {
+		return Account{}, false, ErrUnknownAccount
+	}
+	if !strings.EqualFold(auth.Provider, "claude") || auth.Disabled {
+		return Account{}, false, ErrUnsupportedProvider
+	}
+	now := s.now()
+	s.mu.Lock()
+	a := s.accountLocked(auth.ID)
+	a.AuthIndex, a.Provider = auth.EnsureIndex(), "claude"
+	if label := strings.TrimSpace(auth.Label); label != "" {
+		a.Label = label
+	}
+	throttled := now.Before(a.pauseUntil) || (a.LastPollAt != nil && now.Sub(*a.LastPollAt) < pollNowMinGap)
+	planDue := now.Sub(a.planAt) >= planEvery
+	s.mu.Unlock()
+	if !throttled {
+		s.poll(ctx, auth, a, planDue)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.viewLocked(a), throttled, nil
+}
+
 // Accounts returns the latest state of every account, sorted by auth id.
 func (s *Service) Accounts() []Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]Account, 0, len(s.accounts))
 	for _, a := range s.accounts {
+		out = append(out, s.viewLocked(a))
+	}
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j].AuthID < out[j-1].AuthID; j-- {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
+	}
+	return out
+}
+
+func (s *Service) viewLocked(a *account) Account {
+	{
 		acc := a.Account
 		acc.Windows = make([]Current, 0, len(a.current))
 		for _, c := range a.current {
@@ -381,14 +436,8 @@ func (s *Service) Accounts() []Account {
 			}
 			acc.NextPollAt = &next
 		}
-		out = append(out, acc)
+		return acc
 	}
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j].AuthID < out[j-1].AuthID; j-- {
-			out[j], out[j-1] = out[j-1], out[j]
-		}
-	}
-	return out
 }
 
 // Snapshot is one history row.
