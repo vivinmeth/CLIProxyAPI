@@ -34,6 +34,12 @@ but are **parked**. Don't work there; see `../wiki/parked-fork-clones.md`.)
   `openai/openai_responses_websocket.go`, `middleware/request_logging.go`; the response writer calls
   `tmxTee`/`tmxSubmit` (logic in `middleware/response_writer_tmx.go`). Keep these when merging
   upstream. Contract: `../wiki/archive-ingest.md`.
+- **Analytics** (`internal/tmx/archive/analytics*.go`): derived query layer in its own Postgres
+  (`TMX_ANALYTICS_DSN`). `tmx_archive.analytics_journal` is written in the same transaction as
+  session ingest/replace/delete and exchange capture; the worker extracts sessions / messages /
+  items and mirrors `tmx.requests` + `exchanges`. Routes `/tmx/analytics/{status,backfill,search}`;
+  `/tmx/archive/conversation` reads from it when the session is extracted. Integration tests need
+  `TMX_ANALYTICS_TEST_DSN` (a second throwaway database). Details: `../wiki/analytics.md`.
 - **Reset credits** (`internal/tmx/resets/`): list/redeem Codex + Claude banked resets,
   `GET /tmx/resets`, `POST /tmx/resets/poll`, `GET /tmx/resets/history`, `POST /tmx/resets/redeem`
   (fleet contract `../wiki/reset-credits-api.md`; verdicts in `verdict.go`; routes + contract test in
