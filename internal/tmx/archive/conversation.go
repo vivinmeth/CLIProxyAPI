@@ -90,17 +90,33 @@ func (a *Archive) importedConversation(ctx context.Context, sessionID, harness s
 	}
 	defer func() { _ = rows.Close() }()
 	conv := &Conversation{Kind: "imported", SessionID: id, Harness: h, Title: title, Items: []ConvItem{}}
-	n := 0
+	type stored struct {
+		ts                sql.NullTime
+		role, model, hash string
+	}
+	var msgs []stored
 	for rows.Next() {
-		var ts sql.NullTime
-		var role, model, hash string
-		if err = rows.Scan(&ts, &role, &model, &hash); err != nil {
+		var m stored
+		if err = rows.Scan(&m.ts, &m.role, &m.model, &m.hash); err != nil {
 			return nil, err
 		}
-		if n++; n > convMaxItems {
+		if len(msgs) >= convMaxItems {
 			conv.Truncated = true
 			break
 		}
+		msgs = append(msgs, m)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	_ = rows.Close()
+	hashes := make([]string, len(msgs))
+	for i, m := range msgs {
+		hashes[i] = m.hash
+	}
+	a.prefetchBodies(ctx, hashes)
+	for _, m := range msgs {
+		ts, role, model, hash := m.ts, m.role, m.model, m.hash
 		body, errBody := a.rebuildBody(ctx, hash)
 		if errBody != nil {
 			return nil, fmt.Errorf("message: %w", errBody)
@@ -118,7 +134,7 @@ func (a *Archive) importedConversation(ctx context.Context, sessionID, harness s
 		}
 		conv.Items = append(conv.Items, items...)
 	}
-	return conv, rows.Err()
+	return conv, nil
 }
 
 func (a *Archive) proxyConversation(ctx context.Context, sessionID, traceID string) (*Conversation, error) {
@@ -163,6 +179,8 @@ func (a *Archive) proxyConversation(ctx context.Context, sessionID, traceID stri
 		return nil, err
 	}
 	conv.TraceID = traceID
+	a.prefetchBodies(ctx, []string{meta.RequestBody})
+	a.blobs.Prefetch(ctx, []string{meta.ResponseBody})
 	if conv.SessionID == "" {
 		conv.SessionID = meta.SessionID
 	}

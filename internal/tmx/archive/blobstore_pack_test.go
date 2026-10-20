@@ -98,3 +98,61 @@ func TestPackUploadAndRangedRead(t *testing.T) {
 		t.Fatalf("cost writes_30d = %d, want 1", cost.Writes30d)
 	}
 }
+
+func TestPrefetchFillsCacheFromPacks(t *testing.T) {
+	endpoint := os.Getenv("TMX_ARCHIVE_TEST_S3")
+	dsn := os.Getenv("TMX_REQUESTLOG_TEST_DSN")
+	if endpoint == "" || dsn == "" {
+		t.Skip("TMX_ARCHIVE_TEST_S3 / TMX_REQUESTLOG_TEST_DSN not set")
+	}
+	ctx := context.Background()
+	s3, err := minio.New(endpoint, &minio.Options{Creds: credentials.NewStaticV4("minioadmin", "minioadmin", "")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := "tmx-prefetch-test"
+	if exists, _ := s3.BucketExists(ctx, bucket); !exists {
+		if err = s3.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, err := Open(ctx, dsn, s3, bucket, "test", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if _, err = a.db.Exec("DELETE FROM " + schema + ".blobs"); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]byte{}
+	var hashes []string
+	for i := 0; i < 60; i++ {
+		data := []byte(fmt.Sprintf("element %d %s", i, strings.Repeat("y", i*53)))
+		h, errPut := a.blobs.Put(ctx, data, "application/json", "test")
+		if errPut != nil {
+			t.Fatal(errPut)
+		}
+		want[h] = data
+		hashes = append(hashes, h)
+	}
+	a.blobs.uploadPending()
+	// Empty the read cache so everything must come from R2.
+	_ = os.RemoveAll(a.blobs.cache.dir)
+	_ = os.MkdirAll(a.blobs.cache.dir, 0o750)
+	a.blobs.Prefetch(ctx, append(hashes, hashes[0], "not-a-hash"))
+	for _, h := range hashes {
+		if _, errStat := os.Stat(a.blobs.cache.path(h)); errStat != nil {
+			t.Fatalf("blob %s not prefetched", h[:12])
+		}
+	}
+	misses := a.blobs.cache.misses
+	for h, data := range want {
+		got, errGet := a.blobs.Get(ctx, h)
+		if errGet != nil || !bytes.Equal(got, data) {
+			t.Fatalf("blob %s after prefetch: %v", h[:12], errGet)
+		}
+	}
+	if a.blobs.cache.misses != misses {
+		t.Fatalf("reads after prefetch missed the cache %d times", a.blobs.cache.misses-misses)
+	}
+}
