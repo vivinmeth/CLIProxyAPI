@@ -299,3 +299,47 @@ func TestAnalyticsStoresHostileJSON(t *testing.T) {
 		t.Fatal("message not stored as a JSON object")
 	}
 }
+
+// tmx.requests changes reach the copy through the trigger journal, whatever wrote them.
+func TestAnalyticsRequestRowsFollowSource(t *testing.T) {
+	a, an := openTestAnalytics(t)
+	rl := an.reqMirror
+	if rl == nil {
+		t.Fatal("requests mirror not installed")
+	}
+	ctx := context.Background()
+	tx, err := rl.src.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lateID int64
+	if err = tx.QueryRow(`INSERT INTO ` + rl.srcTable + ` (ts, outcome, model) VALUES (now(), 'success', 'late') RETURNING id`).Scan(&lateID); err != nil {
+		t.Fatal(err)
+	}
+	var earlyID int64
+	if err = rl.src.QueryRow(`INSERT INTO ` + rl.srcTable + ` (ts, outcome, model) VALUES (now(), 'success', 'early') RETURNING id`).Scan(&earlyID); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, an)
+	if err = tx.Commit(); err != nil { // commits after a higher id was already copied
+		t.Fatal(err)
+	}
+	drain(t, an)
+	if n := count(t, an, `SELECT count(*) FROM requests WHERE model IN ('late', 'early')`); n != 2 {
+		t.Fatalf("copies = %d", n)
+	}
+	if _, err = rl.src.Exec(`UPDATE `+rl.srcTable+` SET model = 'late2' WHERE id = $1`, lateID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = rl.src.Exec(`DELETE FROM `+rl.srcTable+` WHERE id = $1`, earlyID); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, an)
+	if n := count(t, an, `SELECT count(*) FROM requests WHERE model = 'late2'`); n != 1 {
+		t.Fatal("update not copied")
+	}
+	if n := count(t, an, `SELECT count(*) FROM requests WHERE id = $1`, earlyID); n != 0 {
+		t.Fatal("delete not copied")
+	}
+	_ = a
+}

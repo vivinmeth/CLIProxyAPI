@@ -41,9 +41,8 @@ const (
 	// are rewritten on the next backfill.
 	analyticsVersion  = 1
 	journalTable      = schema + ".analytics_journal"
-	journalBatch      = 200
+	journalBatch      = 1000
 	analyticsPoll     = 3 * time.Second
-	requestsBatch     = 2000
 	prefetchChunkMsgs = 5000
 	maxAttempts       = 3
 	insertParamLimit  = 60000
@@ -64,12 +63,9 @@ type analytics struct {
 	extracted   atomic.Int64
 	failures    atomic.Int64
 	backfilling atomic.Bool
-	resetGen    atomic.Int64 // bumped by backfill: recopy tmx.requests from the start
-	appliedGen  atomic.Int64 // last resetGen the requests copy has started over for
-	idxMu       sync.Mutex   // trigram index state + DDL (backfill vs deferred build)
+	idxMu       sync.Mutex // trigram index state + DDL (backfill vs deferred build)
 	ctx         context.Context
 	cancel      context.CancelFunc
-	lastRecon   time.Time
 	lastErr     atomic.Value // string
 	lastRunUnix atomic.Int64
 	mu          sync.Mutex // serialises step() and backfill bookkeeping
@@ -80,6 +76,10 @@ type analytics struct {
 func (a *Archive) startAnalytics(ctx context.Context) {
 	dsn := strings.TrimSpace(os.Getenv("TMX_ANALYTICS_DSN"))
 	if dsn == "" {
+		// Nothing reads the journal: stop the usage-row triggers filling it.
+		if rl := requestlog.Default(); rl != nil {
+			dropRequestTriggers(ctx, rl.DB(), rl.Schema()+".requests")
+		}
 		return
 	}
 	an, err := openAnalytics(ctx, a, dsn)
@@ -202,16 +202,10 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 			return fmt.Errorf("analytics schema: %w", err)
 		}
 	}
-	// The journal used to be read with a cursor; entries up to it are done.
-	if old, err := an.stateInt(ctx, "journal_id"); err != nil {
+	// Old versions read the journal with a cursor (and could skip late commits); the entries they
+	// left behind are simply replayed — extraction is idempotent.
+	if _, err := an.db.ExecContext(ctx, `DELETE FROM state WHERE key IN ('journal_id', 'requests_id', 'requests_recon_id')`); err != nil {
 		return err
-	} else if old > 0 {
-		if _, err = an.a.db.ExecContext(ctx, `DELETE FROM `+journalTable+` WHERE id <= $1`, old); err != nil {
-			return err
-		}
-		if _, err = an.db.ExecContext(ctx, `DELETE FROM state WHERE key = 'journal_id'`); err != nil {
-			return err
-		}
 	}
 	var err error
 	if an.exchMirror, err = ensureMirror(ctx, an.a.db, an.db, schema, "exchanges", "exchanges", "trace_id",
@@ -222,6 +216,10 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 		if an.reqMirror, err = ensureMirror(ctx, rl.DB(), an.db, rl.Schema(), "requests", "requests", "id",
 			[]string{"ts", "session_id", "trace_id", "import_ref", "source, ts"}); err != nil {
 			return err
+		}
+		if err = installRequestTriggers(ctx, rl.DB(), rl.Schema()+".requests"); err != nil {
+			log.WithError(err).Warn("tmx analytics: tmx.requests is not in the archive database; usage rows are not mirrored")
+			an.reqMirror = nil
 		}
 	}
 	return nil
@@ -334,10 +332,6 @@ func (an *analytics) step() (bool, error) {
 	defer cancel()
 	an.lastRunUnix.Store(time.Now().Unix())
 
-	moreReq, err := an.syncRequests(ctx)
-	if err != nil {
-		return false, fmt.Errorf("requests mirror: %w", err)
-	}
 	// The journal is a queue: processed entries are deleted. (A cursor over the BIGSERIAL id
 	// would skip entries whose transaction commits after a later id's.) Failed entries back off
 	// and don't hold up the rest.
@@ -359,11 +353,11 @@ func (an *analytics) step() (bool, error) {
 		return false, err
 	}
 	if len(entries) == 0 {
-		return moreReq, nil
+		return false, nil
 	}
 
 	// Collapse the batch: work is state-based, so each session is processed once.
-	var traces []string
+	var traces, requestIDs []string
 	imported := map[string]bool{}
 	proxy := map[string]bool{}
 	byRef := map[string][]journalEntry{}
@@ -375,6 +369,8 @@ func (an *analytics) step() (bool, error) {
 			imported[e.ref] = true
 		case "proxy":
 			proxy[e.ref] = true
+		case "request":
+			requestIDs = append(requestIDs, e.ref)
 		}
 		byRef[e.kind+"\x00"+e.ref] = append(byRef[e.kind+"\x00"+e.ref], e)
 	}
@@ -382,6 +378,13 @@ func (an *analytics) step() (bool, error) {
 	fail := func(kind, ref string, err error) {
 		for _, e := range byRef[kind+"\x00"+ref] {
 			failedIDs[e.id] = err
+		}
+	}
+	if len(requestIDs) > 0 {
+		if errR := an.syncRequestRows(ctx, requestIDs); errR != nil {
+			for _, id := range requestIDs {
+				fail("request", id, errR)
+			}
 		}
 	}
 	if len(traces) > 0 {
@@ -424,19 +427,20 @@ func (an *analytics) step() (bool, error) {
 	var done []string
 	for _, e := range entries {
 		errE, bad := failedIDs[e.id]
-		if !bad || e.attempts+1 >= maxAttempts {
-			done = append(done, fmt.Sprint(e.id))
-		}
 		if !bad {
+			done = append(done, fmt.Sprint(e.id))
 			continue
 		}
 		an.setErr(fmt.Errorf("%s %s: %w", e.kind, e.ref, errE))
 		if e.attempts+1 >= maxAttempts {
-			_, _ = an.db.ExecContext(ctx, `INSERT INTO failed (journal_id, kind, ref, error) VALUES ($1,$2,$3,$4)
+			// Acknowledge only once the failure is recorded; otherwise keep retrying.
+			if _, errF := an.db.ExecContext(ctx, `INSERT INTO failed (journal_id, kind, ref, error) VALUES ($1,$2,$3,$4)
 				ON CONFLICT (journal_id) DO UPDATE SET error = EXCLUDED.error, failed_at = now()`,
-				e.id, e.kind, e.ref, cleanText(errE.Error()))
-			log.WithError(errE).Warnf("tmx analytics: giving up on %s %s", e.kind, e.ref)
-			continue
+				e.id, e.kind, e.ref, cleanText(errE.Error())); errF == nil {
+				done = append(done, fmt.Sprint(e.id))
+				log.WithError(errE).Warnf("tmx analytics: giving up on %s %s", e.kind, e.ref)
+				continue
+			}
 		}
 		if _, err = an.a.db.ExecContext(ctx, `UPDATE `+journalTable+` SET attempts = attempts + 1,
 			not_before = now() + make_interval(mins => attempts + 1) WHERE id = $1`, e.id); err != nil {
@@ -450,7 +454,7 @@ func (an *analytics) step() (bool, error) {
 		}
 		an.processed.Add(int64(len(done)))
 	}
-	return len(entries) == journalBatch || moreReq, nil
+	return len(entries) == journalBatch, nil
 }
 
 // buildDeferredIndexes rebuilds the trigram index after a backfill has drained the journal.
@@ -482,64 +486,138 @@ func (an *analytics) buildDeferredIndexes() {
 	log.Infof("tmx analytics: trigram index built in %s", time.Since(start).Round(time.Second))
 }
 
-// syncRequests copies new tmx.requests rows (by id). Rewrites of imported rows are picked up by
-// the per-session resync in extractImported.
-func (an *analytics) syncRequests(ctx context.Context) (bool, error) {
-	if an.reqMirror == nil {
-		return false, nil
-	}
-	cursor, err := an.stateInt(ctx, "requests_id")
-	if err != nil {
-		return false, err
-	}
-	gen := an.resetGen.Load()
-	if gen != an.appliedGen.Load() {
-		if err = an.setState(ctx, "requests_id", "0"); err != nil {
-			return false, err
-		}
-		_ = an.setState(ctx, "requests_recon_id", "0")
-		an.appliedGen.Store(gen)
-		cursor = 0
-	}
-	if err = an.reconcileRequests(ctx, cursor); err != nil {
-		return false, err
-	}
-	var maxID sql.NullInt64
-	if err = an.reqMirror.src.QueryRowContext(ctx, `SELECT max(id) FROM (SELECT id FROM `+an.reqMirror.srcTable+
-		` WHERE id > $1 ORDER BY id LIMIT $2) t`, cursor, requestsBatch).Scan(&maxID); err != nil {
-		return false, err
-	}
-	if !maxID.Valid {
-		return false, nil
-	}
-	n, err := an.reqMirror.copy(ctx, `id > $1 AND id <= $2`, cursor, maxID.Int64)
-	if err != nil {
-		return false, err
-	}
-	if err = an.setState(ctx, "requests_id", fmt.Sprint(maxID.Int64)); err != nil {
-		return false, err
-	}
-	return n >= requestsBatch, nil
-}
-
-// reconcileRequests recopies, every 5 minutes, the rows above the cursor as it was at the
-// previous pass. Rows can commit after a higher id was already copied (concurrent imports); this
-// picks them up within ~5 minutes. Upserts make the overlap harmless.
-func (an *analytics) reconcileRequests(ctx context.Context, cursor int64) error {
-	if time.Since(an.lastRecon) < 5*time.Minute {
-		return nil
-	}
-	from, err := an.stateInt(ctx, "requests_recon_id")
-	if err != nil {
+// installRequestTriggers journals every inserted, updated or deleted tmx.requests row (statement
+// triggers with transition tables), in the writer's own transaction. Needs the journal in the same
+// database as tmx.requests (prod: one DB).
+func installRequestTriggers(ctx context.Context, db *sql.DB, table string) error {
+	var ok bool
+	if err := db.QueryRowContext(ctx, `SELECT to_regclass($1) IS NOT NULL`, journalTable).Scan(&ok); err != nil {
 		return err
 	}
-	if from < cursor {
-		if _, err = an.reqMirror.copy(ctx, `id > $1 AND id <= $2`, from, cursor); err != nil {
+	if !ok {
+		return fmt.Errorf("%s not found next to %s", journalTable, table)
+	}
+	stmts := []string{
+		`CREATE OR REPLACE FUNCTION ` + schema + `.analytics_journal_requests() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF TG_OP = 'DELETE' THEN
+				INSERT INTO ` + journalTable + ` (kind, ref) SELECT 'request', id::text FROM old_rows;
+			ELSE
+				INSERT INTO ` + journalTable + ` (kind, ref) SELECT 'request', id::text FROM new_rows;
+			END IF;
+			RETURN NULL;
+		END $$`,
+		`CREATE OR REPLACE TRIGGER analytics_journal_ins AFTER INSERT ON ` + table +
+			` REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION ` + schema + `.analytics_journal_requests()`,
+		`CREATE OR REPLACE TRIGGER analytics_journal_upd AFTER UPDATE ON ` + table +
+			` REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION ` + schema + `.analytics_journal_requests()`,
+		`CREATE OR REPLACE TRIGGER analytics_journal_del AFTER DELETE ON ` + table +
+			` REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION ` + schema + `.analytics_journal_requests()`,
+	}
+	for _, stmt := range stmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
 	}
-	an.lastRecon = time.Now()
-	return an.setState(ctx, "requests_recon_id", fmt.Sprint(cursor))
+	return nil
+}
+
+// dropRequestTriggers stops journaling tmx.requests (analytics turned off).
+func dropRequestTriggers(ctx context.Context, db *sql.DB, table string) {
+	for _, t := range []string{"analytics_journal_ins", "analytics_journal_upd", "analytics_journal_del"} {
+		_, _ = db.ExecContext(ctx, `DROP TRIGGER IF EXISTS `+t+` ON `+table)
+	}
+}
+
+// syncRequestRows copies the given tmx.requests rows; ids no longer in the source are deleted.
+func (an *analytics) syncRequestRows(ctx context.Context, ids []string) error {
+	if an.reqMirror == nil {
+		return nil
+	}
+	arr := "{" + strings.Join(ids, ",") + "}"
+	if _, err := an.reqMirror.copy(ctx, `id = ANY($1::bigint[])`, arr); err != nil {
+		return err
+	}
+	present := map[string]bool{}
+	rows, err := an.reqMirror.src.QueryContext(ctx, `SELECT id::text FROM `+an.reqMirror.srcTable+` WHERE id = ANY($1::bigint[])`, arr)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		present[id] = true
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	var gone []string
+	for _, id := range ids {
+		if !present[id] {
+			gone = append(gone, id)
+		}
+	}
+	if len(gone) > 0 {
+		_, err = an.db.ExecContext(ctx, `DELETE FROM requests WHERE id = ANY($1::bigint[])`, "{"+strings.Join(gone, ",")+"}")
+	}
+	return err
+}
+
+// reconcileAllRequests makes the requests copy equal to tmx.requests: upserts everything and
+// deletes copies whose source row is gone (backfill).
+func (an *analytics) reconcileAllRequests(ctx context.Context) (int, error) {
+	if an.reqMirror == nil {
+		return 0, nil
+	}
+	n, err := an.reqMirror.copy(ctx, `TRUE`)
+	if err != nil {
+		return n, err
+	}
+	src := map[int64]bool{}
+	rows, err := an.reqMirror.src.QueryContext(ctx, `SELECT id FROM `+an.reqMirror.srcTable)
+	if err != nil {
+		return n, err
+	}
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return n, err
+		}
+		src[id] = true
+	}
+	if err = rows.Close(); err != nil {
+		return n, err
+	}
+	rows, err = an.db.QueryContext(ctx, `SELECT id FROM requests`)
+	if err != nil {
+		return n, err
+	}
+	var gone []string
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return n, err
+		}
+		if !src[id] {
+			gone = append(gone, fmt.Sprint(id))
+		}
+	}
+	if err = rows.Close(); err != nil {
+		return n, err
+	}
+	for start := 0; start < len(gone); start += 5000 {
+		end := min(start+5000, len(gone))
+		if _, err = an.db.ExecContext(ctx, `DELETE FROM requests WHERE id = ANY($1::bigint[])`,
+			"{"+strings.Join(gone[start:end], ",")+"}"); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // proxyKeysForTraces maps captured exchanges to their proxy session keys.
@@ -763,7 +841,7 @@ func (an *analytics) extractImported(ctx context.Context, id string) error {
 			_, _ = an.db.ExecContext(ctx, `UPDATE sessions SET shadowed_by = NULL WHERE id = $1 AND shadowed_by = $2`,
 				"proxy:"+ext, id)
 		}
-		return an.resyncImportedUsage(ctx, id)
+		return nil
 	}
 	if err != nil {
 		return err
@@ -819,22 +897,7 @@ func (an *analytics) extractImported(ctx context.Context, id string) error {
 		return err
 	}
 	// Its proxied twin (same client session id) is shadowed by this transcript.
-	if _, err = an.db.ExecContext(ctx, `UPDATE sessions SET shadowed_by = $1 WHERE id = $2`, id, "proxy:"+s.externalID); err != nil {
-		return err
-	}
-	return an.resyncImportedUsage(ctx, id)
-}
-
-// resyncImportedUsage replaces the copies of a session's imported usage rows.
-func (an *analytics) resyncImportedUsage(ctx context.Context, id string) error {
-	if an.reqMirror == nil {
-		return nil
-	}
-	if _, err := an.db.ExecContext(ctx, `DELETE FROM requests WHERE import_ref IS NOT NULL AND starts_with(import_ref, $1)`,
-		id+"#"); err != nil {
-		return err
-	}
-	_, err := an.reqMirror.copy(ctx, `import_ref IS NOT NULL AND starts_with(import_ref, $1)`, id+"#")
+	_, err = an.db.ExecContext(ctx, `UPDATE sessions SET shadowed_by = $1 WHERE id = $2`, id, "proxy:"+s.externalID)
 	return err
 }
 
@@ -1024,11 +1087,11 @@ func (an *analytics) proxyMessages(ctx context.Context, e proxyExchange) ([]msgR
 
 // BackfillResult reports what a backfill queued.
 type BackfillResult struct {
-	Sessions  int64  `json:"sessions"`
-	Proxy     int64  `json:"proxy_sessions"`
-	Exchanges int64  `json:"exchanges"`
-	Requests  string `json:"requests"`
-	Replayed  int    `json:"replayed"` // failed entries + sessions deleted from the archive
+	Sessions    int64 `json:"sessions"`
+	Proxy       int64 `json:"proxy_sessions"`
+	Exchanges   int64 `json:"exchanges"`
+	RequestRows int   `json:"request_rows"` // tmx.requests rows copied (copies of deleted rows are removed)
+	Replayed    int   `json:"replayed"`     // failed entries + sessions deleted from the archive
 }
 
 // importedGhosts lists imported sessions in analytics that the archive no longer has.
@@ -1077,7 +1140,7 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 	}
 	an.backfilling.Store(true)
 	defer an.backfilling.Store(false)
-	res := &BackfillResult{Requests: "restarted"}
+	res := &BackfillResult{}
 	an.idxMu.Lock()
 	err := an.setState(ctx, "trgm_index", "pending")
 	if err == nil {
@@ -1090,14 +1153,23 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 	// Replay what failed before, and drop imported sessions the archive no longer has (a delete
 	// whose journal entry failed): extractImported deletes them.
 	var replay [][2]string
-	if rows, errF := an.db.QueryContext(ctx, `SELECT kind, ref FROM failed`); errF == nil {
-		for rows.Next() {
-			var k, r string
-			if rows.Scan(&k, &r) == nil {
-				replay = append(replay, [2]string{k, r})
-			}
+	var replayedFailed []string
+	rows, err := an.db.QueryContext(ctx, `SELECT journal_id, kind, ref FROM failed`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var jid int64
+		var k, r string
+		if err = rows.Scan(&jid, &k, &r); err != nil {
+			_ = rows.Close()
+			return nil, err
 		}
-		_ = rows.Close()
+		replay = append(replay, [2]string{k, r})
+		replayedFailed = append(replayedFailed, fmt.Sprint(jid))
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
 	}
 	ghosts, err := an.importedGhosts(ctx)
 	if err != nil {
@@ -1130,8 +1202,13 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 		return nil, err
 	}
 	res.Proxy, _ = tag.RowsAffected()
-	an.resetGen.Add(1)
-	_, _ = an.db.ExecContext(ctx, `DELETE FROM failed`)
+	if res.RequestRows, err = an.reconcileAllRequests(ctx); err != nil {
+		return nil, fmt.Errorf("requests: %w", err)
+	}
+	if len(replayedFailed) > 0 {
+		_, _ = an.db.ExecContext(ctx, `DELETE FROM failed WHERE journal_id = ANY($1::bigint[])`,
+			"{"+strings.Join(replayedFailed, ",")+"}")
+	}
 	an.poke()
 	return res, nil
 }
@@ -1142,7 +1219,6 @@ func (a *Archive) AnalyticsStatus(ctx context.Context) (map[string]any, error) {
 	if an == nil {
 		return nil, ErrAnalyticsOff
 	}
-	reqCursor, _ := an.stateInt(ctx, "requests_id")
 	var backlog, retrying int64
 	_ = a.db.QueryRowContext(ctx, `SELECT count(*), count(*) FILTER (WHERE attempts > 0) FROM `+journalTable).Scan(&backlog, &retrying)
 	counts := map[string]int64{}
@@ -1181,7 +1257,6 @@ func (a *Archive) AnalyticsStatus(ctx context.Context) (map[string]any, error) {
 		"version":          analyticsVersion,
 		"journal_backlog":  backlog,
 		"journal_retrying": retrying,
-		"requests_cursor":  reqCursor,
 		"counts":           counts,
 		"sessions_by_kind": byKind,
 		"processed":        an.processed.Load(),

@@ -267,11 +267,6 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 			return res, fmt.Errorf("replace usage rows: %w", err)
 		}
 	}
-	// Usage rows are written after the commit; journal again so analytics copies them. A failure
-	// is returned so the (idempotent) ingest gets retried.
-	if err = a.journal(ctx, a.db, "session", id); err != nil {
-		return res, fmt.Errorf("analytics journal: %w", err)
-	}
 	return res, nil
 }
 
@@ -311,10 +306,6 @@ func (a *Archive) DeleteSession(ctx context.Context, id string) (*DeleteResult, 
 	}
 	if res.UsageRows, err = requestlog.Default().DeleteImported(ctx, id+"#", nil); err != nil {
 		return res, fmt.Errorf("usage rows: %w", err)
-	}
-	// Usage rows go after the commit; journal again so analytics drops its copies after them.
-	if err = a.journal(ctx, a.db, "session", id); err != nil {
-		return res, fmt.Errorf("analytics journal: %w", err)
 	}
 	return res, nil
 }
