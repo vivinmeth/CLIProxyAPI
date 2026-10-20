@@ -59,12 +59,16 @@ const (
 // (harness narrows which harness:id to use). Proxied sessions come from the captured exchange with
 // the largest request (the main thread's latest turn carries the whole conversation) plus its
 // response; traceID picks a specific exchange instead.
-func (a *Archive) Conversation(ctx context.Context, sessionID, harness, traceID string) (*Conversation, error) {
+// kind "proxy" or "imported" forces one source; "" prefers the imported transcript when both exist.
+func (a *Archive) Conversation(ctx context.Context, sessionID, harness, traceID, kind string) (*Conversation, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" && traceID == "" {
 		return nil, fmt.Errorf("session_id or trace_id is required")
 	}
-	if traceID == "" {
+	if kind == "imported" {
+		return a.importedConversation(ctx, sessionID, harness)
+	}
+	if traceID == "" && kind != "proxy" {
 		if conv, err := a.importedConversation(ctx, sessionID, harness); err == nil || !errors.Is(err, ErrNoConversation) {
 			return conv, err
 		}

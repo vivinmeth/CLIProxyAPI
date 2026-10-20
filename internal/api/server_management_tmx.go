@@ -445,12 +445,12 @@ func tmxArchiveStorage(c *gin.Context, a *archive.Archive) {
 	}
 }
 
-// tmxConversation: GET /tmx/archive/conversation?session_id=&harness=&trace_id= — a session
+// tmxConversation: GET /tmx/archive/conversation?session_id=&harness=&trace_id=&kind=proxy|imported — a session
 // rebuilt for reading (imported transcript, or the proxied session's fullest captured request plus
 // its response), normalised to role/kind/text items.
 func tmxConversation(c *gin.Context, a *archive.Archive) {
 	conv, err := a.Conversation(c.Request.Context(), c.Query("session_id"), strings.TrimSpace(c.Query("harness")),
-		strings.TrimSpace(c.Query("trace_id")))
+		strings.TrimSpace(c.Query("trace_id")), strings.TrimSpace(c.Query("kind")))
 	switch {
 	case errors.Is(err, archive.ErrNoConversation):
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})

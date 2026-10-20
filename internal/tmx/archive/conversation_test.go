@@ -93,7 +93,7 @@ func TestConversationProxyAndImported(t *testing.T) {
 	// A tiny side request (title generation) later in the same session must not be picked.
 	turn("t3", `{"model":"claude-haiku-5-5","messages":[{"role":"user","content":"title?"}]}`, sse("Greeting"), start.Add(20*time.Second))
 
-	conv, err := a.Conversation(ctx, "s-proxy", "", "")
+	conv, err := a.Conversation(ctx, "s-proxy", "", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestConversationProxyAndImported(t *testing.T) {
 		conv.Items[3].Text != "sure" || conv.Items[3].Role != "assistant" || conv.Model != "claude-opus-5-5" {
 		t.Fatalf("proxy conversation = %+v", conv)
 	}
-	byTrace, err := a.Conversation(ctx, "s-proxy", "", "t3")
+	byTrace, err := a.Conversation(ctx, "s-proxy", "", "t3", "")
 	if err != nil || byTrace.TraceID != "t3" || byTrace.Items[len(byTrace.Items)-1].Text != "Greeting" {
 		t.Fatalf("by trace = %+v %v", byTrace, err)
 	}
@@ -115,12 +115,12 @@ func TestConversationProxyAndImported(t *testing.T) {
 		}}); err != nil {
 		t.Fatal(err)
 	}
-	imp, err := a.Conversation(ctx, "oc-1", "", "")
+	imp, err := a.Conversation(ctx, "oc-1", "", "", "")
 	if err != nil || imp.Kind != "imported" || imp.SessionID != "opencode:oc-1" || imp.Title != "Fix bug" ||
 		len(imp.Items) != 2 || imp.Items[1].Model != "gpt-5.6-sol" || imp.Items[1].Text != "done" {
 		t.Fatalf("imported = %+v %v", imp, err)
 	}
-	if _, err = a.Conversation(ctx, "nope", "", ""); !errors.Is(err, ErrNoConversation) {
+	if _, err = a.Conversation(ctx, "nope", "", "", ""); !errors.Is(err, ErrNoConversation) {
 		t.Fatalf("unknown session err = %v", err)
 	}
 }
