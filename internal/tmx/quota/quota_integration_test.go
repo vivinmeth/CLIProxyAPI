@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -224,5 +225,78 @@ func TestQuotaPollNow(t *testing.T) {
 	}
 	if _, _, err = s.PollNow(ctx, "nope"); !errors.Is(err, ErrUnknownAccount) {
 		t.Fatalf("unknown err = %v", err)
+	}
+}
+
+// Fresh traffic headers slow background polling to the slow interval; a usage-API-only window
+// passing its reset forces a poll; expired readings are flagged stale; poll-now stays live.
+func TestQuotaSkipsPollWhenHeadersFresh(t *testing.T) {
+	clock := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	fiveHourReset := clock.Add(3 * time.Hour)
+	auth := &coreauth.Auth{ID: "claude-busy.json", Provider: "claude"}
+	setHeaders := func(observed time.Time) {
+		auth.Quota.ObservedAt = observed
+		auth.Quota.Signals = map[string]string{
+			"Anthropic-Ratelimit-Unified-5h-Utilization": "0.10",
+			"Anthropic-Ratelimit-Unified-5h-Reset":       strconv.FormatInt(fiveHourReset.Unix(), 10),
+			"Anthropic-Ratelimit-Unified-7d-Utilization": "0.20",
+			"Anthropic-Ratelimit-Unified-7d-Reset":       strconv.FormatInt(clock.Add(72*time.Hour).Unix(), 10),
+		}
+	}
+	setHeaders(clock.Add(-time.Minute))
+	// Fable resets 25 minutes in: once that passes, its value is stale and must be re-polled.
+	fableReset := clock.Add(25 * time.Minute).Format(time.RFC3339)
+	f := &fakeFetcher{auths: []*coreauth.Auth{auth}, status: 200, calls: map[string]int{},
+		usage: `{"five_hour":{"utilization":10,"resets_at":"` + fiveHourReset.Format(time.RFC3339) + `"},` +
+			`"limits":[{"kind":"weekly_scoped","percent":5,"resets_at":"` + fableReset + `","scope":{"model":{"display_name":"Fable"}}}]}`}
+	s := openTestService(t, f, &clock)
+	s.accounts = map[string]*account{}
+	ctx := context.Background()
+
+	s.tick(ctx) // first ever poll
+	if f.calls[claudeUsageURL] != 1 {
+		t.Fatalf("first tick calls = %v", f.calls)
+	}
+	// Traffic keeps the headers fresh: no background poll at 10 or 20 minutes.
+	for _, m := range []int{10, 20} {
+		clock = time.Date(2026, 10, 20, 12, m, 0, 0, time.UTC)
+		setHeaders(clock.Add(-30 * time.Second))
+		s.tick(ctx)
+	}
+	if f.calls[claudeUsageURL] != 1 {
+		t.Fatalf("polled despite fresh headers: %v", f.calls)
+	}
+	acc := s.Accounts()[0]
+	if !acc.PassiveFresh || acc.NextPollAt == nil || !acc.NextPollAt.Equal(time.Date(2026, 10, 20, 13, 0, 0, 0, time.UTC)) {
+		t.Fatalf("fresh account = %+v", acc)
+	}
+	// 12:26: Fable passed its reset. Its reading is flagged stale and the next tick re-polls it.
+	clock = time.Date(2026, 10, 20, 12, 26, 0, 0, time.UTC)
+	setHeaders(clock.Add(-30 * time.Second))
+	for _, w := range s.Accounts()[0].Windows {
+		if w.Window.Window == "7d:fable" && !w.Stale {
+			t.Fatal("expired fable reading not flagged stale")
+		}
+	}
+	fableReset = clock.Add(7 * 24 * time.Hour).Format(time.RFC3339)
+	f.mu.Lock()
+	f.usage = `{"five_hour":{"utilization":11,"resets_at":"` + fiveHourReset.Format(time.RFC3339) + `"},` +
+		`"limits":[{"kind":"weekly_scoped","percent":0,"resets_at":"` + fableReset + `","scope":{"model":{"display_name":"Fable"}}}]}`
+	f.mu.Unlock()
+	s.tick(ctx)
+	if f.calls[claudeUsageURL] != 2 {
+		t.Fatalf("expired usage-only window did not force a poll: %v", f.calls)
+	}
+	// Traffic stops: headers age past the poll interval, normal 10-minute polling resumes.
+	clock = time.Date(2026, 10, 20, 12, 45, 0, 0, time.UTC)
+	s.tick(ctx)
+	if f.calls[claudeUsageURL] != 3 || s.Accounts()[0].PassiveFresh {
+		t.Fatalf("stale headers did not resume polling: %v", f.calls)
+	}
+	// Poll-now is live even right after a background poll... once the 30 s throttle passes.
+	clock = clock.Add(time.Minute)
+	setHeaders(clock.Add(-10 * time.Second))
+	if _, throttled, err := s.PollNow(ctx, auth.ID); err != nil || throttled || f.calls[claudeUsageURL] != 4 {
+		t.Fatalf("poll now with fresh headers: throttled=%v err=%v calls=%v", throttled, err, f.calls)
 	}
 }

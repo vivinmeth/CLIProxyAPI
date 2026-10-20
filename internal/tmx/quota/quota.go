@@ -37,6 +37,7 @@ const (
 	rateLimitPause  = 30 * time.Minute
 	authErrorPause  = time.Hour
 	pollNowMinGap   = 30 * time.Second
+	defaultSlowMins = 60
 
 	claudeUsageURL   = "https://api.anthropic.com/api/oauth/usage"
 	claudeProfileURL = "https://api.anthropic.com/api/oauth/profile"
@@ -131,6 +132,9 @@ type Current struct {
 	Window
 	ObservedAt time.Time `json:"observed_at"`
 	Source     string    `json:"source"` // passive | polled
+	// Stale is set when the window's reset time has passed since this reading: the value no longer
+	// describes the current window and must not be shown as current.
+	Stale bool `json:"stale,omitempty"`
 }
 
 // Account is one account's latest state.
@@ -144,6 +148,9 @@ type Account struct {
 	LastPollAt *time.Time `json:"last_poll_at"`
 	NextPollAt *time.Time `json:"next_poll_at"`
 	PollError  string     `json:"poll_error,omitempty"`
+	// PassiveFresh: recent traffic headers cover this account, so background polls are slowed to
+	// TMX_QUOTA_SLOW_POLL_MINUTES (POST /tmx/quota/poll is always live).
+	PassiveFresh bool `json:"passive_fresh"`
 }
 
 type written struct {
@@ -168,6 +175,7 @@ type Service struct {
 	table     string
 	fetch     Fetcher
 	pollEvery time.Duration
+	slowEvery time.Duration
 	now       func() time.Time
 
 	mu       sync.Mutex
@@ -214,8 +222,13 @@ func newService(ctx context.Context, db *sql.DB, schema string, fetch Fetcher) (
 	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("TMX_QUOTA_POLL_MINUTES"))); err == nil && n >= 2 {
 		poll = n
 	}
+	slow := defaultSlowMins
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("TMX_QUOTA_SLOW_POLL_MINUTES"))); err == nil && n >= poll {
+		slow = n
+	}
 	s := &Service{db: db, table: schema + ".quota_snapshots", fetch: fetch,
-		pollEvery: time.Duration(poll) * time.Minute, now: time.Now, accounts: map[string]*account{}}
+		pollEvery: time.Duration(poll) * time.Minute, slowEvery: time.Duration(slow) * time.Minute,
+		now: time.Now, accounts: map[string]*account{}}
 	for _, stmt := range []string{
 		`CREATE TABLE IF NOT EXISTS ` + s.table + ` (
 			id         BIGSERIAL PRIMARY KEY,
@@ -314,13 +327,16 @@ func (s *Service) tick(ctx context.Context) {
 			a.Label = label
 		}
 		observed := auth.Quota.ObservedAt
+		passiveWindows := spec.passive(auth.Quota.Signals, observed)
 		passiveDue := !observed.IsZero() && observed.After(a.lastPassive)
-		pollDue := (a.LastPollAt == nil || now.Sub(*a.LastPollAt) >= s.pollEvery) && !now.Before(a.pauseUntil)
+		fresh := s.passiveFresh(passiveWindows, observed, now)
+		a.PassiveFresh = fresh
+		pollDue := s.pollDueLocked(a, passiveWindows, fresh, now)
 		planDue := now.Sub(a.planAt) >= planEvery
 		s.mu.Unlock()
 
 		if passiveDue {
-			s.record(ctx, auth.ID, spec.passive(auth.Quota.Signals, observed), "passive", observed.UTC())
+			s.record(ctx, auth.ID, passiveWindows, "passive", observed.UTC())
 			s.mu.Lock()
 			a.lastPassive = observed
 			s.mu.Unlock()
@@ -329,6 +345,49 @@ func (s *Service) tick(ctx context.Context) {
 			s.poll(ctx, spec, auth, a, planDue)
 		}
 	}
+}
+
+// passiveFresh: the headers were observed within one poll interval, carry at least one window,
+// and none of those windows has passed its reset since.
+func (s *Service) passiveFresh(windows []Window, observed, now time.Time) bool {
+	if len(windows) == 0 || observed.IsZero() || now.Sub(observed) >= s.pollEvery {
+		return false
+	}
+	for _, w := range windows {
+		if w.ResetsAt != nil && !w.ResetsAt.After(now) {
+			return false
+		}
+	}
+	return true
+}
+
+// pollDueLocked decides whether the background loop polls an account now. Fresh headers slow the
+// poll to slowEvery, unless a window only the usage API reports has passed its reset (its value is
+// then stale and must be re-read).
+func (s *Service) pollDueLocked(a *account, passiveWindows []Window, fresh bool, now time.Time) bool {
+	if now.Before(a.pauseUntil) {
+		return false
+	}
+	if a.LastPollAt == nil {
+		return true
+	}
+	since := now.Sub(*a.LastPollAt)
+	if since < s.pollEvery {
+		return false
+	}
+	if !fresh || since >= s.slowEvery {
+		return true
+	}
+	covered := make(map[string]bool, len(passiveWindows))
+	for _, w := range passiveWindows {
+		covered[w.Window] = true
+	}
+	for name, cur := range a.current {
+		if !covered[name] && cur.ResetsAt != nil && !cur.ResetsAt.After(now) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) poll(ctx context.Context, spec providerSpec, auth *coreauth.Auth, a *account, planDue bool) {
@@ -491,7 +550,9 @@ func (s *Service) viewLocked(a *account) Account {
 	{
 		acc := a.Account
 		acc.Windows = make([]Current, 0, len(a.current))
+		now := s.now()
 		for _, c := range a.current {
+			c.Stale = c.ResetsAt != nil && !c.ResetsAt.After(now)
 			acc.Windows = append(acc.Windows, c)
 		}
 		for i := 1; i < len(acc.Windows); i++ {
@@ -500,7 +561,11 @@ func (s *Service) viewLocked(a *account) Account {
 			}
 		}
 		if a.LastPollAt != nil {
-			next := a.LastPollAt.Add(s.pollEvery)
+			every := s.pollEvery
+			if a.PassiveFresh {
+				every = s.slowEvery
+			}
+			next := a.LastPollAt.Add(every)
 			if a.pauseUntil.After(next) {
 				next = a.pauseUntil
 			}
