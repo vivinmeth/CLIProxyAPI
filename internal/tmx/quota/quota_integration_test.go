@@ -300,3 +300,44 @@ func TestQuotaSkipsPollWhenHeadersFresh(t *testing.T) {
 		t.Fatalf("poll now with fresh headers: throttled=%v err=%v calls=%v", throttled, err, f.calls)
 	}
 }
+
+// A removed or disabled login drops out of the current view; its history stays queryable.
+func TestQuotaDropsRemovedAccounts(t *testing.T) {
+	clock := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	keep := &coreauth.Auth{ID: "claude-keep.json", Provider: "claude"}
+	gone := &coreauth.Auth{ID: "claude-gone.json", Provider: "claude"}
+	f := &fakeFetcher{auths: []*coreauth.Auth{keep, gone}, usage: usageJSON(1, 2, 3), status: 200, calls: map[string]int{}}
+	s := openTestService(t, f, &clock)
+	s.accounts = map[string]*account{}
+	if _, err := s.db.Exec(`DELETE FROM ` + s.table); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s.tick(ctx)
+	if n := len(s.Accounts()); n != 2 {
+		t.Fatalf("accounts = %d, want 2", n)
+	}
+	f.mu.Lock()
+	f.auths = []*coreauth.Auth{keep}
+	f.mu.Unlock()
+	clock = clock.Add(time.Minute)
+	s.tick(ctx)
+	accs := s.Accounts()
+	if len(accs) != 1 || accs[0].AuthID != "claude-keep.json" {
+		t.Fatalf("after removal = %+v", accs)
+	}
+	hist, _, err := s.History(ctx, "claude-gone.json", "", clock.Add(-time.Hour), clock.Add(time.Hour), 100)
+	if err != nil || len(hist) == 0 {
+		t.Fatalf("history of removed account lost: %v %v", hist, err)
+	}
+	// Restarted service: accounts restored from history only appear once a tick sees them.
+	s2, err := newService(ctx, s.db, "tmxq", f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.now = s.now
+	s2.tick(ctx)
+	if accs = s2.Accounts(); len(accs) != 1 || accs[0].AuthID != "claude-keep.json" {
+		t.Fatalf("after restart = %+v", accs)
+	}
+}

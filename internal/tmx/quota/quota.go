@@ -167,6 +167,9 @@ type account struct {
 	lastPassive time.Time
 	planAt      time.Time
 	pauseUntil  time.Time
+	// present: the account was in the auth manager (and tracked) at the last tick. Removed or
+	// disabled accounts keep their history but drop out of Accounts().
+	present bool
 }
 
 // Service collects and stores quota snapshots.
@@ -315,13 +318,23 @@ func (s *Service) loop() {
 // tick reads passive signals for every account and polls the ones that are due.
 func (s *Service) tick(ctx context.Context) {
 	now := s.now()
+	seen := map[string]bool{}
+	defer func() {
+		s.mu.Lock()
+		for id, a := range s.accounts {
+			a.present = seen[id]
+		}
+		s.mu.Unlock()
+	}()
 	for _, auth := range s.fetch.TmxAuths() {
 		spec, provider, ok := specFor(auth)
 		if !ok {
 			continue
 		}
+		seen[auth.ID] = true
 		s.mu.Lock()
 		a := s.accountLocked(auth.ID)
+		a.present = true
 		a.AuthIndex, a.Provider = auth.EnsureIndex(), provider
 		if label := strings.TrimSpace(auth.Label); label != "" {
 			a.Label = label
@@ -515,7 +528,7 @@ func (s *Service) PollNow(ctx context.Context, authID string) (Account, bool, er
 	now := s.now()
 	s.mu.Lock()
 	a := s.accountLocked(auth.ID)
-	a.AuthIndex, a.Provider = auth.EnsureIndex(), provider
+	a.AuthIndex, a.Provider, a.present = auth.EnsureIndex(), provider, true
 	if label := strings.TrimSpace(auth.Label); label != "" {
 		a.Label = label
 	}
@@ -536,7 +549,9 @@ func (s *Service) Accounts() []Account {
 	defer s.mu.Unlock()
 	out := make([]Account, 0, len(s.accounts))
 	for _, a := range s.accounts {
-		out = append(out, s.viewLocked(a))
+		if a.present {
+			out = append(out, s.viewLocked(a))
+		}
 	}
 	for i := 1; i < len(out); i++ {
 		for j := i; j > 0 && out[j].AuthID < out[j-1].AuthID; j-- {
