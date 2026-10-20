@@ -2,13 +2,15 @@
 //
 // Two sources feed it:
 //   - passive: the rate-limit headers the proxy already keeps per account from real traffic
-//     (Claude 5h / 7d), read from the auth manager every minute;
+//     (Claude 5h / 7d; Codex primary/secondary windows, also from websocket rate-limit events),
+//     read from the auth manager every minute;
 //   - polled: GET api.anthropic.com/api/oauth/usage every TMX_QUOTA_POLL_MINUTES (default 10) per
 //     account, which also covers model-scoped weekly limits (e.g. Fable) and idle accounts, plus
 //     /api/oauth/profile every 6 h for the plan label.
 //
 // A snapshot row is written when a window's reading changes, and at least every 30 minutes as a
-// heartbeat, so history shows both burn rate and "nothing happened". Codex is out of scope here.
+// heartbeat, so history shows both burn rate and "nothing happened". Codex accounts are polled at
+// chatgpt.com/backend-api/wham/usage (plan from the same payload); Codex API-key accounts are skipped.
 package quota
 
 import (
@@ -46,6 +48,75 @@ var claudeHeaders = map[string]string{
 	"Content-Type":   "application/json",
 	"Accept":         "application/json",
 	"anthropic-beta": "oauth-2025-04-20",
+}
+
+const codexUsageURL = "https://chatgpt.com/backend-api/wham/usage"
+
+// providerSpec is how one provider's quota is read: passive headers, the usage API, and the plan.
+type providerSpec struct {
+	usageURL   string
+	headers    func(*coreauth.Auth) map[string]string
+	passive    func(signals map[string]string, observedAt time.Time) []Window
+	parseUsage func([]byte) ([]Window, string, error) // plan "" when the usage API has none
+	profileURL string
+	parsePlan  func([]byte) string
+}
+
+var providers = map[string]providerSpec{
+	"claude": {
+		usageURL: claudeUsageURL,
+		headers:  func(*coreauth.Auth) map[string]string { return copyHeaders(claudeHeaders) },
+		passive:  func(sig map[string]string, _ time.Time) []Window { return ParseClaudeSignals(sig) },
+		parseUsage: func(b []byte) ([]Window, string, error) {
+			ws, err := ParseClaudeUsage(b)
+			return ws, "", err
+		},
+		profileURL: claudeProfileURL,
+		parsePlan:  ParseClaudePlan,
+	},
+	"codex": {
+		usageURL: codexUsageURL,
+		headers: func(auth *coreauth.Auth) map[string]string {
+			h := map[string]string{
+				"Authorization": "Bearer $TOKEN$",
+				"Content-Type":  "application/json",
+				"User-Agent":    "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)",
+			}
+			if auth != nil && auth.Metadata != nil {
+				if id, ok := auth.Metadata["account_id"].(string); ok && strings.TrimSpace(id) != "" {
+					h["Chatgpt-Account-Id"] = strings.TrimSpace(id)
+				}
+			}
+			return h
+		},
+		passive:    ParseCodexSignals,
+		parseUsage: ParseCodexUsage,
+	},
+}
+
+// specFor returns the quota spec for an auth, or false when its provider isn't tracked or the
+// account is API-key based (no subscription quota).
+func specFor(auth *coreauth.Auth) (providerSpec, string, bool) {
+	if auth == nil || auth.Disabled {
+		return providerSpec{}, "", false
+	}
+	name := strings.ToLower(strings.TrimSpace(auth.Provider))
+	spec, ok := providers[name]
+	if !ok {
+		return providerSpec{}, "", false
+	}
+	if name == "codex" && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != "" {
+		return providerSpec{}, "", false
+	}
+	return spec, name, true
+}
+
+func copyHeaders(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // Fetcher is what the service needs from the management layer: the current accounts, and an
@@ -232,12 +303,13 @@ func (s *Service) loop() {
 func (s *Service) tick(ctx context.Context) {
 	now := s.now()
 	for _, auth := range s.fetch.TmxAuths() {
-		if auth == nil || auth.Disabled || !strings.EqualFold(auth.Provider, "claude") {
+		spec, provider, ok := specFor(auth)
+		if !ok {
 			continue
 		}
 		s.mu.Lock()
 		a := s.accountLocked(auth.ID)
-		a.AuthIndex, a.Provider = auth.EnsureIndex(), "claude"
+		a.AuthIndex, a.Provider = auth.EnsureIndex(), provider
 		if label := strings.TrimSpace(auth.Label); label != "" {
 			a.Label = label
 		}
@@ -248,23 +320,24 @@ func (s *Service) tick(ctx context.Context) {
 		s.mu.Unlock()
 
 		if passiveDue {
-			s.record(ctx, auth.ID, ParseClaudeSignals(auth.Quota.Signals), "passive", observed.UTC())
+			s.record(ctx, auth.ID, spec.passive(auth.Quota.Signals, observed), "passive", observed.UTC())
 			s.mu.Lock()
 			a.lastPassive = observed
 			s.mu.Unlock()
 		}
 		if pollDue {
-			s.poll(ctx, auth, a, planDue)
+			s.poll(ctx, spec, auth, a, planDue)
 		}
 	}
 }
 
-func (s *Service) poll(ctx context.Context, auth *coreauth.Auth, a *account, planDue bool) {
+func (s *Service) poll(ctx context.Context, spec providerSpec, auth *coreauth.Auth, a *account, planDue bool) {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	now := s.now().UTC()
-	status, body, err := s.fetch.TmxFetch(ctx, auth, claudeUsageURL, cloneHeaders())
+	status, body, err := s.fetch.TmxFetch(ctx, auth, spec.usageURL, spec.headers(auth))
 	var windows []Window
+	var usagePlan string
 	pollErr := ""
 	switch {
 	case err != nil:
@@ -276,13 +349,17 @@ func (s *Service) poll(ctx context.Context, auth *coreauth.Auth, a *account, pla
 	case status < 200 || status >= 300:
 		pollErr = fmt.Sprintf("status %d", status)
 	default:
-		if windows, err = ParseClaudeUsage(body); err != nil {
+		if windows, usagePlan, err = spec.parseUsage(body); err != nil {
 			pollErr = "bad usage payload: " + err.Error()
 		}
 	}
-	if planDue && pollErr == "" {
-		if st, pb, errPlan := s.fetch.TmxFetch(ctx, auth, claudeProfileURL, cloneHeaders()); errPlan == nil && st == 200 {
-			if plan := ParseClaudePlan(pb); plan != "" {
+	if usagePlan != "" {
+		s.mu.Lock()
+		a.Plan, a.planAt = usagePlan, now
+		s.mu.Unlock()
+	} else if planDue && pollErr == "" && spec.profileURL != "" {
+		if st, pb, errPlan := s.fetch.TmxFetch(ctx, auth, spec.profileURL, spec.headers(auth)); errPlan == nil && st == 200 {
+			if plan := spec.parsePlan(pb); plan != "" {
 				s.mu.Lock()
 				a.Plan, a.planAt = plan, now
 				s.mu.Unlock()
@@ -303,14 +380,6 @@ func (s *Service) poll(ctx context.Context, auth *coreauth.Auth, a *account, pla
 		return
 	}
 	s.record(ctx, auth.ID, windows, "polled", now)
-}
-
-func cloneHeaders() map[string]string {
-	out := make(map[string]string, len(claudeHeaders))
-	for k, v := range claudeHeaders {
-		out[k] = v
-	}
-	return out
 }
 
 // record updates current state and writes a snapshot for windows that changed or are due a
@@ -363,7 +432,7 @@ func changed(last written, w Window) bool {
 // ErrUnknownAccount / ErrUnsupportedProvider are returned by PollNow.
 var (
 	ErrUnknownAccount      = errors.New("unknown auth_id")
-	ErrUnsupportedProvider = errors.New("quota polling supports claude accounts only")
+	ErrUnsupportedProvider = errors.New("quota polling supports claude and codex subscription accounts only")
 )
 
 // PollNow polls one account immediately and returns its fresh state. A second call within 30 s,
@@ -380,13 +449,14 @@ func (s *Service) PollNow(ctx context.Context, authID string) (Account, bool, er
 	if auth == nil {
 		return Account{}, false, ErrUnknownAccount
 	}
-	if !strings.EqualFold(auth.Provider, "claude") || auth.Disabled {
+	spec, provider, ok := specFor(auth)
+	if !ok {
 		return Account{}, false, ErrUnsupportedProvider
 	}
 	now := s.now()
 	s.mu.Lock()
 	a := s.accountLocked(auth.ID)
-	a.AuthIndex, a.Provider = auth.EnsureIndex(), "claude"
+	a.AuthIndex, a.Provider = auth.EnsureIndex(), provider
 	if label := strings.TrimSpace(auth.Label); label != "" {
 		a.Label = label
 	}
@@ -394,7 +464,7 @@ func (s *Service) PollNow(ctx context.Context, authID string) (Account, bool, er
 	planDue := now.Sub(a.planAt) >= planEvery
 	s.mu.Unlock()
 	if !throttled {
-		s.poll(ctx, auth, a, planDue)
+		s.poll(ctx, spec, auth, a, planDue)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

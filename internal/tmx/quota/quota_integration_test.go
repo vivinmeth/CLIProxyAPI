@@ -21,6 +21,8 @@ type fakeFetcher struct {
 	status  int
 	calls   map[string]int
 	headers map[string]string
+	// codexUsage is served for the Codex usage URL; empty means 404.
+	codexUsage string
 }
 
 func (f *fakeFetcher) TmxAuths() []*coreauth.Auth {
@@ -38,6 +40,12 @@ func (f *fakeFetcher) TmxFetch(_ context.Context, _ *coreauth.Auth, url string, 
 	defer f.mu.Unlock()
 	f.calls[url]++
 	f.headers = headers
+	if url == codexUsageURL {
+		if f.codexUsage == "" {
+			return 404, nil, nil
+		}
+		return 200, []byte(f.codexUsage), nil
+	}
 	if url == claudeProfileURL {
 		return 200, []byte(`{"account":{"has_claude_max":true},"organization":{"rate_limit_tier":"default_claude_max_20x"}}`), nil
 	}
@@ -103,7 +111,7 @@ func TestQuotaServiceRecordsPassivePolledAndHistory(t *testing.T) {
 
 	s.tick(ctx)
 	// a: passive 5h, then the poll's 5h matches it (same value, reset within a minute) so only
-	// 7d and 7d:fable-5 are new = 3 rows; idle: 3 polled rows. Codex untouched.
+	// 7d and 7d:fable-5 are new = 3 rows; idle: 3 polled rows. Codex polls but gets a 404 here.
 	if n := countRows(t, s); n != 6 {
 		t.Fatalf("rows after first tick = %d, want 6", n)
 	}
@@ -164,7 +172,8 @@ func TestQuotaServiceRecordsPassivePolledAndHistory(t *testing.T) {
 	}
 
 	accounts := s.Accounts()
-	if len(accounts) != 2 || accounts[0].Plan != "max_20x" || accounts[0].PollError == "" {
+	if len(accounts) != 3 || accounts[0].Plan != "max_20x" || accounts[0].PollError == "" ||
+		accounts[2].Provider != "codex" || accounts[2].PollError != "status 404" {
 		t.Fatalf("accounts = %+v", accounts)
 	}
 	windows := map[string]Current{}
@@ -188,8 +197,10 @@ func TestQuotaServiceRecordsPassivePolledAndHistory(t *testing.T) {
 func TestQuotaPollNow(t *testing.T) {
 	clock := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
 	auth := &coreauth.Auth{ID: "claude-now.json", Provider: "claude"}
-	codex := &coreauth.Auth{ID: "codex-now.json", Provider: "codex"}
-	f := &fakeFetcher{auths: []*coreauth.Auth{auth, codex}, usage: usageJSON(7, 8, 9), status: 200, calls: map[string]int{}}
+	codex := &coreauth.Auth{ID: "codex-now.json", Provider: "codex", Metadata: map[string]any{"account_id": "acct-1"}}
+	apiKeyCodex := &coreauth.Auth{ID: "codex-key.json", Provider: "codex", Attributes: map[string]string{"api_key": "sk-x"}}
+	f := &fakeFetcher{auths: []*coreauth.Auth{auth, codex, apiKeyCodex}, usage: usageJSON(7, 8, 9), status: 200, calls: map[string]int{},
+		codexUsage: `{"plan_type":"prolite","rate_limit":{"primary_window":{"used_percent":12,"limit_window_seconds":604800,"reset_at":1793102375}}}`}
 	s := openTestService(t, f, &clock)
 	ctx := context.Background()
 	acc, throttled, err := s.PollNow(ctx, "claude-now.json")
@@ -200,8 +211,16 @@ func TestQuotaPollNow(t *testing.T) {
 	if _, throttled, _ = s.PollNow(ctx, "claude-now.json"); !throttled || f.calls[claudeUsageURL] != 1 {
 		t.Fatalf("second poll within 30 s not throttled (calls %v)", f.calls)
 	}
-	if _, _, err = s.PollNow(ctx, "codex-now.json"); !errors.Is(err, ErrUnsupportedProvider) {
-		t.Fatalf("codex err = %v", err)
+	cx, _, err := s.PollNow(ctx, "codex-now.json")
+	if err != nil || cx.Plan != "prolite" || cx.Provider != "codex" || len(cx.Windows) != 1 ||
+		cx.Windows[0].Window.Window != "7d" || *cx.Windows[0].UsedPct != 12 {
+		t.Fatalf("codex poll = %+v %v", cx, err)
+	}
+	if f.headers["Chatgpt-Account-Id"] != "acct-1" {
+		t.Fatalf("codex account header = %v", f.headers)
+	}
+	if _, _, err = s.PollNow(ctx, "codex-key.json"); !errors.Is(err, ErrUnsupportedProvider) {
+		t.Fatalf("API-key codex err = %v", err)
 	}
 	if _, _, err = s.PollNow(ctx, "nope"); !errors.Is(err, ErrUnknownAccount) {
 		t.Fatalf("unknown err = %v", err)

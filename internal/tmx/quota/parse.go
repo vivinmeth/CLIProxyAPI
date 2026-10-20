@@ -189,3 +189,129 @@ func sortWindows(ws []Window) {
 		}
 	}
 }
+
+// windowNameForSeconds names a window by its length: 5h, 7d, 30d, otherwise <n>h / <n>m.
+func windowNameForSeconds(secs int64) string {
+	switch {
+	case secs <= 0:
+		return ""
+	case secs%86400 == 0:
+		return strconv.FormatInt(secs/86400, 10) + "d"
+	case secs%3600 == 0:
+		return strconv.FormatInt(secs/3600, 10) + "h"
+	default:
+		return strconv.FormatInt((secs+59)/60, 10) + "m"
+	}
+}
+
+// ParseCodexSignals reads the x-codex-{primary,secondary}-* headers the proxy keeps per account
+// (from HTTP responses and from websocket rate-limit events): used-percent 0-100, window-minutes,
+// reset-at (unix) or reset-after-seconds counted from observedAt.
+func ParseCodexSignals(signals map[string]string, observedAt time.Time) []Window {
+	get := func(name string) string {
+		for k, v := range signals {
+			if strings.EqualFold(k, name) {
+				return strings.TrimSpace(v)
+			}
+		}
+		return ""
+	}
+	var out []Window
+	for _, slot := range []string{"Primary", "Secondary"} {
+		base := "X-Codex-" + slot + "-"
+		minutes, errMin := strconv.ParseInt(get(base+"Window-Minutes"), 10, 64)
+		used, errUsed := strconv.ParseFloat(get(base+"Used-Percent"), 64)
+		if errMin != nil || errUsed != nil || minutes <= 0 {
+			continue
+		}
+		w := Window{Window: windowNameForSeconds(minutes * 60), UsedPct: pct(used)}
+		if n, err := strconv.ParseInt(get(base+"Reset-At"), 10, 64); err == nil && n > 0 {
+			t := time.Unix(n, 0).UTC()
+			w.ResetsAt = &t
+		} else if n, err = strconv.ParseInt(get(base+"Reset-After-Seconds"), 10, 64); err == nil && n >= 0 && !observedAt.IsZero() {
+			t := observedAt.Add(time.Duration(n) * time.Second).UTC().Truncate(time.Second)
+			w.ResetsAt = &t
+		}
+		if strings.EqualFold(get("X-Codex-Limit-Reached"), "true") && used >= 100 {
+			w.Status = "rejected"
+		}
+		out = append(out, w)
+	}
+	sortWindows(out)
+	return out
+}
+
+type codexWindow struct {
+	UsedPercent        *float64 `json:"used_percent"`
+	LimitWindowSeconds int64    `json:"limit_window_seconds"`
+	ResetAt            int64    `json:"reset_at"`
+}
+
+type codexRateLimit struct {
+	LimitReached bool         `json:"limit_reached"`
+	Primary      *codexWindow `json:"primary_window"`
+	Secondary    *codexWindow `json:"secondary_window"`
+}
+
+func (r *codexRateLimit) windows(prefix string) []Window {
+	if r == nil {
+		return nil
+	}
+	var out []Window
+	for _, cw := range []*codexWindow{r.Primary, r.Secondary} {
+		if cw == nil || cw.UsedPercent == nil || cw.LimitWindowSeconds <= 0 {
+			continue
+		}
+		w := Window{Window: prefix + windowNameForSeconds(cw.LimitWindowSeconds), UsedPct: pct(*cw.UsedPercent)}
+		if cw.ResetAt > 0 {
+			t := time.Unix(cw.ResetAt, 0).UTC()
+			w.ResetsAt = &t
+		}
+		if r.LimitReached && *cw.UsedPercent >= 100 {
+			w.Status = "rejected"
+		}
+		out = append(out, w)
+	}
+	return out
+}
+
+// ParseCodexUsage reads GET chatgpt.com/backend-api/wham/usage. Windows are named by length
+// ("5h", "7d", "30d"); the code-review limit gets a "code_review:" prefix and additional metered
+// limits "<name>:". Also returns plan_type (e.g. "prolite", "plus", "pro").
+func ParseCodexUsage(body []byte) ([]Window, string, error) {
+	var p struct {
+		PlanType   string          `json:"plan_type"`
+		RateLimit  *codexRateLimit `json:"rate_limit"`
+		CodeReview *codexRateLimit `json:"code_review_rate_limit"`
+		Additional json.RawMessage `json:"additional_rate_limits"`
+	}
+	if err := json.Unmarshal(body, &p); err != nil {
+		return nil, "", err
+	}
+	out := p.RateLimit.windows("")
+	out = append(out, p.CodeReview.windows("code_review:")...)
+	var extra []struct {
+		LimitName      string          `json:"limit_name"`
+		MeteredFeature string          `json:"metered_feature"`
+		RateLimit      *codexRateLimit `json:"rate_limit"`
+	}
+	if len(p.Additional) > 0 && json.Unmarshal(p.Additional, &extra) == nil {
+		for _, e := range extra {
+			name := strings.Trim(nonSlug.ReplaceAllString(strings.ToLower(firstNonEmpty(e.LimitName, e.MeteredFeature)), "_"), "_")
+			if name != "" {
+				out = append(out, e.RateLimit.windows(name+":")...)
+			}
+		}
+	}
+	sortWindows(out)
+	return out, strings.ToLower(strings.TrimSpace(p.PlanType)), nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
