@@ -149,6 +149,9 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 			}
 		}
 	}
+	if nativeRequest {
+		codexturn.MirrorWebsocketSessionHeaders(headers, ginHeaders) // tmx: same session headers as HTTP/direct
+	}
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		headers.Set("Originator", originator)
 	} else if !isAPIKey {
