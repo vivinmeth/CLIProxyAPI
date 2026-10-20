@@ -45,6 +45,7 @@ type BlobStore struct {
 	dec *zstd.Decoder
 
 	known   *lruSet
+	cache   *blobCache
 	kick    chan struct{}
 	stopped chan struct{}
 	stop    chan struct{}
@@ -70,7 +71,7 @@ func newBlobStore(db *sql.DB, schema string, r2 *minio.Client, bucket, env, spoo
 	}
 	b := &BlobStore{
 		db: db, schema: schema, r2: r2, bucket: bucket, prefix: env + "/blobs", spool: spool,
-		enc: enc, dec: dec, known: newLRUSet(200000),
+		enc: enc, dec: dec, known: newLRUSet(200000), cache: newBlobCache(spool),
 		kick: make(chan struct{}, 1), stop: make(chan struct{}), stopped: make(chan struct{}),
 	}
 	go b.uploadLoop()
@@ -174,6 +175,9 @@ func (b *BlobStore) Get(ctx context.Context, hash string) ([]byte, error) {
 		if b.r2 == nil {
 			return nil, fmt.Errorf("blob %s not found", hash)
 		}
+		if cached, ok := b.cache.get(hash); ok {
+			return b.dec.DecodeAll(cached, nil)
+		}
 		key, opts := b.objectKey(hash), minio.GetObjectOptions{}
 		var packKey sql.NullString
 		var packOffset, storedSize sql.NullInt64
@@ -196,6 +200,7 @@ func (b *BlobStore) Get(ctx context.Context, hash string) ([]byte, error) {
 		if compressed, err = io.ReadAll(obj); err != nil {
 			return nil, err
 		}
+		b.cache.put(hash, compressed)
 	}
 	return b.dec.DecodeAll(compressed, nil)
 }

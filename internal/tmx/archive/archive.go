@@ -470,6 +470,7 @@ func (a *Archive) Stats() map[string]any {
 		"blobs_deduped":    a.blobs.dedup.Load(),
 		"blobs_uploaded":   a.blobs.uploaded.Load(),
 		"packs_uploaded":   a.blobs.packs.Load(),
+		"read_cache":       a.blobs.cache.stats(),
 		"upload_failures":  a.blobs.failures.Load(),
 		"spool_backlog":    a.blobs.SpoolBacklog(),
 		"r2_configured":    a.blobs.r2 != nil,

@@ -297,6 +297,7 @@ func registerTMXArchiveRoutes(v8 *gin.RouterGroup) {
 	g.GET("/sessions/*id", tmxArchive(tmxSessionGet))
 	g.DELETE("/sessions/*id", tmxArchive(tmxSessionDelete))
 	g.POST("/usage/rebuild", tmxArchive(tmxUsageRebuild))
+	g.GET("/conversation", tmxArchive(tmxConversation))
 	g.GET("/exchanges", tmxArchive(tmxExchangeList))
 	g.GET("/exchanges/:trace", tmxArchive(tmxExchangeGet))
 }
@@ -441,6 +442,22 @@ func tmxArchiveStorage(c *gin.Context, a *archive.Archive) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "bucket listing failed: " + err.Error(), "cost_estimate": cost})
 	default:
 		c.JSON(http.StatusOK, gin.H{"enabled": true, "r2_configured": true, "storage": usage, "cost_estimate": cost})
+	}
+}
+
+// tmxConversation: GET /tmx/archive/conversation?session_id=&harness=&trace_id= — a session
+// rebuilt for reading (imported transcript, or the proxied session's fullest captured request plus
+// its response), normalised to role/kind/text items.
+func tmxConversation(c *gin.Context, a *archive.Archive) {
+	conv, err := a.Conversation(c.Request.Context(), c.Query("session_id"), strings.TrimSpace(c.Query("harness")),
+		strings.TrimSpace(c.Query("trace_id")))
+	switch {
+	case errors.Is(err, archive.ErrNoConversation):
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+	case err != nil:
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	default:
+		c.JSON(http.StatusOK, conv)
 	}
 }
 
