@@ -23,6 +23,8 @@ type Store struct {
 
 // Open shares the existing tmx database pool and follows its schema migration style.
 func Open(ctx context.Context, db *sql.DB, schema string) (*Store, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	table := `"` + strings.ReplaceAll(schema, `"`, `""`) + `".session_bindings`
 	_, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS `+table+` (
  session_key TEXT PRIMARY KEY, auth_id TEXT NOT NULL, aliases JSONB NOT NULL,
@@ -128,6 +130,8 @@ func Start(ctx context.Context, db *sql.DB, schema string, manager *auth.Manager
 	return w, nil
 }
 func (w *Worker) restore(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	bindings, err := w.store.Load(ctx)
 	if err != nil {
 		return err
