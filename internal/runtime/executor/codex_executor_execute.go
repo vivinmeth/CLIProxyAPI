@@ -39,6 +39,12 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
+	var streamUsage helps.StreamUsageBuffer
+	defer func() {
+		if err != nil {
+			streamUsage.PublishFailure(ctx, reporter, err)
+		}
+	}()
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -158,6 +164,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		eventData := bytes.TrimSpace(line[5:])
 		eventData = helps.RestoreCodexMultiAgentV2Response(eventData, optimizeMultiAgentV2)
 		reporter.ObserveResponseModel(eventData)
+		streamUsage.ObserveCodexStream(eventData)
 		eventType := gjson.GetBytes(eventData, "type").String()
 
 		if helps.HasMeaningfulCodexOutputDelta(eventData) {

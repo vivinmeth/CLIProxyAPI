@@ -250,7 +250,7 @@ func (r *UsageReporter) SetResponseModel(model string) {
 // SetUpstreamModel records the upstream model expected to be served when it differs
 // from the requested model (e.g. due to provider-specific mapping or canonicalization).
 // Model substitution detection compares the response against this upstream model,
-// while usage accounting preserves the client's requested model.
+// while Alias preserves the client's requested model for usage accounting.
 func (r *UsageReporter) SetUpstreamModel(model string) {
 	if r == nil {
 		return
@@ -348,6 +348,9 @@ func (r *UsageReporter) SetTranslatedReasoningEffort(payload []byte, format stri
 		return
 	}
 	r.reasoning = thinking.ExtractTranslatedReasoningEffort(payload, format)
+	if model := gjson.GetBytes(payload, "model"); model.Type == gjson.String {
+		r.SetUpstreamModel(model.String())
+	}
 }
 
 func (r *UsageReporter) TrackHTTPClient(client *http.Client) *http.Client {
@@ -567,7 +570,8 @@ func (r *UsageReporter) EnsurePublished(ctx context.Context) {
 		return
 	}
 	r.once.Do(func() {
-		r.publishAttemptRecord(ctx, r.buildRecord(usage.Detail{}, false, usage.Failure{}))
+		detail := normalizeUsageDetailTotal(usage.Detail{}, r.provider, r.executorType)
+		r.publishAttemptRecord(ctx, r.buildRecord(detail, false, usage.Failure{}))
 	})
 }
 
@@ -635,6 +639,9 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 	responseModel := ""
 	if model == r.model {
 		responseModel = r.ResponseModel()
+		if upstreamModel := r.UpstreamModel(); upstreamModel != "" {
+			model = upstreamModel
+		}
 	}
 	return usage.Record{
 		RequestID:           r.requestID,
@@ -744,6 +751,19 @@ type usageTTFTRoundTripper struct {
 
 func (t usageTTFTRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	cliproxyexecutor.MarkUpstreamAttempt(req.Context())
+	// GetBody observes the final payload after user rules without consuming or
+	// rewriting the body sent upstream. Alias remains the client-facing name.
+	if req.GetBody != nil {
+		if body, errBody := req.GetBody(); errBody == nil {
+			payload, errRead := io.ReadAll(body)
+			_ = body.Close()
+			if errRead == nil {
+				if model := gjson.GetBytes(payload, "model"); model.Type == gjson.String {
+					t.reporter.SetUpstreamModel(model.String())
+				}
+			}
+		}
+	}
 	t.reporter.StartResponseTTFT()
 	resp, errRoundTrip := t.base.RoundTrip(req)
 	if errRoundTrip != nil {
@@ -868,9 +888,10 @@ func resolveUsageAuthType(auth *cliproxyauth.Auth) string {
 
 // StreamUsageBuffer keeps the latest usage detail observed in a stream.
 type StreamUsageBuffer struct {
-	detail        usage.Detail
-	ok            bool
-	responseModel string
+	detail           usage.Detail
+	ok               bool
+	responseModel    string
+	claudeFinalUsage bool
 }
 
 var (
@@ -937,6 +958,14 @@ func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
 	b.Observe(detail, usageOK || detail.ResponseServiceTier != "")
 }
 
+// ObserveCodexStream records usage and tier metadata before terminal error handling.
+func (b *StreamUsageBuffer) ObserveCodexStream(payload []byte) {
+	if b == nil || (!bytes.Contains(payload, openAIStreamUsageMarker) && !bytes.Contains(payload, openAIStreamServiceTierMarker)) {
+		return
+	}
+	b.Observe(ParseCodexUsage(payload))
+}
+
 // ObserveClaudeStream records and merges usage from a Claude SSE line.
 func (b *StreamUsageBuffer) ObserveClaudeStream(line []byte) {
 	if b == nil {
@@ -951,6 +980,16 @@ func (b *StreamUsageBuffer) ObserveClaudeStream(line []byte) {
 	}
 	if detail, ok := ParseClaudeStreamUsage(line); ok {
 		ObserveMergedStreamUsage(b, detail)
+		payload := jsonPayload(line)
+		if gjson.GetBytes(payload, "type").String() == "message_delta" &&
+			gjson.GetBytes(payload, "usage.output_tokens").Exists() &&
+			gjson.GetBytes(payload, "delta.stop_reason").String() != "" {
+			b.claudeFinalUsage = true
+		}
+		if !b.claudeFinalUsage && b.detail.TokenBreakdown.Quality == usage.TokenAccountingQualityComplete {
+			// message_start output is provisional, even if the known buckets add up.
+			b.detail.TokenBreakdown.Quality = usage.TokenAccountingQualityUnclassified
+		}
 	}
 }
 
@@ -1165,7 +1204,14 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 	if !usageNode.Exists() {
 		return usage.Detail{}, false
 	}
-	return parseClaudeUsageNode(usageNode), true
+	detail := parseClaudeUsageNode(usageNode)
+	if gjson.GetBytes(payload, "type").String() != "message_delta" ||
+		!usageNode.Get("output_tokens").Exists() || gjson.GetBytes(payload, "delta.stop_reason").String() == "" {
+		if detail.TokenBreakdown.Quality == usage.TokenAccountingQualityComplete {
+			detail.TokenBreakdown.Quality = usage.TokenAccountingQualityUnclassified
+		}
+	}
+	return detail, true
 }
 
 func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {

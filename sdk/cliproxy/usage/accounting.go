@@ -227,7 +227,7 @@ func NewSeparateReasoningTokenBreakdown(inputTotal, cacheRead, cacheWrite, nonRe
 // guessing how an unknown protocol partitions it.
 func NewUnclassifiedTokenBreakdown(total int64) TokenBreakdown {
 	if total <= 0 {
-		quality := TokenAccountingQualityComplete
+		quality := TokenAccountingQualityUnclassified
 		if total < 0 {
 			quality = TokenAccountingQualityInconsistent
 		}
@@ -253,12 +253,23 @@ func EnsureTokenBreakdown(detail Detail) Detail {
 func EnsureTokenBreakdownForProvider(detail Detail, provider, executorType string) Detail {
 	if !detail.TokenBreakdown.Valid() {
 		semantics := tokenAccountingSemanticsFor(provider, executorType)
+		// Claude's legacy cached_tokens aliases writes when there were no reads.
+		// Only recover a read when it cannot be that write-only alias.
+		if semantics == tokenAccountingSemanticsIndependent && detail.CacheReadTokens == 0 && detail.CachedTokens > 0 &&
+			(detail.CacheCreationTokens == 0 || detail.CachedTokens != detail.CacheCreationTokens) {
+			detail.CacheReadTokens = detail.CachedTokens
+		}
 		if detail.CacheReadTokens == 0 && detail.CachedTokens > 0 && detail.InputTokens == 0 &&
 			detail.OutputTokens == 0 && detail.ReasoningTokens == 0 && detail.CacheCreationTokens == 0 && detail.TotalTokens == 0 &&
 			(semantics == tokenAccountingSemanticsSubset || semantics == tokenAccountingSemanticsSeparateReasoning) {
 			detail.CacheReadTokens = detail.CachedTokens
 		}
 		detail.TokenBreakdown = tokenBreakdownForSemantics(detail, semantics)
+	}
+	if detail.TotalTokens == 0 && detail.InputTokens == 0 && detail.OutputTokens == 0 && detail.ReasoningTokens == 0 &&
+		detail.CacheReadTokens == 0 && detail.CacheCreationTokens == 0 && detail.CachedTokens == 0 &&
+		detail.TokenBreakdown.TotalTokens == 0 && detail.TokenBreakdown.Quality == TokenAccountingQualityComplete {
+		detail.TokenBreakdown.Quality = TokenAccountingQualityUnclassified
 	}
 	if detail.TotalTokens == 0 {
 		detail.TotalTokens = detail.TokenBreakdown.TotalTokens

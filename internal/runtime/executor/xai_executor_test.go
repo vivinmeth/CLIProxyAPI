@@ -3592,8 +3592,8 @@ func TestXAIExecutorExecuteImagesUsesImagesEndpointAndPublishesUsage(t *testing.
 	if record.Failed {
 		t.Fatalf("failed = true, want false; failure=%+v", record.Fail)
 	}
-	if record.Detail != (usage.Detail{}) {
-		t.Fatalf("detail = %+v, want zero token usage", record.Detail)
+	if record.Detail != (usage.Detail{TokenBreakdown: usage.NewUnclassifiedTokenBreakdown(0)}) {
+		t.Fatalf("detail = %+v, want unclassified zero token usage", record.Detail)
 	}
 	assertXAIUsageRecordTTFT(t, record.TTFT)
 	assertNoAdditionalXAIUsageRecord(t, plugin.records)
@@ -3975,8 +3975,8 @@ func TestXAIExecutorExecuteVideosCreate(t *testing.T) {
 	if record.Failed {
 		t.Fatalf("failed = true, want false; failure=%+v", record.Fail)
 	}
-	if record.Detail != (usage.Detail{}) {
-		t.Fatalf("detail = %+v, want zero token usage", record.Detail)
+	if record.Detail != (usage.Detail{TokenBreakdown: usage.NewUnclassifiedTokenBreakdown(0)}) {
+		t.Fatalf("detail = %+v, want unclassified zero token usage", record.Detail)
 	}
 	assertXAIUsageRecordTTFT(t, record.TTFT)
 	assertNoAdditionalXAIUsageRecord(t, plugin.records)
