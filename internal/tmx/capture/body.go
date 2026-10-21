@@ -62,7 +62,10 @@ func Dropped() int64   { return captureDrops.Load() }
 // Body owns a bounded memory capture or a spool file. Ownership moves to Exchange;
 // Release must run after archiving or dropping it. Writes never affect client delivery.
 // Group shares the per-exchange memory threshold across body and timing sources.
-type Group struct{ bytes atomic.Int64 }
+type Group struct {
+	bytes    atomic.Int64
+	dropOnce sync.Once
+}
 
 func (g *Group) NewBody() *Body { return &Body{group: g} }
 
@@ -137,9 +140,17 @@ func (b *Body) spill() error {
 func (b *Body) fail(err error) error {
 	if b.err == nil {
 		b.err = err
-		if captureDrops.Add(1)%20 == 1 {
-			log.WithError(err).Warn("tmx capture: disk spill failed; dropping capture")
+		recordDrop := func() {
+			if captureDrops.Add(1)%20 == 1 {
+				log.WithError(err).Warn("tmx capture: disk spill failed; dropping capture")
+			}
 		}
+		if b.group != nil {
+			b.group.dropOnce.Do(recordDrop)
+		} else {
+			recordDrop()
+		}
+
 		b.Release()
 	}
 	return err

@@ -29,6 +29,9 @@ func (w *ResponseWriterWrapper) tmxTee(data []byte) {
 	if len(data) == 0 || !capture.Enabled() {
 		return
 	}
+	if w.tmx != nil && w.tmx.body.Err() != nil {
+		return
+	}
 	if w.tmx == nil {
 		group := &capture.Group{}
 		w.tmx = &tmxCapture{group: group, body: group.NewBody(), chunks: group.NewBody()}
@@ -70,6 +73,11 @@ func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
 			w.tmx.body.Release()
 			w.tmx.chunks.Release()
 		}
+		return
+	}
+	if w.tmx != nil && w.tmx.body.Err() != nil {
+		w.tmx.body.Release()
+		w.tmx.chunks.Release()
 		return
 	}
 	ex := &capture.Exchange{
