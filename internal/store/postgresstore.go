@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -570,7 +571,9 @@ func (s *PostgresStore) upsertAuthRecord(ctx context.Context, relID, path string
 func (s *PostgresStore) persistAuth(ctx context.Context, relID string, data []byte) error {
 	// All callers hold s.mu. Canonicalize JSON so whitespace/key order changes do not write.
 	var content any
-	if err := json.Unmarshal(data, &content); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&content); err != nil {
 		return fmt.Errorf("postgres store: invalid auth JSON: %w", err)
 	}
 	canonical, err := json.Marshal(content)

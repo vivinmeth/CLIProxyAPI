@@ -43,4 +43,14 @@ func TestPostgresAuthSkipsOnlySuccessfullyPersistedUnchangedContent(t *testing.T
 	if writes != 3 {
 		t.Fatalf("unchanged rotation wrote again: %d", writes)
 	}
+	if err := save(`{"numeric_id":9007199254740992}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := save(`{"numeric_id":9007199254740993}`); err != nil {
+		t.Fatal(err)
+	}
+	if writes != 5 {
+		t.Fatalf("numeric credential metadata changes were collapsed: %d writes", writes)
+	}
+
 }
