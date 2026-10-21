@@ -48,17 +48,19 @@ type BlobStore struct {
 	enc *zstd.Encoder
 	dec *zstd.Decoder
 
-	known   *lruSet
-	cache   *blobCache
-	kick    chan struct{}
-	stopped chan struct{}
-	stop    chan struct{}
+	known     *lruSet
+	cache     *blobCache
+	lastSweep time.Time // upload loop only
+	kick      chan struct{}
+	stopped   chan struct{}
+	stop      chan struct{}
 
 	stored   atomic.Int64
 	dedup    atomic.Int64
 	uploaded atomic.Int64
 	packs    atomic.Int64
 	failures atomic.Int64
+	swept    atomic.Int64
 }
 
 func newBlobStore(db *sql.DB, schema string, r2 *minio.Client, bucket, env, spool string) (*BlobStore, error) {
@@ -267,6 +269,10 @@ const (
 	packMaxBytes      = 32 << 20 // per pack object
 	packMaxBlobs      = 5000
 	packLoneBytes     = 8 << 20 // blobs at least this big get their own object
+	// strayAge: a spool file without an index row this old is from a Put that failed before
+	// indexing; an index row this old without upload or spool file points nowhere.
+	strayAge      = time.Hour
+	sweepInterval = time.Hour
 )
 
 // spooled is one blob waiting in the spool.
@@ -345,6 +351,69 @@ func (b *BlobStore) uploadPending() {
 	flush()
 	close(jobs)
 	wg.Wait()
+	if !failed.Load() && time.Since(b.lastSweep) >= sweepInterval {
+		b.lastSweep = time.Now()
+		b.sweepUnbacked()
+	}
+}
+
+// sweepUnbacked deletes index rows that were never uploaded and have no spool file (lost before
+// uploads only removed indexed files). Their content is gone; without the row the next Put of
+// the same bytes (a re-import) stores them again instead of deduplicating against nothing.
+func (b *BlobStore) sweepUnbacked() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	rows, err := b.db.QueryContext(ctx, `SELECT hash FROM `+b.schema+`.blobs
+		WHERE uploaded_at IS NULL AND created_at < $1`, time.Now().Add(-strayAge))
+	if err != nil {
+		return
+	}
+	var gone []string
+	for rows.Next() {
+		var h string
+		if rows.Scan(&h) != nil {
+			continue
+		}
+		if _, errStat := os.Stat(b.spoolPath(h)); errors.Is(errStat, os.ErrNotExist) {
+			gone = append(gone, h)
+		}
+	}
+	if rows.Err() != nil {
+		_ = rows.Close()
+		return
+	}
+	_ = rows.Close()
+	if len(gone) == 0 {
+		return
+	}
+	if _, err = b.db.ExecContext(ctx, `DELETE FROM `+b.schema+`.blobs WHERE hash = ANY($1::text[])
+		AND uploaded_at IS NULL`, pgArray(gone)); err != nil {
+		log.WithError(err).Warn("tmx archive: sweeping unbacked blob rows failed")
+		return
+	}
+	for _, h := range gone {
+		b.known.Remove(h)
+	}
+	b.swept.Add(int64(len(gone)))
+	log.WithField("blobs", len(gone)).Warn("tmx archive: removed index rows of blobs that were never uploaded; re-import their sessions")
+}
+
+// settleSpooled removes the spool files of uploaded blobs. A file whose index row didn't exist
+// yet (Put writes the file before inserting the row) stays and goes into a later pass, unless it
+// is old enough to be from a Put that failed.
+func (b *BlobStore) settleSpooled(hashes []string, indexed map[string]bool) {
+	for _, h := range hashes {
+		if indexed[h] {
+			_ = os.Remove(b.spoolPath(h))
+			continue
+		}
+		if st, err := os.Stat(b.spoolPath(h)); err == nil && time.Since(st.ModTime()) > strayAge {
+			var exists bool
+			if b.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM `+b.schema+`.blobs WHERE hash = $1)`, h).Scan(&exists) == nil && !exists {
+				_ = os.Remove(b.spoolPath(h))
+			}
+		}
+	}
 }
 
 // uploadOne stores a single blob as its own object (legacy layout, used for very large blobs).
@@ -355,18 +424,19 @@ func (b *BlobStore) uploadOne(blob spooled) error {
 		int64(len(blob.data)), minio.PutObjectOptions{ContentType: "application/zstd"}); err != nil {
 		return err
 	}
-	if _, err := b.db.ExecContext(ctx, `UPDATE `+b.schema+`.blobs SET uploaded_at = now() WHERE hash = $1`,
-		blob.hash); err != nil {
+	tag, err := b.db.ExecContext(ctx, `UPDATE `+b.schema+`.blobs SET uploaded_at = now() WHERE hash = $1`, blob.hash)
+	if err != nil {
 		return err
 	}
-	_ = os.Remove(b.spoolPath(blob.hash))
-	b.uploaded.Add(1)
+	n, _ := tag.RowsAffected()
+	b.settleSpooled([]string{blob.hash}, map[string]bool{blob.hash: n > 0})
+	b.uploaded.Add(n)
 	return nil
 }
 
 // uploadPack concatenates blobs into one object, then records each blob's pack and offset. If the
-// index update fails the blobs stay spooled and go into a later pack; the orphaned pack only
-// wastes its bytes.
+// index update fails (or a blob's row isn't committed yet) the blobs stay spooled and go into a
+// later pack; the orphaned pack bytes are only wasted space.
 func (b *BlobStore) uploadPack(group []spooled) error {
 	var buf bytes.Buffer
 	hashes := make([]string, len(group))
@@ -385,16 +455,27 @@ func (b *BlobStore) uploadPack(group []spooled) error {
 		minio.PutObjectOptions{ContentType: "application/octet-stream"}); err != nil {
 		return err
 	}
-	if _, err := b.db.ExecContext(ctx, `UPDATE `+b.schema+`.blobs AS b
+	rows, err := b.db.QueryContext(ctx, `UPDATE `+b.schema+`.blobs AS b
 		SET uploaded_at = now(), pack_key = $1, pack_offset = u.off
-		FROM unnest($2::text[], $3::bigint[]) AS u(hash, off) WHERE b.hash = u.hash`,
-		key, pgArray(hashes), pgInt64Array(offsets)); err != nil {
+		FROM unnest($2::text[], $3::bigint[]) AS u(hash, off) WHERE b.hash = u.hash RETURNING b.hash`,
+		key, pgArray(hashes), pgInt64Array(offsets))
+	if err != nil {
 		return err
 	}
-	for _, h := range hashes {
-		_ = os.Remove(b.spoolPath(h))
+	indexed := make(map[string]bool, len(hashes))
+	for rows.Next() {
+		var h string
+		if err = rows.Scan(&h); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		indexed[h] = true
 	}
-	b.uploaded.Add(int64(len(group)))
+	if err = closeRows(rows); err != nil {
+		return err
+	}
+	b.settleSpooled(hashes, indexed)
+	b.uploaded.Add(int64(len(indexed)))
 	b.packs.Add(1)
 	return nil
 }
@@ -453,6 +534,15 @@ func (s *lruSet) Has(k string) bool {
 		return true
 	}
 	return false
+}
+
+func (s *lruSet) Remove(k string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if el, ok := s.items[k]; ok {
+		s.order.Remove(el)
+		delete(s.items, k)
+	}
 }
 
 func (s *lruSet) Add(k string) {

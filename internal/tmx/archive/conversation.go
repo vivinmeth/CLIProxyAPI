@@ -26,6 +26,9 @@ type ConvItem struct {
 	IsError bool       `json:"is_error,omitempty"` // tool_result reported an error
 	TS      *time.Time `json:"ts,omitempty"`
 	Model   string     `json:"model,omitempty"`
+	// Data is the item's structured form as JSON, untruncated: a tool call's arguments, or the
+	// raw block of an "other" item. Only analytics stores it.
+	Data string `json:"-"`
 }
 
 // ConvExchange is one captured proxied request of the session.
@@ -58,6 +61,7 @@ const (
 	convMaxItems    = 4000
 	convMaxItemText = 64 << 10
 	convMaxExch     = 500
+	convMaxItemData = 4 << 20
 )
 
 // Conversation rebuilds a session for reading. Imported sessions come from their stored messages
@@ -267,7 +271,7 @@ func normalizeMessage(m gjson.Result, fallbackRole string) []ConvItem {
 	switch m.Get("type").String() {
 	case "function_call", "custom_tool_call", "local_shell_call":
 		args := firstNonEmptyStr(m.Get("arguments").String(), m.Get("input").String(), m.Get("action").Raw)
-		return []ConvItem{withCall(item("assistant", "tool_call", args, m.Get("name").String()), m.Get("call_id").String(), false)}
+		return []ConvItem{withData(withCall(item("assistant", "tool_call", args, m.Get("name").String()), m.Get("call_id").String(), false), args)}
 	case "function_call_output", "custom_tool_call_output", "local_shell_call_output":
 		return []ConvItem{withCall(item("tool", "tool_result", outputText(m.Get("output")), ""), m.Get("call_id").String(), false)}
 	case "reasoning":
@@ -278,6 +282,9 @@ func normalizeMessage(m gjson.Result, fallbackRole string) []ConvItem {
 		})
 		return []ConvItem{item("assistant", "thinking", strings.Join(parts, "\n"), "")}
 	}
+	if m.Get("bubbleId").Exists() {
+		return cursorBubble(m, fallbackRole)
+	}
 	content := m.Get("content")
 	if !content.Exists() {
 		content = m.Get("parts")
@@ -286,12 +293,13 @@ func normalizeMessage(m gjson.Result, fallbackRole string) []ConvItem {
 		if !m.IsObject() && !m.IsArray() && m.String() != "" {
 			return []ConvItem{item(role, "text", m.String(), "")}
 		}
-		return []ConvItem{item(role, "other", m.Raw, "")}
+		return []ConvItem{otherItem(role, m)}
 	}
 	items := contentItems(content, role)
 	// Chat Completions tool calls live next to content.
 	m.Get("tool_calls").ForEach(func(_, tc gjson.Result) bool {
-		items = append(items, withCall(item(role, "tool_call", tc.Get("function.arguments").String(), tc.Get("function.name").String()), tc.Get("id").String(), false))
+		args := tc.Get("function.arguments").String()
+		items = append(items, withData(withCall(item(role, "tool_call", args, tc.Get("function.name").String()), tc.Get("id").String(), false), args))
 		return true
 	})
 	if role == "tool" && len(items) > 0 {
@@ -320,23 +328,81 @@ func contentItems(content gjson.Result, role string) []ConvItem {
 		case "text", "input_text", "output_text", "":
 			text := b.Get("text").String()
 			if text == "" && t == "" {
-				out = append(out, item(role, "other", b.Raw, ""))
+				out = append(out, otherItem(role, b))
 			} else {
 				out = append(out, item(role, "text", text, ""))
 			}
 		case "thinking", "redacted_thinking":
 			out = append(out, item(role, "thinking", firstNonEmptyStr(b.Get("thinking").String(), "[redacted thinking]"), ""))
+		case "reasoning": // OpenCode
+			out = append(out, item(role, "thinking", b.Get("text").String(), ""))
 		case "tool_use", "server_tool_use":
-			out = append(out, withCall(item(role, "tool_call", b.Get("input").Raw, b.Get("name").String()), b.Get("id").String(), false))
+			out = append(out, withData(withCall(item(role, "tool_call", b.Get("input").Raw, b.Get("name").String()), b.Get("id").String(), false), b.Get("input").Raw))
+		case "tool": // OpenCode: the call and its result in one part
+			out = append(out, openCodeTool(b)...)
+		case "step-start": // OpenCode: only a snapshot id
+		case "file": // OpenCode attachment
+			if strings.HasPrefix(b.Get("mime").String(), "image/") {
+				out = append(out, item(role, "image", "["+firstNonEmptyStr(b.Get("filename").String(), "image")+"]", ""))
+			} else {
+				out = append(out, otherItem(role, b))
+			}
 		case "tool_result":
 			out = append(out, withCall(item("tool", "tool_result", outputText(b.Get("content")), ""), b.Get("tool_use_id").String(), b.Get("is_error").Bool()))
 		case "image", "input_image", "document", "input_file":
 			out = append(out, item(role, "image", "["+t+"]", ""))
 		default:
-			out = append(out, item(role, "other", b.Raw, ""))
+			out = append(out, otherItem(role, b))
 		}
 		return true
 	})
+	return out
+}
+
+// openCodeTool splits an OpenCode tool part (tool, callID, state{status, input, output, error})
+// into a tool_call and, once it has run, its tool_result.
+func openCodeTool(b gjson.Result) []ConvItem {
+	st := b.Get("state")
+	callID := b.Get("callID").String()
+	input := st.Get("input").Raw
+	out := []ConvItem{withData(withCall(item("assistant", "tool_call", input, b.Get("tool").String()), callID, false), input)}
+	switch st.Get("status").String() {
+	case "completed":
+		out = append(out, withCall(item("tool", "tool_result", outputText(st.Get("output")), ""), callID, false))
+	case "error":
+		out = append(out, withCall(item("tool", "tool_result", st.Get("error").String(), ""), callID, true))
+	}
+	return out
+}
+
+// cursorBubble reads a Cursor chat bubble (type 1 = user, 2 = assistant): thinking, text, and a
+// tool call with its result (toolFormerData). Everything else in a bubble is editor context.
+func cursorBubble(m gjson.Result, fallbackRole string) []ConvItem {
+	role := fallbackRole
+	switch m.Get("type").Int() {
+	case 1:
+		role = "user"
+	case 2:
+		role = "assistant"
+	}
+	role = firstNonEmptyStr(role, "assistant")
+	var out []ConvItem
+	if t := m.Get("thinking.text").String(); strings.TrimSpace(t) != "" {
+		out = append(out, item(role, "thinking", t, ""))
+	}
+	if t := m.Get("text").String(); strings.TrimSpace(t) != "" {
+		out = append(out, item(role, "text", t, ""))
+	}
+	if tf := m.Get("toolFormerData"); tf.Get("name").String() != "" {
+		args := firstNonEmptyStr(tf.Get("rawArgs").String(), tf.Get("params").String())
+		callID := tf.Get("toolCallId").String()
+		out = append(out, withData(withCall(item("assistant", "tool_call", args, tf.Get("name").String()), callID, false), args))
+		if res := tf.Get("result").String(); res != "" || tf.Get("status").String() == "error" {
+			status := tf.Get("status").String()
+			out = append(out, withCall(item("tool", "tool_result", firstNonEmptyStr(res, tf.Get("error").Raw, status), ""),
+				callID, status == "error"))
+		}
+	}
 	return out
 }
 
@@ -438,7 +504,7 @@ func responseItems(body []byte) []ConvItem {
 	}
 	for _, idx := range toolOrder {
 		t := *tools[idx]
-		out = append(out, withCall(item(t.Role, t.Kind, t.Text, t.Name), t.CallID, false))
+		out = append(out, withData(withCall(item(t.Role, t.Kind, t.Text, t.Name), t.CallID, false), t.Text))
 	}
 	return out
 }
@@ -446,6 +512,20 @@ func responseItems(body []byte) []ConvItem {
 func withCall(it ConvItem, callID string, isError bool) ConvItem {
 	it.CallID, it.IsError = callID, isError
 	return it
+}
+
+// withData attaches raw as the item's structured form when it is JSON (and not huge).
+func withData(it ConvItem, raw string) ConvItem {
+	raw = strings.TrimSpace(raw)
+	if raw != "" && len(raw) <= convMaxItemData && gjson.Valid(raw) {
+		it.Data = raw
+	}
+	return it
+}
+
+// otherItem keeps a block nothing else understands: as text, and as data for JSON queries.
+func otherItem(role string, b gjson.Result) ConvItem {
+	return withData(item(role, "other", b.Raw, ""), b.Raw)
 }
 
 func item(role, kind, text, name string) ConvItem {

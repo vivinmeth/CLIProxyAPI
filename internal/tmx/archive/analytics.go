@@ -45,13 +45,16 @@ var trgmIndexSQL = []string{
 const (
 	// analyticsVersion is bumped when extraction changes; sessions extracted by an older version
 	// are rewritten on the next backfill.
-	analyticsVersion  = 1
+	analyticsVersion  = 2
 	journalTable      = schema + ".analytics_journal"
 	journalBatch      = 1000
 	analyticsPoll     = 3 * time.Second
 	prefetchChunkMsgs = 5000
 	maxAttempts       = 3
 	insertParamLimit  = 60000
+	// writeSession inserts once this much message/item content (or this many messages) is produced.
+	writeChunkBytes = 16 << 20
+	writeChunkMsgs  = 500
 )
 
 type analytics struct {
@@ -61,9 +64,10 @@ type analytics struct {
 	reqMirror  *mirror // tmx.requests -> requests (nil when the request log is off)
 	exchMirror *mirror // tmx_archive.exchanges -> exchanges
 
-	wake chan struct{}
-	stop chan struct{}
-	done chan struct{}
+	wake       chan struct{}
+	stop       chan struct{}
+	done       chan struct{}
+	pricesDone chan struct{} // nil when prices are off (no request log)
 
 	processed   atomic.Int64
 	extracted   atomic.Int64
@@ -95,6 +99,10 @@ func (a *Archive) startAnalytics(ctx context.Context) {
 	}
 	a.analytics = an
 	go an.run()
+	if an.reqMirror != nil {
+		an.pricesDone = make(chan struct{})
+		go an.pricesLoop()
+	}
 	log.Info("tmx analytics: on")
 }
 
@@ -178,11 +186,14 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 			call_id    TEXT NOT NULL DEFAULT '',
 			is_error   BOOLEAN NOT NULL DEFAULT FALSE,
 			text       TEXT NOT NULL DEFAULT '',     -- capped at 64 KiB per item
+			data       JSONB,                        -- untruncated structure: tool_call arguments, raw "other" block
 			ts         TIMESTAMPTZ,
 			model      TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (session_id, seq, idx),
 			FOREIGN KEY (session_id, seq) REFERENCES messages (session_id, seq) ON DELETE CASCADE
 		)`,
+		`ALTER TABLE items ADD COLUMN IF NOT EXISTS data JSONB`,
+		`CREATE INDEX IF NOT EXISTS messages_external_idx ON messages (session_id, external_id)`,
 		`CREATE INDEX IF NOT EXISTS items_kind_name_idx ON items (kind, name)`,
 		`CREATE INDEX IF NOT EXISTS items_call_idx ON items (call_id) WHERE call_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS items_ts_idx ON items (ts)`,
@@ -230,7 +241,28 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 			an.reqMirror = nil
 		}
 	}
+	if an.reqMirror != nil {
+		if err = an.ensureViews(ctx); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// ensureViews creates the price table and (re)creates the views over requests, in one
+// transaction so readers never see them missing.
+func (an *analytics) ensureViews(ctx context.Context) error {
+	tx, err := an.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, stmt := range append(append([]string{}, pricesSchemaSQL...), analyticsViewsSQL...) {
+		if _, err = tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("analytics views: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // journal records an archive change for the analytics worker. ex is the caller's transaction
@@ -259,6 +291,9 @@ func (an *analytics) close() {
 	an.cancel() // in-flight work is abandoned; the journal keeps it for the next start
 	close(an.stop)
 	<-an.done
+	if an.pricesDone != nil {
+		<-an.pricesDone
+	}
 	_ = an.db.Close()
 }
 
@@ -692,45 +727,39 @@ type sessionRow struct {
 }
 
 // writeSession stores the session row and rewrites messages from the first one whose digest
-// changed. All in one transaction.
+// changed (all of them when the session was extracted by an older version). All in one
+// transaction; messages are produced and inserted a chunk at a time so a huge session never sits
+// in memory whole.
 func (an *analytics) writeSession(ctx context.Context, s sessionRow, msgs []msgRow) error {
 	existing := map[int]string{}
-	rows, err := an.db.QueryContext(ctx, `SELECT seq, digest FROM messages WHERE session_id = $1`, s.id)
-	if err != nil {
+	var storedVersion sql.NullInt64
+	if err := an.db.QueryRowContext(ctx, `SELECT version FROM sessions WHERE id = $1`, s.id).Scan(&storedVersion); err != nil &&
+		!errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	for rows.Next() {
-		var seq int
-		var d string
-		if err = rows.Scan(&seq, &d); err != nil {
-			_ = rows.Close()
+	if !storedVersion.Valid || storedVersion.Int64 == analyticsVersion {
+		rows, err := an.db.QueryContext(ctx, `SELECT seq, digest FROM messages WHERE session_id = $1`, s.id)
+		if err != nil {
 			return err
 		}
-		existing[seq] = d
-	}
-	if err = closeRows(rows); err != nil {
-		return err
+		for rows.Next() {
+			var seq int
+			var d string
+			if err = rows.Scan(&seq, &d); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			existing[seq] = d
+		}
+		if err = closeRows(rows); err != nil {
+			return err
+		}
 	}
 	first := 0
 	for first < len(msgs) && existing[first] == msgs[first].digest && existing[first] != "" {
 		first++
 	}
 	unchanged := first == len(msgs) && len(existing) == len(msgs)
-
-	type prepared struct {
-		msg   json.RawMessage
-		items []ConvItem
-	}
-	prep := make([]prepared, 0, len(msgs)-first)
-	if !unchanged {
-		for _, m := range msgs[first:] {
-			msg, items, errP := m.produce()
-			if errP != nil {
-				return errP
-			}
-			prep = append(prep, prepared{msg, items})
-		}
-	}
 
 	tx, err := an.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -762,27 +791,45 @@ func (an *analytics) writeSession(ctx context.Context, s sessionRow, msgs []msgR
 			return err
 		}
 		var mrows, irows [][]any
-		for i, p := range prep {
-			m := msgs[first+i]
-			seq := first + i
+		pending := 0
+		flush := func() error {
+			if err := insertRows(ctx, tx, "messages", []string{"session_id", "seq", "source_seq", "external_id",
+				"parent_id", "ts", "role", "model", "message", "usage", "metadata", "blob", "digest"}, mrows, ""); err != nil {
+				return fmt.Errorf("messages: %w", err)
+			}
+			if err := insertRows(ctx, tx, "items", []string{"session_id", "seq", "idx", "role", "kind", "name", "call_id",
+				"is_error", "text", "data", "ts", "model"}, irows, ""); err != nil {
+				return fmt.Errorf("items: %w", err)
+			}
+			mrows, irows, pending = nil, nil, 0
+			return nil
+		}
+		for seq := first; seq < len(msgs); seq++ {
+			m := msgs[seq]
+			msg, items, errP := m.produce()
+			if errP != nil {
+				return errP
+			}
 			mrows = append(mrows, []any{s.id, seq, m.sourceSeq, cleanText(m.externalID), cleanText(m.parentID), m.ts,
-				m.role, m.model, nullableJSON(p.msg), nullableJSON(m.usage), jsonOrEmpty(m.metadata), m.blob, m.digest})
-			for j, it := range p.items {
+				m.role, m.model, nullableJSON(msg), nullableJSON(m.usage), jsonOrEmpty(m.metadata), m.blob, m.digest})
+			pending += len(msg)
+			for j, it := range items {
 				ts := it.TS
 				if ts == nil {
 					ts = m.ts
 				}
 				irows = append(irows, []any{s.id, seq, j, it.Role, it.Kind, cleanText(it.Name), cleanText(it.CallID),
-					it.IsError, cleanText(it.Text), ts, it.Model})
+					it.IsError, cleanText(it.Text), nullableJSON([]byte(it.Data)), ts, it.Model})
+				pending += len(it.Text) + len(it.Data)
+			}
+			if pending >= writeChunkBytes || len(mrows) >= writeChunkMsgs {
+				if err = flush(); err != nil {
+					return err
+				}
 			}
 		}
-		if err = insertRows(ctx, tx, "messages", []string{"session_id", "seq", "source_seq", "external_id",
-			"parent_id", "ts", "role", "model", "message", "usage", "metadata", "blob", "digest"}, mrows, ""); err != nil {
-			return fmt.Errorf("messages: %w", err)
-		}
-		if err = insertRows(ctx, tx, "items", []string{"session_id", "seq", "idx", "role", "kind", "name", "call_id",
-			"is_error", "text", "ts", "model"}, irows, ""); err != nil {
-			return fmt.Errorf("items: %w", err)
+		if err = flush(); err != nil {
+			return err
 		}
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE sessions SET items = (SELECT count(*) FROM items WHERE session_id = $1)
@@ -1275,6 +1322,15 @@ func (a *Archive) AnalyticsStatus(ctx context.Context) (map[string]any, error) {
 		}
 		_ = rows.Close()
 	}
+	prices := map[string]any{}
+	if an.reqMirror != nil {
+		var pairs, unpriced int64
+		var updated sql.NullTime
+		if an.db.QueryRowContext(ctx, `SELECT count(*), count(*) FILTER (WHERE input IS NULL), max(updated_at)
+			FROM model_prices`).Scan(&pairs, &unpriced, &updated) == nil {
+			prices["models"], prices["unpriced"], prices["updated_at"] = pairs, unpriced, nullTimePtr(updated)
+		}
+	}
 	lastErr, _ := an.lastErr.Load().(string)
 	trgm, _ := an.getState(ctx, "trgm_index")
 	if trgm == "" {
@@ -1294,6 +1350,7 @@ func (a *Archive) AnalyticsStatus(ctx context.Context) (map[string]any, error) {
 		"last_run":         time.Unix(an.lastRunUnix.Load(), 0).UTC(),
 		"backfilling":      an.backfilling.Load(),
 		"trgm_index":       trgm,
+		"prices":           prices,
 	}, nil
 }
 
