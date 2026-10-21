@@ -113,7 +113,7 @@ func TestParseClaudeRateLimitReset_AllCases(t *testing.T) {
 		}
 	})
 
-	t.Run("fable-only rejection with 7d_oi reset and retry-after returns nil for exponential backoff", func(t *testing.T) {
+	t.Run("fable-only rejection with 7d_oi reset and retry-after keeps the 7d_oi deadline", func(t *testing.T) {
 		h := make(http.Header)
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
@@ -124,12 +124,12 @@ func TestParseClaudeRateLimitReset_AllCases(t *testing.T) {
 		h.Set("Retry-After", "60")
 
 		got := parseClaudeRateLimitResetWithFuzz(h, now, 0, 0)
-		if got != nil {
-			t.Fatalf("expected nil RetryAfter for fable-only rejection with retry-after, got %v", *got)
+		if got == nil || *got <= 7*24*time.Hour-time.Second || *got > 7*24*time.Hour {
+			t.Fatalf("expected the 7d_oi reset as the model deadline, got %v", got)
 		}
 	})
 
-	t.Run("fable-only rejection with 7d_oi reset only returns nil for exponential backoff", func(t *testing.T) {
+	t.Run("fable-only rejection with 7d_oi reset only keeps the 7d_oi deadline", func(t *testing.T) {
 		h := make(http.Header)
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
@@ -138,13 +138,13 @@ func TestParseClaudeRateLimitReset_AllCases(t *testing.T) {
 		h.Set("Anthropic-Ratelimit-Unified-7d_oi-Reset", strconv.FormatInt(now.Add(7*24*time.Hour).Unix(), 10))
 		h.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(now.Add(7*24*time.Hour).Unix(), 10))
 
-		got := ParseClaudeRateLimitReset(h, now)
-		if got != nil {
-			t.Fatalf("expected nil for fable-only rejection without retry-after, got %v", *got)
+		got := parseClaudeRateLimitResetWithFuzz(h, now, 0, 0)
+		if got == nil || *got <= 7*24*time.Hour-time.Second || *got > 7*24*time.Hour {
+			t.Fatalf("expected the 7d_oi reset as the model deadline, got %v", got)
 		}
 	})
 
-	t.Run("fable-only rejection with allowed_warning on shared window returns nil for exponential backoff", func(t *testing.T) {
+	t.Run("fable-only rejection with allowed_warning on shared window keeps the 7d_oi deadline", func(t *testing.T) {
 		h := make(http.Header)
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
@@ -155,8 +155,8 @@ func TestParseClaudeRateLimitReset_AllCases(t *testing.T) {
 		h.Set("Retry-After", "60")
 
 		got := parseClaudeRateLimitResetWithFuzz(h, now, 0, 0)
-		if got != nil {
-			t.Fatalf("expected nil RetryAfter for fable-only rejection with allowed_warning, got %v", *got)
+		if got == nil || *got <= 7*24*time.Hour-time.Second || *got > 7*24*time.Hour {
+			t.Fatalf("expected the 7d_oi reset as the model deadline, got %v", got)
 		}
 	})
 

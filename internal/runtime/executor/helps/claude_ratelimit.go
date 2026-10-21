@@ -237,6 +237,13 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 	status7d := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d-Status")))
 	status7dOI := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d_oi-Status")))
 	overageOnlyRejection := isOverageOrFableOnlyRejection(headers, unifiedStatus, status5h, status7d, status7dOI)
+	// A model-scoped rejection of the Fable weekly window (7d_oi) keeps its own deadline: the
+	// error stays model-scoped, so the deadline cools only the rejected model and other models
+	// stay eligible. A billing-overage rejection (overage status rejected, or overage disabled
+	// for a reason such as org_level_disabled or a spend cap) is not a quota window: its
+	// timestamps are billing boundaries, so it keeps the generic exponential backoff.
+	fableWindowRejection := overageOnlyRejection && status7dOI == "rejected" && !isClaudeBillingOverageRejection(headers)
+	modelWindowDeadline := !overageOnlyRejection || fableWindowRejection
 
 	var candidateDeadlines []time.Time
 	var rejectedWindows []string
@@ -254,8 +261,8 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 		rejectedWindows = append(rejectedWindows, "7d_oi")
 	}
 
-	// 1. Retry-After header (skipped for an overage/Fable-only rejection, which does not describe the credential)
-	if !overageOnlyRejection {
+	// 1. Retry-After header (skipped for a billing-overage rejection, which does not describe a quota window)
+	if modelWindowDeadline {
 		if rawRetryAfter := getHeaderCaseInsensitive(headers, "Retry-After"); rawRetryAfter != "" {
 			if !containsString(rejectedWindows, "retry-after") {
 				rejectedWindows = append(rejectedWindows, "retry-after")
@@ -284,8 +291,8 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 		}
 	}
 
-	// 4. Fable-specific 7-day window reset (only when rejected and not an overage/Fable-only rejection)
-	if status7dOI == "rejected" && !overageOnlyRejection {
+	// 4. Fable-specific 7-day window reset (only when rejected and not a billing-overage rejection)
+	if status7dOI == "rejected" && modelWindowDeadline {
 		if raw := getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d_oi-Reset"); raw != "" {
 			if t, ok := parseUnixOrTimestamp(raw); ok && t.After(now) {
 				candidateDeadlines = append(candidateDeadlines, t)
@@ -355,6 +362,15 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 	}).Info("parsed Anthropic rate limit reset headers")
 
 	return &effectiveDuration
+}
+
+// isClaudeBillingOverageRejection reports whether the overage (extra usage) billing state, not a
+// quota window, refused the request. The representative claim is not consulted: the Fable window
+// is itself named "seven_day_overage_included".
+func isClaudeBillingOverageRejection(headers http.Header) bool {
+	overageStatus := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-Overage-Status")))
+	overageDisabledReason := strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-Overage-Disabled-Reason"))
+	return overageStatus == "rejected" || overageDisabledReason != ""
 }
 
 func claudeUnifiedResetIsOverageBillingBoundary(headers http.Header, unifiedReset string) bool {
