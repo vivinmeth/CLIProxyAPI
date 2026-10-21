@@ -54,9 +54,10 @@ type Store struct {
 	stopOnce      sync.Once
 	done          chan struct{}
 
-	prices     atomic.Pointer[priceSnapshot]
-	stopPrices chan struct{}
-	spoolFile  string // pending-rows file, resolved once at Open (see spoolPath)
+	keyMachines atomic.Pointer[map[string]string] // api_key_hash -> machine (key_machines)
+	prices      atomic.Pointer[priceSnapshot]
+	stopPrices  chan struct{}
+	spoolFile   string // pending-rows file, resolved once at Open (see spoolPath)
 }
 
 var current atomic.Pointer[Store]
@@ -140,7 +141,11 @@ func Open(ctx context.Context, dsn, schema string, retentionDays int) (*Store, e
 	go s.run()
 	go s.backfillAccounting()
 	go s.backfillHarness()
+	go s.backfillBilling()
 	go s.pricesLoop()
+	if err := s.loadKeyMachines(pingCtx); err != nil {
+		log.WithError(err).Warn("tmx request log: loading the key -> machine ledger failed")
+	}
 	return s, nil
 }
 
@@ -216,6 +221,13 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		// row_key: set by the writer, makes retried inserts idempotent.
 		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS row_key TEXT`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS requests_row_key_idx ON ` + s.table() + ` (row_key) WHERE row_key IS NOT NULL`,
+		// v4: billing mode; client keys' machines from fleet's key ledger (SetKeyMachines).
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS billing TEXT NOT NULL DEFAULT ''`,
+		`CREATE TABLE IF NOT EXISTS ` + s.schema + `.key_machines (
+			api_key_hash TEXT PRIMARY KEY,
+			machine      TEXT NOT NULL,
+			updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
 		`CREATE INDEX IF NOT EXISTS requests_price_pending_idx ON ` + s.table() + ` (id)
 			WHERE price_source IS NULL OR price_source = 'unpriced'`,
 		`CREATE TABLE IF NOT EXISTS ` + s.schema + `.price_catalogs (
@@ -241,6 +253,11 @@ func (s *Store) Enqueue(row Row) {
 	}
 	if row.RowKey == "" {
 		row.RowKey = newRowKey()
+	}
+	if row.Machine == "" && row.APIKeyHash != "" {
+		if m := s.keyMachines.Load(); m != nil {
+			row.Machine = (*m)[row.APIKeyHash]
+		}
 	}
 	select {
 	case s.queue <- row:
@@ -506,7 +523,7 @@ var columnNames = []string{"ts", "request_id", "trace_id", "session_id", "provid
 	"reasoning_effort", "service_tier", "uncached_input", "cache_write", "output_non_reasoning",
 	"accounting_quality", "source", "machine", "import_ref", "shadowed", "harness", "client_mode",
 	"cache_write_1h", "speed", "cost_input", "cost_cache_read", "cost_cache_write", "cost_output", "cost_usd",
-	"priced_as", "price_source", "priced_at", "row_key"}
+	"priced_as", "price_source", "priced_at", "row_key", "billing"}
 
 func rowFields(r *Row) []any {
 	return []any{&r.TS, &r.RequestID, &r.TraceID, &r.SessionID, &r.Provider, &r.Executor,
@@ -517,7 +534,7 @@ func rowFields(r *Row) []any {
 		&r.ReasoningEffort, &r.ServiceTier, &r.UncachedInput, &r.CacheWrite, &r.OutputNonReasoning,
 		&r.AccountingQuality, &r.Source, &r.Machine, &r.importRefPtr, &r.Shadowed, &r.Harness, &r.ClientMode,
 		&r.CacheWrite1h, &r.Speed, &r.CostInput, &r.CostCacheRead, &r.CostCacheWrite, &r.CostOutput, &r.CostUSD,
-		&r.PricedAs, &r.PriceSource, &r.PricedAt, &r.rowKeyPtr}
+		&r.PricedAs, &r.PriceSource, &r.PricedAt, &r.rowKeyPtr, &r.Billing}
 }
 
 var insertColumns = strings.Join(columnNames, ", ")

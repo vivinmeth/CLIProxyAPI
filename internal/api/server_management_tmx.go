@@ -23,6 +23,8 @@ func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher) {
 	v8.GET("/tmx/requests", tmxRequestList)
 	v8.GET("/tmx/requests/rollup", tmxRequestRollup)
 	v8.GET("/tmx/requests/sessions", tmxRequestSessions)
+	v8.GET("/tmx/requests/key-machines", tmxKeyMachinesList)
+	v8.POST("/tmx/requests/key-machines", tmxKeyMachinesSet)
 	registerTMXArchiveRoutes(v8)
 	if store := requestlog.Default(); store != nil {
 		quota.Start(store.DB(), store.Schema(), fetcher)
@@ -154,6 +156,7 @@ func tmxFilter(c *gin.Context) (requestlog.Filter, bool) {
 		Machine:         strings.TrimSpace(c.Query("machine")),
 		Harness:         strings.TrimSpace(c.Query("harness")),
 		ClientMode:      strings.TrimSpace(c.Query("client_mode")),
+		Billing:         strings.TrimSpace(c.Query("billing")),
 	}
 	if raw := strings.TrimSpace(c.Query("source")); raw != "" {
 		f.Sources = strings.Split(raw, ",")
@@ -270,6 +273,45 @@ func tmxRequestSessions(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "sessions": sessions})
+}
+
+// tmxKeyMachinesSet: POST /tmx/requests/key-machines {"keys":[{"api_key_hash","machine"}]} —
+// store fleet's client key -> machine ledger and give existing rows of those keys without a
+// machine that machine (api_key_hash = first 16 hex of the key's sha256).
+func tmxKeyMachinesSet(c *gin.Context) {
+	store := requestlog.Default()
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "request log is off"})
+		return
+	}
+	var body struct {
+		Keys []requestlog.KeyMachine `json:"keys"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	res, err := store.SetKeyMachines(c.Request.Context(), body.Keys)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+// tmxKeyMachinesList: GET /tmx/requests/key-machines — the stored ledger.
+func tmxKeyMachinesList(c *gin.Context) {
+	store := requestlog.Default()
+	if store == nil {
+		c.JSON(http.StatusOK, gin.H{"enabled": false, "keys": []any{}})
+		return
+	}
+	keys, err := store.KeyMachines(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "keys": keys})
 }
 
 func normalizedLimit(n int) int {

@@ -16,9 +16,11 @@ import (
 // Token meanings match tmx.requests: prompt = uncached_input + cache_read + cache_write;
 // output is the TOTAL output and reasoning is the part of it spent on thinking.
 type ImportUsage struct {
-	Provider          string `json:"provider"`
-	Model             string `json:"model"`
-	Account           string `json:"account"`
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	Account  string `json:"account"` // the login / account (stored as auth_id and auth_label)
+	// Billing: subscription | api_key | local | free ("" = unknown); see requestlog.ValidBilling.
+	Billing           string `json:"billing"`
 	UncachedInput     int64  `json:"uncached_input"`
 	CacheRead         int64  `json:"cache_read"`
 	CacheWrite        int64  `json:"cache_write"`
@@ -84,7 +86,9 @@ func usageRows(in SessionIngest, sessionKey string, viaProxy *bool, proxiedSince
 			Model:              model,
 			Alias:              model,
 			ResponseModel:      model,
+			AuthID:             u.Account,
 			AuthLabel:          u.Account,
+			Billing:            billingOf(u),
 			UserAgent:          strings.TrimSpace(in.Harness + "/" + in.HarnessVersion),
 			Outcome:            outcome,
 			StatusCode:         u.StatusCode,
@@ -110,6 +114,14 @@ func usageRows(in SessionIngest, sessionKey string, viaProxy *bool, proxiedSince
 		})
 	}
 	return rows
+}
+
+// billingOf is the billing an import declares, or local for local models.
+func billingOf(u ImportUsage) string {
+	if b := strings.TrimSpace(u.Billing); b != "" {
+		return b
+	}
+	return requestlog.BillingFor("", u.Provider)
 }
 
 // usageRefsWithout lists the usage keys of messages sent without usage: a re-import can move a

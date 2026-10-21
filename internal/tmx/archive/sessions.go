@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
+	"github.com/tidwall/gjson"
 )
 
 // SessionIngest is the body of PUT /v8/management/tmx/archive/sessions. See
@@ -149,6 +150,9 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 		}
 		if (len(m.Usage) > 0 && !json.Valid(m.Usage)) || (len(m.Metadata) > 0 && !json.Valid(m.Metadata)) {
 			return nil, fmt.Errorf("message %q: usage/metadata is not valid JSON", m.ExternalID)
+		}
+		if b := gjson.GetBytes(m.Usage, "billing").String(); !requestlog.ValidBilling(strings.TrimSpace(b)) {
+			return nil, fmt.Errorf("message %q: billing must be subscription, api_key, local or free", m.ExternalID)
 		}
 		wrapped, _ := json.Marshal(map[string]json.RawMessage{"message": m.Message})
 		hash, errSplit := a.splitBody(ctx, wrapped, "import.message")

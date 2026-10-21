@@ -26,6 +26,7 @@ type Filter struct {
 	Machine         string
 	Harness         string
 	ClientMode      string
+	Billing         string
 }
 
 // where renders the WHERE clause; args start at $1.
@@ -59,7 +60,7 @@ func (f Filter) where() (string, []any) {
 	for _, kv := range []struct{ col, v string }{
 		{"outcome", f.Outcome}, {"provider", f.Provider}, {"auth_id", f.AuthID}, {"model", f.Model},
 		{"session_id", f.SessionID}, {"api_key_hash", f.APIKeyHash}, {"machine", f.Machine},
-		{"harness", f.Harness}, {"client_mode", f.ClientMode},
+		{"harness", f.Harness}, {"client_mode", f.ClientMode}, {"billing", f.Billing},
 	} {
 		if kv.v != "" {
 			add(kv.col+" = $%d", kv.v)
@@ -313,7 +314,7 @@ func (s *Store) List(ctx context.Context, f Filter, beforeID int64, limit int) (
 var RollupDims = map[string]bool{
 	"source": true, "provider": true, "model": true, "response_model": true, "auth_id": true,
 	"api_key_hash": true, "machine": true, "outcome": true, "accounting_quality": true,
-	"session_id": true, "harness": true, "client_mode": true,
+	"session_id": true, "harness": true, "client_mode": true, "billing": true, "auth_label": true,
 }
 
 // RollupRow is one cell of the rollup cube.

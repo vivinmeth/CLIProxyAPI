@@ -57,7 +57,8 @@ var analyticsViewsSQL = []string{
 	// List-price cost per usage row, as stored on the row when its tokens were written
 	// (tmx.requests cost_* columns; NULL = unpriced or not priced yet).
 	`CREATE VIEW request_costs AS
-	SELECT r.id AS request_id, r.ts, r.source, r.harness, r.machine, r.provider, r.model, r.shadowed,
+		SELECT r.id AS request_id, r.ts, r.source, r.harness, r.machine, r.provider, r.model, r.shadowed,
+		r.auth_id, r.auth_label, r.auth_type, r.billing,
 		r.priced_as, r.price_source, r.priced_at, r.speed, r.service_tier,
 		r.uncached_input, r.cache_read, r.cache_write, r.cache_write_1h, r.output_tokens,
 		r.cost_input, r.cost_cache_read, r.cost_cache_write, r.cost_output, r.cost_usd

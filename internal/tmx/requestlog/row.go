@@ -90,6 +90,9 @@ type Row struct {
 	PricedAs       string     `json:"priced_as"`
 	PriceSource    *string    `json:"price_source"` // models.dev | local | unpriced; NULL = not priced yet
 	PricedAt       *time.Time `json:"priced_at"`    // fetch time of the catalog snapshot used
+	// Billing says what the cost was: subscription (API-equivalent, paid by a plan), api_key
+	// (real spend), local (free, own hardware), free (a free tier); "" when unknown.
+	Billing string `json:"billing"`
 	// Provenance: "tmx-proxy" for proxied calls, "extern:<harness>" for imported sessions.
 	Source  string `json:"source"`
 	Machine string `json:"machine"`
@@ -134,6 +137,37 @@ func (r *Row) loadImportRef() {
 	if r.rowKeyPtr != nil {
 		r.RowKey = *r.rowKeyPtr
 	}
+}
+
+// Billing values.
+const (
+	BillingSubscription = "subscription"
+	BillingAPIKey       = "api_key"
+	BillingLocal        = "local"
+	BillingFree         = "free"
+)
+
+// ValidBilling reports whether v is a billing value ("" = unknown is valid).
+func ValidBilling(v string) bool {
+	switch v {
+	case "", BillingSubscription, BillingAPIKey, BillingLocal, BillingFree:
+		return true
+	}
+	return false
+}
+
+// BillingFor derives a proxied row's billing from its credential kind and provider: local
+// models (ollama) are local, OAuth logins are subscriptions, API keys are real spend.
+func BillingFor(authType, provider string) string {
+	switch {
+	case strings.Contains(strings.ToLower(provider), "ollama"):
+		return BillingLocal
+	case authType == "oauth":
+		return BillingSubscription
+	case authType == "apikey":
+		return BillingAPIKey
+	}
+	return ""
 }
 
 // SourceProxy marks rows recorded by the proxy itself.
@@ -340,6 +374,7 @@ func rowFromRecord(ctx context.Context, record coreusage.Record) Row {
 		CacheWrite1h:    detail.CacheWrite1hTokens,
 		Speed:           strings.TrimSpace(detail.ResponseSpeed),
 	}
+	row.Billing = BillingFor(row.AuthType, row.Provider)
 	// Raw provider-shaped columns above are kept as reported; the normalised ones come from
 	// upstream's accounting (cache_read and reasoning_tokens take its values).
 	row.applyBreakdown(detail.TokenBreakdown)

@@ -157,3 +157,29 @@ func TestSubagentUsageShadowedByParent(t *testing.T) {
 		t.Fatalf("reshadow = %d %v", n, err)
 	}
 }
+
+// Imported usage keeps its account (auth_id + auth_label) and billing; bad billing is refused.
+func TestImportAccountAndBilling(t *testing.T) {
+	a, rl := openTestArchive(t)
+	ctx := context.Background()
+	ts := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+	in := SessionIngest{Harness: "nanx-app", ExternalID: "acct", Messages: []MessageIngest{
+		usageMsg("m1", 1, ts, `{"provider":"openai","model":"gpt-5.5","account":"openai:iam","billing":"subscription","uncached_input":5,"output":1}`),
+		usageMsg("m2", 2, ts, `{"provider":"soa-ollama","model":"qwen","uncached_input":5,"output":1}`),
+	}}
+	if _, err := a.IngestSession(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	var id, label, billing string
+	if err := rl.DB().QueryRow(`SELECT auth_id, auth_label, billing FROM tmx.requests WHERE import_ref = 'nanx-app:acct#m1'`).Scan(&id, &label, &billing); err != nil ||
+		id != "openai:iam" || label != "openai:iam" || billing != "subscription" {
+		t.Fatalf("m1 = %q %q %q %v", id, label, billing, err)
+	}
+	if err := rl.DB().QueryRow(`SELECT billing FROM tmx.requests WHERE import_ref = 'nanx-app:acct#m2'`).Scan(&billing); err != nil || billing != "local" {
+		t.Fatalf("ollama billing = %q %v", billing, err)
+	}
+	in.Messages[0].Usage = json.RawMessage(`{"provider":"openai","model":"gpt-5.5","billing":"prepaid"}`)
+	if _, err := a.IngestSession(ctx, in); err == nil {
+		t.Fatal("unknown billing accepted")
+	}
+}
