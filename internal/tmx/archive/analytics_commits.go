@@ -48,27 +48,39 @@ var commitSchemaSQL = []string{
 
 // taskViewsSQL need sessions and threads only; tasksSQL (cost) needs session_usage.
 var taskViewsSQL = []string{
-	// The root of every thread (depth-capped, so a parent cycle can't loop).
+	// The root of every thread: its topmost ancestor. Parent links that form a cycle (bad data)
+	// are detected; every thread in or under a cycle gets the cycle's smallest id, so a cycle is
+	// one task.
 	`CREATE VIEW thread_roots AS
 	WITH RECURSIVE up AS (
-		SELECT id AS thread_id, id AS root_id, parent_id, 0 AS depth FROM threads
+		SELECT id AS thread_id, id AS cur, ARRAY[id] AS path, false AS cyc FROM threads
 		UNION ALL
-		SELECT up.thread_id, p.id, p.parent_id, up.depth + 1
-		FROM up JOIN threads p ON p.id = up.parent_id WHERE up.depth < 50
+		SELECT up.thread_id, p.id, up.path || p.id, p.id = ANY(up.path)
+		FROM up JOIN threads t ON t.id = up.cur JOIN threads p ON p.id = t.parent_id
+		WHERE NOT up.cyc
+	), last AS (
+		SELECT DISTINCT ON (thread_id) thread_id, cur, path, cyc FROM up
+		ORDER BY thread_id, cardinality(path) DESC
 	)
-	SELECT DISTINCT ON (thread_id) thread_id, root_id FROM up ORDER BY thread_id, depth DESC`,
-	// The one task each session belongs to: the root thread of a thread it is in (the first, if
-	// several), else its own task, a subagent going with its parent session and a proxied twin
-	// with its imported transcript.
+	SELECT thread_id, CASE WHEN NOT cyc THEN cur ELSE (SELECT min(x) FROM unnest(
+		path[array_position(path, cur):cardinality(path)]) x) END AS root_id
+	FROM last`,
+	// The one task each session belongs to, decided on its canonical session (a proxied twin
+	// goes with its imported transcript) and that session's parent (a subagent goes with the
+	// session that started it): the root thread of a thread any of them is in (the first, if
+	// several), else the top session's own task.
 	`CREATE VIEW session_tasks AS
-	SELECT s.id AS session_id,
-		COALESCE(min(r.root_id), 'session:' || COALESCE(tr.parent_session_id, s.shadowed_by, s.id)) AS task_id,
+	WITH anchor AS (
+		SELECT s.id, COALESCE(s.shadowed_by, s.id) AS canon,
+			COALESCE(tr.parent_session_id, s.shadowed_by, s.id) AS top
+		FROM sessions s LEFT JOIN session_tree tr ON tr.session_id = COALESCE(s.shadowed_by, s.id)
+	)
+	SELECT a.id AS session_id, COALESCE(min(r.root_id), 'session:' || a.top) AS task_id,
 		CASE WHEN min(r.root_id) IS NULL THEN 'session' ELSE 'thread' END AS task_kind
-	FROM sessions s
-		LEFT JOIN session_threads st ON st.session_id = s.id
+	FROM anchor a
+		LEFT JOIN session_threads st ON st.session_id IN (a.id, a.canon, a.top)
 		LEFT JOIN thread_roots r ON r.thread_id = st.thread_id
-		LEFT JOIN session_tree tr ON tr.session_id = s.id
-	GROUP BY s.id, s.shadowed_by, tr.parent_session_id`,
+	GROUP BY a.id, a.top`,
 	// Which task(s) a commit belongs to: through the threads it names, else the sessions (by
 	// archive id or external id). A commit naming two tasks counts in both.
 	`CREATE VIEW commit_tasks AS
@@ -76,10 +88,19 @@ var taskViewsSQL = []string{
 	FROM commits c JOIN (
 		SELECT ct.commit_id, COALESCE(r.root_id, ct.thread_id) AS task_id, 'thread'::text AS via
 		FROM commit_threads ct LEFT JOIN thread_roots r ON r.thread_id = ct.thread_id
-		UNION ALL
+				UNION ALL
 		SELECT cs.commit_id, st.task_id, 'session'
-		FROM commit_sessions cs JOIN sessions s ON s.id = cs.session_id OR s.external_id = cs.session_id
-			JOIN session_tasks st ON st.session_id = s.id
+		FROM commit_sessions cs JOIN LATERAL (
+			-- an archive id ("<harness>:<id>") exactly; a bare external id only when one imported
+			-- session has it (the same id under two harnesses is ambiguous)
+			SELECT s.id FROM sessions s WHERE s.id = cs.session_id
+			UNION ALL
+			SELECT min(s.id) FROM sessions s
+			WHERE s.kind = 'imported' AND s.external_id = cs.session_id
+				AND NOT EXISTS (SELECT 1 FROM sessions e WHERE e.id = cs.session_id)
+			HAVING count(*) = 1
+		) m ON true
+			JOIN session_tasks st ON st.session_id = m.id
 		WHERE NOT EXISTS (SELECT 1 FROM commit_threads ct WHERE ct.commit_id = cs.commit_id)
 	) x ON x.commit_id = c.id`,
 }
@@ -99,11 +120,15 @@ var tasksSQL = []string{
 		SELECT ct.task_id, count(*) AS commits, sum(c.additions) AS additions, sum(c.deletions) AS deletions,
 			sum(c.files) AS files, count(*) FILTER (WHERE ct.match = 'trailer') AS exact_commits
 		FROM commit_tasks ct JOIN commits c ON c.id = ct.commit_id GROUP BY ct.task_id
-	), task_prs AS (
-		SELECT r.root_id AS task_id, count(*) AS prs, count(*) FILTER (WHERE p.state = 'merged') AS merged_prs,
-			sum(p.additions) FILTER (WHERE p.state = 'merged') AS pr_additions,
-			sum(p.deletions) FILTER (WHERE p.state = 'merged') AS pr_deletions
-		FROM thread_pull_requests p JOIN thread_roots r ON r.thread_id = p.thread_id GROUP BY r.root_id
+		), task_prs AS (
+		-- a PR linked to several threads of a task counts once
+		SELECT task_id, count(*) AS prs, count(*) FILTER (WHERE state = 'merged') AS merged_prs,
+			sum(additions) FILTER (WHERE state = 'merged') AS pr_additions,
+			sum(deletions) FILTER (WHERE state = 'merged') AS pr_deletions
+		FROM (SELECT DISTINCT ON (r.root_id, p.url) r.root_id AS task_id, p.state, p.additions, p.deletions
+			FROM thread_pull_requests p JOIN thread_roots r ON r.thread_id = p.thread_id
+			ORDER BY r.root_id, p.url, (p.state = 'merged') DESC) d
+		GROUP BY task_id
 	)
 	SELECT ts.task_id, ts.kind, COALESCE(t.title, s.title, '') AS title, COALESCE(t.project, s.project, '') AS project,
 		COALESCE(t.created_at, ts.started_at) AS started_at, ts.ended_at, ts.sessions, ts.requests, ts.cost_usd,
@@ -111,7 +136,10 @@ var tasksSQL = []string{
 		COALESCE(tc.additions, 0) AS additions, COALESCE(tc.deletions, 0) AS deletions, COALESCE(tc.files, 0) AS files,
 		COALESCE(tp.prs, 0) AS prs, COALESCE(tp.merged_prs, 0) AS merged_prs,
 		COALESCE(tp.pr_additions, 0) AS pr_additions, COALESCE(tp.pr_deletions, 0) AS pr_deletions,
-		ts.cost_usd / NULLIF(COALESCE(tc.additions, 0) + COALESCE(tc.deletions, 0), 0) AS cost_per_changed_line
+				-- per committed line (commit churn, incl. later-rewritten work) and per merged PR line
+		-- (what landed through PRs)
+		ts.cost_usd / NULLIF(COALESCE(tc.additions, 0) + COALESCE(tc.deletions, 0), 0) AS cost_per_committed_line,
+		ts.cost_usd / NULLIF(COALESCE(tp.pr_additions, 0) + COALESCE(tp.pr_deletions, 0), 0) AS cost_per_merged_line
 	FROM task_sessions ts
 		LEFT JOIN threads t ON ts.kind = 'thread' AND t.id = ts.task_id
 		LEFT JOIN sessions s ON ts.kind = 'session' AND s.id = substr(ts.task_id, 9)
