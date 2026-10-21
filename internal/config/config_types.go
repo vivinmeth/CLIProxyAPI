@@ -414,7 +414,14 @@ type QuotaExceeded struct {
 }
 
 // RoutingConfig configures how credentials are selected for requests.
+type ResetSoonestConfig struct {
+	FiveHourThreshold        float64 `yaml:"five-hour-threshold,omitempty" json:"five-hour-threshold,omitempty"`
+	SevenDayThreshold        float64 `yaml:"seven-day-threshold,omitempty" json:"seven-day-threshold,omitempty"`
+	MaxInflightPerCredential int     `yaml:"max-inflight-per-credential,omitempty" json:"max-inflight-per-credential,omitempty"`
+}
+
 type RoutingConfig struct {
+	ResetSoonest ResetSoonestConfig `yaml:"reset-soonest,omitempty" json:"reset-soonest,omitempty"`
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first", "reset-soonest".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`

@@ -27,8 +27,8 @@ func (s *Server) registerManagementV8Routes() {
 		v8.Handle(method, "/config/*path", s.mgmt.ConfigV8)
 	}
 
-	registerTMXManagementRoutes(v8, s.mgmt, s.handlers.AuthManager) // tokenmaxx fork: server_management_tmx.go
-	registerTMXResetRoutes(v8, s.mgmt)                              // tokenmaxx fork: server_management_tmx_resets.go
+	registerTMXManagementRoutes(v8, s.mgmt, s.tmxQuotaRoutingObserver()) // tokenmaxx fork: server_management_tmx.go
+	registerTMXResetRoutes(v8, s.mgmt)                                   // tokenmaxx fork: server_management_tmx_resets.go
 	v8.GET("/server/latest-version", s.mgmt.GetLatestVersion)
 	v8.POST("/requests/api-call", s.mgmt.APICall)
 	v8.POST("/routing/cooldown/reset", s.mgmt.ResetQuota)

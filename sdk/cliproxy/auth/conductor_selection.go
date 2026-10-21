@@ -669,6 +669,10 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 }
 
 func selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = context.WithValue(ctx, tmxRankingModelKey{}, routeModel)
 	ctx = withWeightedSelectorStateModel(ctx, selector, routeModel)
 	if !isBuiltInSelector(selector) {
 		if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {

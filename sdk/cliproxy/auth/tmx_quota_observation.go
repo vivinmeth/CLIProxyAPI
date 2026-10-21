@@ -38,7 +38,7 @@ func (q QuotaState) FreshSignals(now time.Time) map[string]string {
 		if stableQuotaSignal(key) {
 			ttl = QuotaObservationMaxAge
 		}
-		if !at.IsZero() && (now.Sub(at) > ttl || at.After(now.Add(time.Minute))) {
+		if at.IsZero() || now.Sub(at) > ttl || at.After(now.Add(time.Minute)) {
 			continue
 		}
 		out[key] = value
@@ -56,7 +56,7 @@ func (q *QuotaState) mergeObservedSignals(next map[string]string, at time.Time) 
 	times := make(map[string]time.Time, len(merged)+len(next))
 	for key := range merged {
 		// An absent rejection flag is not evidence about the new response.
-		if !stableQuotaSignal(key) && !at.Before(old.SignalObservedTime(key)) {
+		if !stableQuotaSignal(key) && old.SignalObservedTime(key).Before(at) {
 			delete(merged, key)
 			continue
 		}

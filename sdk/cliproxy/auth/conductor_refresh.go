@@ -395,7 +395,7 @@ func (m *Manager) finishRefreshJob(job *authRefreshJob, retryAt time.Time, queue
 }
 
 type authRefreshLock struct {
-	mu      sync.Mutex
+	mu      tmxRefreshMutex
 	stateMu sync.Mutex
 	pending int
 	done    chan struct{}
@@ -836,7 +836,9 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if failedAccessToken != "" {
 		m.markRejectedAccessToken(id, failedAccessToken)
 	}
-	lock.mu.Lock()
+	if errLock := lock.mu.LockContext(ctx); errLock != nil {
+		return nil, errLock
+	}
 	defer lock.mu.Unlock()
 
 	m.mu.RLock()

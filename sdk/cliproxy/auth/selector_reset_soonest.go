@@ -10,8 +10,8 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-// weeklyWindowMinutes is the length of the long (weekly) subscription quota window.
-const weeklyWindowMinutes = 7 * 24 * 60
+// Accept provider weekly windows of at least six days.
+const minimumWeeklyWindowMinutes = 6 * 24 * 60
 
 // Quota signal names (canonical header keys as stored by collectQuotaSignals) that carry
 // the reset time of a credential's weekly quota window.
@@ -35,13 +35,11 @@ const (
 // soonest, so quota that would otherwise expire unused at the reset is consumed first and
 // credentials with distant resets are kept in reserve.
 //
-// Ordering inside the highest available priority tier:
-//  1. credentials with no observed weekly reset (so each one gets observed quickly),
-//  2. credentials with a known future reset, earliest first,
-//  3. credentials whose observed reset already passed (their new window is ~7 days away).
-//
-// Ties keep the stable fill-first (ID) order. Credentials without quota observation
-// (API keys, Gemini, ...) therefore behave like fill-first.
+// Within the highest priority tier, prefer credentials below utilization thresholds,
+// then accounts with admission headroom. Among healthy candidates, one unobserved
+// probe leads, followed by earliest future weekly resets, then rolled-over readings.
+// Saturated accounts and accounts near quota exhaustion remain usable as a last resort.
+// Ties keep stable ID order; excess traffic above all soft caps uses in-flight counts.
 type ResetSoonestSelector struct {
 	// nowFunc overrides the clock for tests; nil uses time.Now.
 	nowFunc func() time.Time
@@ -57,13 +55,16 @@ func (s *ResetSoonestSelector) now() time.Time {
 // Pick selects the available auth whose weekly quota window resets soonest.
 func (s *ResetSoonestSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
+	if model == "" && ctx != nil {
+		model, _ = ctx.Value(tmxRankingModelKey{}).(string)
+	}
 	now := s.now()
 	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	return pickResetSoonest(available, now), nil
+	return pickResetSoonestForModel(available, now, model, admissionView(ctx)), nil
 }
 
 const (
@@ -72,71 +73,37 @@ const (
 	resetSoonestRankPast
 )
 
-// resetSoonestKey returns the ordering rank and reset time for one credential.
 func resetSoonestKey(auth *Auth, now time.Time) (int, time.Time) {
-	resetAt, ok := weeklyResetAt(auth, now)
-	if !ok {
-		// A rolled-over observation is stale, not a brand-new credential to probe.
-		if auth != nil {
-			for _, key := range []string{claudeWeeklyResetSignal, claudeWeeklyModelResetSignal, codexSecondaryResetAtSignal, codexPrimaryResetAtSignal, devinWeeklyResetSignal} {
-				if reset, valid := parseQuotaResetTimestamp(quotaSignalValue(auth.Quota.Signals, key)); valid && !reset.After(now) {
-					return resetSoonestRankPast, time.Time{}
-				}
-			}
-		}
-		return resetSoonestRankUnknown, time.Time{}
-	}
-	if !resetAt.After(now) {
-		return resetSoonestRankPast, time.Time{}
-	}
-	return resetSoonestRankKnown, resetAt
+	return rankingKey(auth, now, "")
 }
 
-// pickResetSoonest returns the first auth in reset-soonest order, keeping the input order
-// for ties. The input is expected to be ID-sorted (fill-first order).
 func pickResetSoonest(auths []*Auth, now time.Time) *Auth {
-	var picked *Auth
-	pickedRank := 0
-	var pickedReset time.Time
-	for _, candidate := range auths {
-		if candidate == nil {
-			continue
-		}
-		rank, resetAt := resetSoonestKey(candidate, now)
-		if picked == nil || rank < pickedRank || (rank == pickedRank && rank == resetSoonestRankKnown && resetAt.Before(pickedReset)) {
-			picked = candidate
-			pickedRank = rank
-			pickedReset = resetAt
-		}
-	}
-	return picked
+	return pickResetSoonestForModel(auths, now, "", admissionView(nil))
 }
 
-// weeklyResetAt extracts the observed reset time of the credential's weekly quota window
-// from its passive quota signals. It reports false when no weekly reset was observed.
-//
-// Claude: the earliest of the shared 7-day window and the model-specific 7-day window
-// (7d_oi). Codex: the secondary window, falling back to the primary window only when it
-// is itself a weekly window. Devin: weekly_quota_reset_at.
-//
-// When a credential carries several weekly windows, the earliest reset still in the
-// future wins; a reset that already passed only counts when no future reset remains,
-// because that window has rolled over and its next reset is about a week away.
+// weeklyResetAt retains the original model-neutral helper for callers inspecting
+// Claude's shared/Fable windows. Routing uses weeklyResetAtForModel instead.
+// Only fresh observations with future resets are considered known.
 func weeklyResetAt(auth *Auth, now time.Time) (time.Time, bool) {
+	return weeklyResetAtForModel(auth, now, "fable")
+}
+
+func weeklyResetAtForModel(auth *Auth, now time.Time, model string) (time.Time, bool) {
 	if auth == nil || len(auth.Quota.Signals) == 0 {
 		return time.Time{}, false
 	}
 	signals := auth.Quota.FreshSignals(now)
 
 	var candidates []time.Time
-	for _, name := range []string{claudeWeeklyResetSignal, claudeWeeklyModelResetSignal} {
+	weeklyNames := claudeWeeklyResetNames(signals, model)
+	for _, name := range weeklyNames {
 		if resetAt, ok := parseQuotaResetTimestamp(quotaSignalValue(signals, name)); ok {
 			candidates = append(candidates, resetAt)
 		}
 	}
-	if resetAt, ok := codexWindowResetAt(signals, auth.Quota.SignalObservedTime(codexSecondaryResetAfterSignal), codexSecondaryResetAtSignal, codexSecondaryResetAfterSignal); ok {
+	if resetAt, ok := codexWindowResetAt(signals, auth.Quota.SignalObservedTime(codexSecondaryResetAfterSignal), codexSecondaryResetAtSignal, codexSecondaryResetAfterSignal); ok && codexWeeklyWindow(signals, "Secondary") {
 		candidates = append(candidates, resetAt)
-	} else if minutes, okMinutes := parseQuotaInt(quotaSignalValue(signals, codexPrimaryWindowSignal)); okMinutes && minutes >= weeklyWindowMinutes {
+	} else if minutes, okMinutes := parseQuotaInt(quotaSignalValue(signals, codexPrimaryWindowSignal)); okMinutes && minutes >= minimumWeeklyWindowMinutes {
 		if resetAtPrimary, okPrimary := codexWindowResetAt(signals, auth.Quota.SignalObservedTime(codexPrimaryResetAfterSignal), codexPrimaryResetAtSignal, codexPrimaryResetAfterSignal); okPrimary {
 			candidates = append(candidates, resetAtPrimary)
 		}
@@ -148,16 +115,13 @@ func weeklyResetAt(auth *Auth, now time.Time) (time.Time, bool) {
 		return time.Time{}, false
 	}
 
-	var earliestFuture, latestPast time.Time
+	var earliestFuture time.Time
 	for _, candidate := range candidates {
 		if candidate.After(now) {
 			if earliestFuture.IsZero() || candidate.Before(earliestFuture) {
 				earliestFuture = candidate
 			}
 			continue
-		}
-		if latestPast.IsZero() || candidate.After(latestPast) {
-			latestPast = candidate
 		}
 	}
 	if !earliestFuture.IsZero() {

@@ -1102,6 +1102,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if opts.Metadata == nil {
 		opts.Metadata = make(map[string]any)
 	}
+	delete(opts.Metadata, tmxAdmissionSpillKey)
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 
@@ -1188,7 +1189,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			if auth.ID == cachedAuthID {
 				bind(auth.ID)
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-				return auth, nil
+				return s.tmxBoundPick(ctx, provider, model, opts, auth, available)
 			}
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
@@ -1220,7 +1221,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 						} else {
 							entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 						}
-						return auth, nil
+						return s.tmxBoundPick(ctx, provider, model, opts, auth, available)
 					}
 				}
 			}
@@ -1328,7 +1329,8 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 				}
 				entry.Infof("session-affinity: LCP cache hit | session=%s prefix=%d auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), match.PrefixLength, auth.ID, provider, model)
 			}
-			return auth, true, nil
+			picked, err := s.tmxBoundPick(ctx, provider, model, opts, auth, available)
+			return picked, true, err
 		}
 		if !match.IsFork && s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, match.AuthID, now) {
 			preservedAuthID = match.AuthID
@@ -1622,6 +1624,9 @@ func (s *SessionAffinitySelector) LookupAffinity(provider, model, sessionID stri
 
 // OnResult handles session affinity binding or release based on execution outcome.
 func (s *SessionAffinitySelector) OnResult(res Result) {
+	if tmxPreserveAdmissionSpill(res) {
+		return
+	}
 	if s == nil || res.AuthID == "" {
 		return
 	}

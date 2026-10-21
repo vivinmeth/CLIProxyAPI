@@ -145,8 +145,10 @@ func (m *Manager) recordCanceledUpstreamCooldown(ctx context.Context, auth *Auth
 func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel, routeModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, ephemeralResult bool, opts cliproxyexecutor.Options, executionSeq uint64) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	streamStart := time.Now()
+	finishAdmission := tmxStreamReservationCompletion(ctx)
 	go func() {
 		defer close(out)
+		defer finishAdmission()
 		var failed bool
 		forward := true
 		var rewriter *StreamRewriter

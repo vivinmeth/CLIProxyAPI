@@ -119,7 +119,7 @@ func preferredExecutionAttemptError(fallback, upstream error) error {
 
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
-func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (m *Manager) executeWithoutAdmission(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	normalized := m.normalizeProviders(providers)
@@ -179,7 +179,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 }
 
 // It supports multiple providers for the same model and round-robins the starting provider per model.
-func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (m *Manager) executeCountWithoutAdmission(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	normalized := m.normalizeProviders(providers)
@@ -232,7 +232,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
-func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithoutAdmission(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	if m.HomeEnabled() {
@@ -1551,7 +1551,7 @@ func (m *Manager) PrepareRequestAuth(ctx context.Context, preparer RequestAuthPr
 		return preparer.PrepareRequestAuth(ctx, auth.Clone())
 	}
 
-	var prepareMu *sync.Mutex
+	var prepareMu sync.Locker
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
 		// Meta also mints on 401 recovery. Serialize both paths per credential.
 		lockValue, _ := m.refreshLocks.LoadOrStore(id, &authRefreshLock{})

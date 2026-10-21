@@ -82,6 +82,12 @@ func (m *Manager) ApplyQuotaObservation(authID, provider string, windows []Quota
 			window := w.Window
 			if strings.HasPrefix(window, "7d:fable") {
 				window = "7d_oi"
+			} else if strings.HasPrefix(window, "7d:") {
+				slug := strings.TrimPrefix(window, "7d:")
+				if !validQuotaModelSlug(slug) {
+					continue
+				}
+				window = "7d_model_" + slug
 			}
 			if window != "5h" && window != "7d" && !strings.HasPrefix(window, "7d_") {
 				continue
@@ -119,7 +125,7 @@ func (m *Manager) ApplyQuotaObservation(authID, provider string, windows []Quota
 			}
 			fields[utilKey] = strconv.FormatFloat(used, 'f', -1, 64)
 		}
-		if w.Status != "" {
+		if validQuotaSignalValue(w.Status) {
 			fields[prefix+"Status"] = w.Status
 		}
 		// Each field is compared independently so a newer 5h reading doesn't block
@@ -145,4 +151,16 @@ func (m *Manager) ApplyQuotaObservation(authID, provider string, windows []Quota
 		m.scheduler.upsertAuth(snapshot)
 	}
 	return changed
+}
+
+func validQuotaModelSlug(slug string) bool {
+	if slug == "" || len(slug) > 80 {
+		return false
+	}
+	for _, c := range slug {
+		if !(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '-' && c != '_' {
+			return false
+		}
+	}
+	return true
 }

@@ -18,6 +18,13 @@ import (
 
 const tmxMaxSummaryRange = 400 * 24 * time.Hour
 
+func (s *Server) tmxQuotaRoutingObserver() quota.RoutingObserver {
+	if s == nil || s.handlers == nil || s.handlers.AuthManager == nil {
+		return nil
+	}
+	return s.handlers.AuthManager
+}
+
 func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher, observers ...quota.RoutingObserver) {
 	v8.GET("/tmx/requests/summary", tmxRequestSummary)
 	v8.GET("/tmx/requests", tmxRequestList)

@@ -42,7 +42,7 @@ func TestRefresh401PoolWaitsForRejectedTokens(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 			if _, _, _, err := m.pickNextMixed(ctx, []string{"claude"}, "test-model", executor.Options{}, nil); !errors.Is(err, context.Canceled) {
-				t.Fatalf("canceled wait: %v", err)
+				t.Errorf("canceled wait: %v", err)
 			}
 			results := make(chan error, 100)
 			for i := 0; i < 100; i++ {
@@ -71,5 +71,32 @@ func TestRefresh401PoolWaitsForRejectedTokens(t *testing.T) {
 				t.Fatalf("refresh calls %d, want %d", got, size)
 			}
 		})
+	}
+}
+
+func TestRefreshLockWaitIsCancelable(t *testing.T) {
+	m := NewManager(nil, &ResetSoonestSelector{}, nil)
+	started, release := make(chan struct{}, 1), make(chan struct{})
+	e := &unauthorizedRefreshExecutor{id: "claude", onRefresh: func() { started <- struct{}{}; <-release }}
+	m.RegisterExecutor(e)
+	_, err := m.Register(context.Background(), &Auth{ID: "cancel-refresh", Provider: "claude", Status: StatusActive, Metadata: map[string]any{"access_token": "old"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := m.refreshAuthForRequest(context.Background(), "cancel-refresh", "old"); done <- err }()
+	<-started
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = m.refreshAuthForRequest(ctx, "cancel-refresh", "old")
+	close(release)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("refresh acquisition did not cancel: %v", err)
+	}
+	if err = <-done; err != nil {
+		t.Fatal(err)
+	}
+	if e.RefreshCalls() != 1 {
+		t.Fatal("canceled waiter rotated token")
 	}
 }

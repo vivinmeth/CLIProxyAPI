@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"reflect"
+	"sync"
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -64,7 +65,7 @@ func (m *Manager) refreshingCandidates(ctx context.Context, providers []string, 
 
 type refreshSelectionContextKey struct{}
 
-func retryDuringRefresh[T any](m *Manager, ctx context.Context, providers []string, opts cliproxyexecutor.Options, tried map[string]struct{}, pick func(context.Context) (T, error)) (T, error) {
+func retryDuringRefresh(m *Manager, ctx context.Context, providers []string, opts cliproxyexecutor.Options, tried map[string]struct{}, pick func(context.Context) (refreshSelection, error)) (refreshSelection, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -76,7 +77,7 @@ func retryDuringRefresh[T any](m *Manager, ctx context.Context, providers []stri
 	defer cancel()
 	for {
 		waits := m.refreshingCandidates(ctx, providers, opts, tried)
-		result, err := pick(ctx)
+		result, err := m.tmxPickWithAdmission(ctx, pick)
 		if err == nil || !isAuthUnavailableError(err) {
 			return result, err
 		}
@@ -100,4 +101,32 @@ type refreshSelection struct {
 	auth     *Auth
 	executor ProviderExecutor
 	provider string
+}
+
+// A channel mutex retains the same serialization as sync.Mutex while allowing
+// a request to abandon credential acquisition without waiting for upstream I/O.
+type tmxRefreshMutex struct {
+	once sync.Once
+	gate chan struct{}
+}
+
+func (m *tmxRefreshMutex) init() {
+	m.once.Do(func() { m.gate = make(chan struct{}, 1); m.gate <- struct{}{} })
+}
+func (m *tmxRefreshMutex) Lock()   { m.init(); <-m.gate }
+func (m *tmxRefreshMutex) Unlock() { m.gate <- struct{}{} }
+func (m *tmxRefreshMutex) LockContext(ctx context.Context) error {
+	m.init()
+	bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	select {
+	case <-bounded.Done():
+		return bounded.Err()
+	case <-m.gate:
+		if err := bounded.Err(); err != nil {
+			m.Unlock()
+			return err
+		}
+		return nil
+	}
 }

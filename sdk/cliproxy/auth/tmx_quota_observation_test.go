@@ -84,3 +84,27 @@ func TestExternalQuotaObservationFreshness(t *testing.T) {
 		}
 	}
 }
+
+func TestExternalQuotaModelWindowsKeepStatuses(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	m := NewManager(nil, &ResetSoonestSelector{}, nil)
+	if _, err := m.Register(context.Background(), &Auth{ID: "models", Provider: "claude", Status: StatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	if !m.ApplyQuotaObservation("models", "claude", []QuotaWindowObservation{
+		{Window: "7d", ResetsAt: now.Add(24 * time.Hour), ObservedAt: now, Status: "allowed"},
+		{Window: "7d:sonnet-5", ResetsAt: now.Add(time.Hour), ObservedAt: now, Status: "rejected"},
+	}) {
+		t.Fatal("observations ignored")
+	}
+	a, _ := m.GetByID("models")
+	if a.Quota.Signals["Anthropic-Ratelimit-Unified-7d-Status"] != "allowed" || a.Quota.Signals["Anthropic-Ratelimit-Unified-7d_model_sonnet-5-Status"] != "rejected" {
+		t.Fatalf("window statuses lost: %v", a.Quota.Signals)
+	}
+	if reset, ok := weeklyResetAtForModel(a, now, "claude-sonnet-5"); !ok || !reset.Equal(now.Add(time.Hour)) {
+		t.Fatalf("Sonnet model window: %v %v", reset, ok)
+	}
+	if reset, ok := weeklyResetAtForModel(a, now, "claude-fable-5"); !ok || !reset.Equal(now.Add(24*time.Hour)) {
+		t.Fatalf("Sonnet window used for Fable: %v %v", reset, ok)
+	}
+}

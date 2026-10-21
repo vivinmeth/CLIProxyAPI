@@ -278,8 +278,8 @@ func TestManagerResetSoonestUsesSelectorPath(t *testing.T) {
 	}
 	now := time.Now()
 	for _, auth := range []*Auth{
-		{ID: "a-late", Provider: "codex", Status: StatusActive, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{codexSecondaryResetAtSignal: unixString(now.Add(120 * time.Hour))}}},
-		{ID: "b-soon", Provider: "codex", Status: StatusActive, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{codexSecondaryResetAtSignal: unixString(now.Add(24 * time.Hour))}}},
+		{ID: "a-late", Provider: "codex", Status: StatusActive, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{"X-Codex-Secondary-Window-Minutes": "10080", codexSecondaryResetAtSignal: unixString(now.Add(120 * time.Hour))}}},
+		{ID: "b-soon", Provider: "codex", Status: StatusActive, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{"X-Codex-Secondary-Window-Minutes": "10080", codexSecondaryResetAtSignal: unixString(now.Add(24 * time.Hour))}}},
 	} {
 		if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
 			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
