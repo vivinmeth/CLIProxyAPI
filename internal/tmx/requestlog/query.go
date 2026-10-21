@@ -92,6 +92,8 @@ type Counts struct {
 	AvgLatencyMs       float64 `json:"avg_latency_ms"`
 	P50TTFTMs          float64 `json:"p50_ttft_ms"`
 	P95TTFTMs          float64 `json:"p95_ttft_ms"`
+	CacheWrite1h       int64   `json:"cache_write_1h"`
+	Cost
 	// Deprecated aliases kept for the v1 UI: input_tokens = prompt tokens,
 	// cache_creation = cache_write.
 	InputTokens   int64 `json:"input_tokens"`
@@ -115,12 +117,34 @@ const countsSelect = `
 	count(*) FILTER (WHERE accounting_quality NOT IN ('complete', '')),
 	COALESCE(avg(latency_ms) FILTER (WHERE outcome = 'success' AND latency_ms > 0), 0),
 	COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY ttft_ms) FILTER (WHERE outcome = 'success' AND ttft_ms > 0), 0),
-	COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY ttft_ms) FILTER (WHERE outcome = 'success' AND ttft_ms > 0), 0)`
+		COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY ttft_ms) FILTER (WHERE outcome = 'success' AND ttft_ms > 0), 0),
+	COALESCE(sum(cache_write_1h), 0),` + costSelect
+
+// Cost sums the list-price cost stored on each row (fixed when the row was written). Unpriced
+// counts rows with tokens but no price (model not in the catalog, or not priced yet); when it is
+// non-zero the cost is a lower bound.
+type Cost struct {
+	CostUSD        float64 `json:"cost_usd"`
+	CostInput      float64 `json:"cost_input"`
+	CostCacheRead  float64 `json:"cost_cache_read"`
+	CostCacheWrite float64 `json:"cost_cache_write"`
+	CostOutput     float64 `json:"cost_output"`
+	Unpriced       int64   `json:"unpriced"`
+}
+
+const costSelect = `
+	COALESCE(sum(cost_usd), 0), COALESCE(sum(cost_input), 0), COALESCE(sum(cost_cache_read), 0),
+	COALESCE(sum(cost_cache_write), 0), COALESCE(sum(cost_output), 0),
+	count(*) FILTER (WHERE cost_usd IS NULL AND total_tokens > 0)`
+
+func (c *Cost) costTargets() []any {
+	return []any{&c.CostUSD, &c.CostInput, &c.CostCacheRead, &c.CostCacheWrite, &c.CostOutput, &c.Unpriced}
+}
 
 func (c *Counts) scanTargets() []any {
-	return []any{&c.Attempts, &c.Requests, &c.Success, &c.Failed, &c.Canceled, &c.Rejected, &c.UncachedInput,
+	return append([]any{&c.Attempts, &c.Requests, &c.Success, &c.Failed, &c.Canceled, &c.Rejected, &c.UncachedInput,
 		&c.CacheRead, &c.CacheWrite, &c.OutputNonReasoning, &c.ReasoningTokens, &c.TotalTokens,
-		&c.Incomplete, &c.AvgLatencyMs, &c.P50TTFTMs, &c.P95TTFTMs}
+		&c.Incomplete, &c.AvgLatencyMs, &c.P50TTFTMs, &c.P95TTFTMs, &c.CacheWrite1h}, c.costTargets()...)
 }
 
 func (c *Counts) finish() {
@@ -166,7 +190,12 @@ type Summary struct {
 	BySource      []Group          `json:"by_source"`
 	Sessions      Sessions         `json:"sessions"`
 	Writer        map[string]int64 `json:"writer"`
+	// Truncated names the breakdowns cut at groupLimit groups (by_auth, by_model, by_source).
+	Truncated []string `json:"truncated,omitempty"`
 }
+
+// groupLimit caps each summary breakdown; a cut breakdown is listed in Summary.Truncated.
+const groupLimit = 500
 
 // Summarize aggregates rows matching f.
 func (s *Store) Summarize(ctx context.Context, f Filter, bucket time.Duration) (*Summary, error) {
@@ -200,14 +229,23 @@ func (s *Store) Summarize(ctx context.Context, f Filter, bucket time.Duration) (
 	}
 	_ = rows.Close()
 
-	if out.ByAuth, err = s.groups(ctx, from, args, `auth_id`, `max(auth_label)`); err != nil {
-		return nil, fmt.Errorf("by auth: %w", err)
-	}
-	if out.ByModel, err = s.groups(ctx, from, args, `model`, `max(model)`); err != nil {
-		return nil, fmt.Errorf("by model: %w", err)
-	}
-	if out.BySource, err = s.groups(ctx, from, args, `source`, `max(source)`); err != nil {
-		return nil, fmt.Errorf("by source: %w", err)
+	for _, g := range []struct {
+		name, key, label string
+		dst              *[]Group
+	}{
+		{"by_auth", `auth_id`, `max(auth_label)`, &out.ByAuth},
+		{"by_model", `model`, `max(model)`, &out.ByModel},
+		{"by_source", `source`, `max(source)`, &out.BySource},
+	} {
+		groups, errG := s.groups(ctx, from, args, g.key, g.label)
+		if errG != nil {
+			return nil, fmt.Errorf("%s: %w", g.name, errG)
+		}
+		if len(groups) > groupLimit {
+			groups = groups[:groupLimit]
+			out.Truncated = append(out.Truncated, g.name)
+		}
+		*g.dst = groups
 	}
 	if err = s.db.QueryRowContext(ctx, `SELECT count(*), count(*) FILTER (WHERE auths > 1) FROM (
 		SELECT session_id, count(DISTINCT auth_id) AS auths`+from+` AND session_id <> ''
@@ -219,7 +257,7 @@ func (s *Store) Summarize(ctx context.Context, f Filter, bucket time.Duration) (
 
 func (s *Store) groups(ctx context.Context, from string, args []any, keyExpr, labelExpr string) ([]Group, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+keyExpr+`, `+labelExpr+`, max(provider),`+
-		countsSelect+from+` GROUP BY `+keyExpr+` ORDER BY count(*) DESC LIMIT 100`, args...)
+		countsSelect+from+` GROUP BY `+keyExpr+fmt.Sprintf(` ORDER BY count(*) DESC LIMIT %d`, groupLimit+1), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -295,6 +333,8 @@ type RollupRow struct {
 	ReasoningTokens    int64 `json:"reasoning_tokens"`
 	TotalTokens        int64 `json:"total_tokens"`
 	Incomplete         int64 `json:"incomplete_accounting"`
+	CacheWrite1h       int64 `json:"cache_write_1h"`
+	Cost
 }
 
 // Rollup groups rows into calendar buckets ("hour" or "day") in time zone tz, by dims.
@@ -325,7 +365,8 @@ func (s *Store) Rollup(ctx context.Context, f Filter, unit, tz string, dims []st
 		count(*) FILTER (WHERE outcome = 'canceled'), count(*) FILTER (WHERE outcome = 'rejected'),
 		COALESCE(sum(uncached_input), 0), COALESCE(sum(cache_read), 0),
 		COALESCE(sum(cache_write), 0), COALESCE(sum(output_non_reasoning), 0), COALESCE(sum(reasoning_tokens), 0),
-		COALESCE(sum(total_tokens), 0), count(*) FILTER (WHERE accounting_quality NOT IN ('complete', ''))
+		COALESCE(sum(total_tokens), 0), count(*) FILTER (WHERE accounting_quality NOT IN ('complete', '')),
+		COALESCE(sum(cache_write_1h), 0),` + costSelect + `
 		FROM ` + s.table() + where + ` GROUP BY ` + strings.Join(group, ", ") +
 		` ORDER BY ` + strings.Join(group, ", ") + fmt.Sprintf(` LIMIT $%d`, len(args))
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -342,7 +383,9 @@ func (s *Store) Rollup(ctx context.Context, f Filter, unit, tz string, dims []st
 			targets = append(targets, &vals[i])
 		}
 		targets = append(targets, &r.Attempts, &r.Success, &r.Failed, &r.Canceled, &r.Rejected, &r.UncachedInput,
-			&r.CacheRead, &r.CacheWrite, &r.OutputNonReasoning, &r.ReasoningTokens, &r.TotalTokens, &r.Incomplete)
+			&r.CacheRead, &r.CacheWrite, &r.OutputNonReasoning, &r.ReasoningTokens, &r.TotalTokens, &r.Incomplete,
+			&r.CacheWrite1h)
+		targets = append(targets, r.costTargets()...)
 		if err = rows.Scan(targets...); err != nil {
 			return nil, false, err
 		}
@@ -383,11 +426,13 @@ type SessionTotal struct {
 	ReasoningTokens    int64 `json:"reasoning_tokens"`
 	TotalTokens        int64 `json:"total_tokens"`
 	Incomplete         int64 `json:"incomplete_accounting"`
+	CacheWrite1h       int64 `json:"cache_write_1h"`
+	Cost
 }
 
 // SessionTotals returns per-session totals for rows matching f, largest total_tokens first (or
-// most recent first with order "recent"). Rows without a session id are skipped. Pricing per
-// model is the caller's job: use a rollup with dims=session_id,model for that.
+// most recent first with order "recent"). Rows without a session id are skipped. Cost is the sum
+// of each row's stored list price.
 func (s *Store) SessionTotals(ctx context.Context, f Filter, order string, limit int) ([]SessionTotal, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
@@ -407,7 +452,8 @@ func (s *Store) SessionTotals(ctx context.Context, f Filter, order string, limit
 		count(*) FILTER (WHERE outcome = 'canceled'), count(*) FILTER (WHERE outcome = 'rejected'),
 		COALESCE(sum(uncached_input), 0), COALESCE(sum(cache_read), 0),
 		COALESCE(sum(cache_write), 0), COALESCE(sum(output_non_reasoning), 0), COALESCE(sum(reasoning_tokens), 0),
-		COALESCE(sum(total_tokens), 0), count(*) FILTER (WHERE accounting_quality NOT IN ('complete', ''))
+		COALESCE(sum(total_tokens), 0), count(*) FILTER (WHERE accounting_quality NOT IN ('complete', '')),
+		COALESCE(sum(cache_write_1h), 0),` + costSelect + `
 		FROM ` + s.table() + where + ` AND session_id <> '' GROUP BY session_id ORDER BY ` + orderBy +
 		fmt.Sprintf(` LIMIT $%d`, len(args))
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -419,9 +465,10 @@ func (s *Store) SessionTotals(ctx context.Context, f Filter, order string, limit
 	for rows.Next() {
 		var r SessionTotal
 		var models, auths, machines, sources, keys, harnesses pgTextArray
-		if err = rows.Scan(&r.SessionID, &r.FirstTS, &r.LastTS, &models, &auths, &machines, &sources, &keys, &harnesses,
-			&r.Attempts, &r.Success, &r.Failed, &r.Canceled, &r.Rejected, &r.UncachedInput, &r.CacheRead, &r.CacheWrite,
-			&r.OutputNonReasoning, &r.ReasoningTokens, &r.TotalTokens, &r.Incomplete); err != nil {
+		if err = rows.Scan(append([]any{&r.SessionID, &r.FirstTS, &r.LastTS, &models, &auths, &machines, &sources, &keys,
+			&harnesses, &r.Attempts, &r.Success, &r.Failed, &r.Canceled, &r.Rejected, &r.UncachedInput, &r.CacheRead,
+			&r.CacheWrite, &r.OutputNonReasoning, &r.ReasoningTokens, &r.TotalTokens, &r.Incomplete, &r.CacheWrite1h},
+			r.costTargets()...)...); err != nil {
 			return nil, err
 		}
 		r.Models, r.AuthIDs, r.Machines, r.Sources, r.KeyHashes, r.Harnesses = models, auths, machines, sources, keys, harnesses

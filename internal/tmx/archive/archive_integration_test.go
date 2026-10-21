@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/capture"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/pricing"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
 )
 
@@ -37,6 +38,11 @@ func openTestArchive(t *testing.T) (*Archive, *requestlog.Store) {
 			t.Fatal(err)
 		}
 	}
+	t.Setenv("TMX_PRICES", "off")
+	t.Setenv("WRITABLE_PATH", t.TempDir())
+	if _, err = a.db.Exec("DROP TABLE IF EXISTS tmx.price_catalogs"); err != nil {
+		t.Fatal(err)
+	}
 	rl, err := requestlog.Open(ctx, dsn, "tmx", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -44,6 +50,11 @@ func openTestArchive(t *testing.T) (*Archive, *requestlog.Store) {
 	if _, err = rl.DB().Exec("DELETE FROM tmx.requests"); err != nil {
 		t.Fatal(err)
 	}
+	cat, err := pricing.ParseModelsDev([]byte(`{"anthropic":{"models":{"claude-opus-5-5":{"cost":{"input":4,"output":20,"cache_read":0.2,"cache_write":5}}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rl.SetPriceCatalogForTest(cat, time.Date(2026, 10, 21, 0, 0, 0, 0, time.UTC))
 	requestlog.SetDefaultForTest(rl)
 	t.Cleanup(func() {
 		requestlog.SetDefaultForTest(nil)

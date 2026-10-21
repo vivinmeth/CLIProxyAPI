@@ -83,53 +83,13 @@ func TestFreeFormToolInputKeptAsString(t *testing.T) {
 	}
 }
 
-func TestPriceResolution(t *testing.T) {
-	cat, err := parsePriceCatalog([]byte(`{
-	"anthropic":{"models":{"claude-opus-5-5":{"cost":{"input":5,"output":25,"cache_read":0.5,"cache_write":6.25}},
-		"claude-haiku-4-5":{"cost":{"input":1,"output":5}}}},
-	"openai":{"models":{"gpt-5.6-luna":{"cost":{"input":0.2,"output":1.2,"cache_read":0.02,
-		"tiers":[{"input":0.4,"output":1.8,"tier":{"type":"context","size":272000}}]}}}},
-	"openrouter":{"models":{"qwen/qwen3-coder":{"cost":{"input":0.3,"output":1.2}},"free":{"cost":{"input":0,"output":0}}}}}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, c := range []struct{ provider, model, want string }{
-		{"claude", "claude-opus-5-5[1m]", "claude-opus-5-5"},
-		{"anthropic", "claude-haiku-4-5-20251001", "claude-haiku-4-5"},
-		{"openrouter", "anthropic/claude-haiku-4.5", ""}, // dots aren't dashes: unpriced, not guessed
-		{"google", "antigravity-claude-opus-5-5-thinking", "claude-opus-5-5"},
-		{"opencode", "claude-opus-5-5", "claude-opus-5-5"},
-		{"openrouter", "qwen/qwen3-coder", "qwen/qwen3-coder"},
-		{"cursor", "default", ""},
-		{"openrouter", "free", ""},
-	} {
-		if _, id, _ := cat.resolve(c.provider, c.model); id != c.want {
-			t.Errorf("%s %s priced as %q, want %q", c.provider, c.model, id, c.want)
-		}
-	}
-	row := priceRow(cat, "anthropic", "claude-haiku-4-5")
-	if row[6].(float64) != 1 || row[7].(float64) != 1 { // missing cache rates fall back to input
-		t.Fatalf("haiku cache rates = %v %v", row[6], row[7])
-	}
-	row = priceRow(cat, "codex", "gpt-5.6-luna")
-	if row[8].(int64) != 272000 || row[9].(float64) != 0.4 || row[11].(float64) != 0.02 {
-		t.Fatalf("luna tier = %v", row[8:13])
-	}
-	if row = priceRow(cat, "soa-ollama", "qwen2.5-coder:14b"); row[4].(float64) != 0 || row[13] != "local" {
-		t.Fatalf("ollama = %v", row)
-	}
-}
-
 // Usage rows link to their session and message, get a list price, and roll up per session;
 // tool calls keep their arguments as JSON; an extractor version bump rewrites the session.
 func TestAnalyticsCostsLinksAndVersion(t *testing.T) {
 	a, an := openTestAnalytics(t)
 	ctx := context.Background()
-	if _, err := an.db.Exec(`TRUNCATE model_prices`); err != nil {
-		t.Fatal(err)
-	}
 	ts := time.Date(2026, 10, 20, 10, 0, 0, 0, time.UTC)
-	usage := `{"provider":"anthropic","model":"claude-opus-5-5","uncached_input":5,"cache_read":900,"cache_write":100,"output":80}`
+	usage := `{"provider":"anthropic","model":"claude-opus-5-5","uncached_input":5,"cache_read":900,"cache_write":100,"cache_write_1h":100,"output":80}`
 	in := SessionIngest{Harness: "claude-code", ExternalID: "cc-cost", Machine: "alien", StartedAt: &ts,
 		Messages: []MessageIngest{
 			{ExternalID: "u1", Seq: 1, Role: "user", TS: &ts, Message: json.RawMessage(`{"role":"user","content":"go"}`)},
@@ -151,11 +111,9 @@ func TestAnalyticsCostsLinksAndVersion(t *testing.T) {
 		sid != "claude-code:cc-cost" || canon != sid || seq != 1 || via != "import_ref" {
 		t.Fatalf("link = %q %q %d %q %v", sid, canon, seq, via, err)
 	}
-	if _, err := an.db.Exec(`INSERT INTO model_prices (provider, model, catalog_model, input, output, cache_read, cache_write)
-		VALUES ('anthropic', 'claude-opus-5-5', 'claude-opus-5-5', 5, 25, 0.5, 6.25)`); err != nil {
-		t.Fatal(err)
-	}
-	want := (5*5 + 900*0.5 + 100*6.25 + 80*25) / 1e6
+	// Priced by the request log when written (catalog installed by openTestArchive: Opus 5.5 at
+	// 4 / 20, read 0.2, write 5; the 100 written tokens are 1-hour: 2x input).
+	want := (5*4 + 900*0.2 + 100*8 + 80*20) / 1e6
 	var cost float64
 	if err := an.db.QueryRow(`SELECT cost_usd FROM request_costs`).Scan(&cost); err != nil || math.Abs(cost-want) > 1e-12 {
 		t.Fatalf("cost = %v, want %v (%v)", cost, want, err)

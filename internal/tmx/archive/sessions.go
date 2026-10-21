@@ -104,6 +104,14 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 	}
 	id := SessionKey(in.Harness, in.ExternalID)
 	res := &IngestResult{SessionID: id, Messages: len(in.Messages)}
+	// Messages without an id are keyed by position, here and in their usage keys (an empty id
+	// would make every such message share "<session>#").
+	for i := range in.Messages {
+		in.Messages[i].ExternalID = strings.TrimSpace(in.Messages[i].ExternalID)
+		if in.Messages[i].ExternalID == "" {
+			in.Messages[i].ExternalID = fmt.Sprintf("seq-%d", in.Messages[i].Seq)
+		}
+	}
 
 	// Raw sources must already be uploaded, so the original survives any transpiler bug.
 	for _, src := range in.Sources {
@@ -132,10 +140,6 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 	prep := make([]prepared, 0, len(in.Messages))
 	seen := map[string]bool{}
 	for i, m := range in.Messages {
-		m.ExternalID = strings.TrimSpace(m.ExternalID)
-		if m.ExternalID == "" {
-			m.ExternalID = fmt.Sprintf("seq-%d", m.Seq)
-		}
 		if seen[m.ExternalID] {
 			return nil, fmt.Errorf("message %d: duplicate external_id %q", i, m.ExternalID)
 		}
@@ -163,6 +167,12 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 		}
 	}
 	res.ViaProxy = viaProxy
+	store := requestlog.Default()
+	var since *time.Time
+	if viaProxy != nil && *viaProxy {
+		since = a.proxiedSince(ctx, store, in.ExternalID)
+	}
+	usageInTx := a.usageInArchiveDB(ctx, store)
 
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -251,20 +261,19 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 	if err = a.journal(ctx, tx, "session", id); err != nil {
 		return nil, fmt.Errorf("analytics journal: %w", err)
 	}
+	// Usage rows go to tmx.requests (source extern:<harness>) so cost views can include them; in
+	// the same transaction when it shares the database, so archive and usage never drift.
+	if usageInTx {
+		if err = a.writeUsage(ctx, tx, in, id, viaProxy, since, res); err != nil {
+			return nil, err
+		}
+	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
-	// Usage rows go to tmx.requests (source extern:<harness>) so cost views can include them.
-	if res.UsageRows, err = a.writeUsage(ctx, in, id, viaProxy); err != nil {
-		return res, fmt.Errorf("usage rows: %w", err)
-	}
-	if in.Replace {
-		keep := []string{}
-		for _, row := range usageRows(in, id, viaProxy) {
-			keep = append(keep, row.ImportRef)
-		}
-		if res.UsageRemoved, err = requestlog.Default().DeleteImported(ctx, id+"#", keep); err != nil {
-			return res, fmt.Errorf("replace usage rows: %w", err)
+	if !usageInTx && store != nil {
+		if err = a.writeUsage(ctx, store.DB(), in, id, viaProxy, since, res); err != nil {
+			return res, err
 		}
 	}
 	return res, nil

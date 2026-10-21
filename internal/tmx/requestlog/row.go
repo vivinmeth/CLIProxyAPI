@@ -70,10 +70,26 @@ type Row struct {
 	// Normalised accounting (identical meaning for every provider and source):
 	// input total = uncached_input + cache_read + cache_write;
 	// output total = output_non_reasoning + reasoning_tokens (reasoning is part of output).
-	UncachedInput      int64  `json:"uncached_input"`
-	CacheWrite         int64  `json:"cache_write"`
+	UncachedInput int64 `json:"uncached_input"`
+	CacheWrite    int64 `json:"cache_write"`
+	// CacheWrite1h is the part of CacheWrite written with Anthropic's 1-hour TTL (billed 2x input
+	// instead of 1.25x).
+	CacheWrite1h       int64  `json:"cache_write_1h"`
 	OutputNonReasoning int64  `json:"output_non_reasoning"`
 	AccountingQuality  string `json:"accounting_quality"`
+	// Speed is Anthropic's usage.speed ("fast" mode); ServiceTier is the tier the upstream
+	// reported, else the one requested.
+	Speed string `json:"speed"`
+	// List-price cost in USD, fixed when the row's tokens are written (see prices.go). NULL while
+	// no price catalog is loaded or when the model is unpriced.
+	CostInput      *float64   `json:"cost_input"`
+	CostCacheRead  *float64   `json:"cost_cache_read"`
+	CostCacheWrite *float64   `json:"cost_cache_write"`
+	CostOutput     *float64   `json:"cost_output"`
+	CostUSD        *float64   `json:"cost_usd"`
+	PricedAs       string     `json:"priced_as"`
+	PriceSource    *string    `json:"price_source"` // models.dev | local | unpriced; NULL = not priced yet
+	PricedAt       *time.Time `json:"priced_at"`    // fetch time of the catalog snapshot used
 	// Provenance: "tmx-proxy" for proxied calls, "extern:<harness>" for imported sessions.
 	Source  string `json:"source"`
 	Machine string `json:"machine"`
@@ -116,6 +132,7 @@ func (r *Row) applyBreakdown(b coreusage.TokenBreakdown) {
 	r.UncachedInput = b.Input.UncachedTokens
 	r.CacheRead = b.Input.CacheReadTokens
 	r.CacheWrite = b.Input.CacheWriteTokens
+	r.CacheWrite1h = min(r.CacheWrite1h, r.CacheWrite)
 	r.OutputNonReasoning = b.Output.NonReasoningTokens
 	r.ReasoningTokens = b.Output.ReasoningTokens
 	r.AccountingQuality = string(b.Quality)
@@ -251,7 +268,14 @@ func rowFromRecord(ctx context.Context, record coreusage.Record) Row {
 	if effort == "" {
 		effort = coreusage.ReasoningEffortFromContext(ctx)
 	}
-	tier := strings.TrimSpace(record.ServiceTier)
+	// The tier the upstream reports (what was billed) wins over the one requested.
+	tier := strings.TrimSpace(record.ResponseServiceTier)
+	if tier == "" {
+		tier = strings.TrimSpace(record.Detail.ResponseServiceTier)
+	}
+	if tier == "" {
+		tier = strings.TrimSpace(record.ServiceTier)
+	}
 	if tier == "" {
 		tier = strings.TrimSpace(record.RequestServiceTier)
 	}
@@ -301,6 +325,8 @@ func rowFromRecord(ctx context.Context, record coreusage.Record) Row {
 		TotalTokens:     detail.TotalTokens,
 		ReasoningEffort: effort,
 		ServiceTier:     tier,
+		CacheWrite1h:    detail.CacheWrite1hTokens,
+		Speed:           strings.TrimSpace(detail.ResponseSpeed),
 	}
 	// Raw provider-shaped columns above are kept as reported; the normalised ones come from
 	// upstream's accounting (cache_read and reasoning_tokens take its values).

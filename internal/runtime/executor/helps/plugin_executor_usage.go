@@ -184,6 +184,12 @@ func MergeStreamUsageDetail(existing, update usage.Detail) usage.Detail {
 	if merged.ResponseServiceTier == "" {
 		merged.ResponseServiceTier = existing.ResponseServiceTier
 	}
+	if merged.CacheWrite1hTokens == 0 && existing.CacheWrite1hTokens > 0 {
+		merged.CacheWrite1hTokens = existing.CacheWrite1hTokens
+	}
+	if merged.ResponseSpeed == "" {
+		merged.ResponseSpeed = existing.ResponseSpeed
+	}
 	cached := merged.CacheReadTokens + merged.CacheCreationTokens
 	if cached == 0 {
 		cached = merged.CachedTokens

@@ -1,10 +1,13 @@
 package requestlog
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -24,6 +27,11 @@ const (
 	batchSize            = 200
 	flushInterval        = 2 * time.Second
 	pruneInterval        = 6 * time.Hour
+	// Rows whose insert failed wait in memory (up to pendingMax) and are retried with backoff; on
+	// shutdown they go to a spool file that the next start reads back.
+	pendingMax    = 100000
+	retryMaxDelay = time.Minute
+	spoolFileName = "tmx-requestlog-pending.jsonl"
 )
 
 var schemaNamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
@@ -37,8 +45,13 @@ type Store struct {
 	dropped       atomic.Int64
 	written       atomic.Int64
 	writeErrors   atomic.Int64
+	rejected      atomic.Int64 // rows the database refused one by one (logged, not retried)
+	pendingRows   atomic.Int64
 	stopOnce      sync.Once
 	done          chan struct{}
+
+	prices     atomic.Pointer[priceSnapshot]
+	stopPrices chan struct{}
 }
 
 var current atomic.Pointer[Store]
@@ -112,6 +125,7 @@ func Open(ctx context.Context, dsn, schema string, retentionDays int) (*Store, e
 		retentionDays: retentionDays,
 		queue:         make(chan Row, queueSize),
 		done:          make(chan struct{}),
+		stopPrices:    make(chan struct{}),
 	}
 	if errSchema := s.ensureSchema(pingCtx); errSchema != nil {
 		_ = db.Close()
@@ -120,6 +134,7 @@ func Open(ctx context.Context, dsn, schema string, retentionDays int) (*Store, e
 	go s.run()
 	go s.backfillAccounting()
 	go s.backfillHarness()
+	go s.pricesLoop()
 	return s, nil
 }
 
@@ -181,6 +196,24 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS requests_import_ref_idx ON ` + s.table() + ` (import_ref) WHERE import_ref IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS requests_source_ts_idx ON ` + s.table() + ` (source, ts DESC)`,
 		`CREATE INDEX IF NOT EXISTS requests_key_ts_idx ON ` + s.table() + ` (api_key_hash, ts DESC)`,
+		// v3: 1-hour cache writes, speed, list-price cost fixed at write time (prices.go).
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS cache_write_1h BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS speed TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS cost_input DOUBLE PRECISION`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS cost_cache_read DOUBLE PRECISION`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS cost_cache_write DOUBLE PRECISION`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS cost_output DOUBLE PRECISION`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS cost_usd DOUBLE PRECISION`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS priced_as TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS price_source TEXT`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS priced_at TIMESTAMPTZ`,
+		`CREATE INDEX IF NOT EXISTS requests_price_pending_idx ON ` + s.table() + ` (id)
+			WHERE price_source IS NULL OR price_source = 'unpriced'`,
+		`CREATE TABLE IF NOT EXISTS ` + s.schema + `.price_catalogs (
+			fetched_at TIMESTAMPTZ PRIMARY KEY,
+			source     TEXT NOT NULL,
+			catalog    JSONB NOT NULL
+		)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -191,7 +224,8 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 }
 
 // Enqueue hands a row to the writer without blocking; when the queue is full the row is dropped
-// and counted rather than slowing the request path.
+// and counted rather than slowing the request path. (The writer never blocks on the database:
+// failed inserts wait in its pending list, so the queue only fills under extreme load.)
 func (s *Store) Enqueue(row Row) {
 	if s == nil {
 		return
@@ -211,6 +245,8 @@ func (s *Store) Stats() map[string]int64 {
 		"written":      s.written.Load(),
 		"dropped":      s.dropped.Load(),
 		"write_errors": s.writeErrors.Load(),
+		"rejected":     s.rejected.Load(),
+		"pending":      s.pendingRows.Load(),
 		"queued":       int64(len(s.queue)),
 	}
 }
@@ -221,6 +257,7 @@ func (s *Store) Close() {
 		return
 	}
 	s.stopOnce.Do(func() {
+		close(s.stopPrices)
 		close(s.queue)
 		<-s.done
 		_ = s.db.Close()
@@ -235,17 +272,10 @@ func (s *Store) run() {
 	defer prune.Stop()
 	s.prune()
 
+	w := &writer{s: s, pending: s.readSpool()}
 	batch := make([]Row, 0, batchSize)
 	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		if err := s.insert(batch); err != nil {
-			s.writeErrors.Add(1)
-			log.WithError(err).Warnf("tmx request log: dropped batch of %d rows", len(batch))
-		} else {
-			s.written.Add(int64(len(batch)))
-		}
+		w.write(batch)
 		batch = batch[:0]
 	}
 	for {
@@ -253,6 +283,7 @@ func (s *Store) run() {
 		case row, ok := <-s.queue:
 			if !ok {
 				flush()
+				w.spill()
 				return
 			}
 			batch = append(batch, row)
@@ -267,6 +298,114 @@ func (s *Store) run() {
 	}
 }
 
+// writer is the run loop's insert state: rows that failed to insert are kept and retried.
+type writer struct {
+	s         *Store
+	pending   []Row
+	nextRetry time.Time
+	delay     time.Duration
+}
+
+// write prices and inserts batch (after anything still pending). A failure keeps every row for a
+// retry with backoff, unless the database is reachable and refuses the rows, in which case they
+// are inserted one by one and only those it refuses are dropped (and logged).
+func (w *writer) write(batch []Row) {
+	s := w.s
+	snap := s.priceSnap()
+	for i := range batch {
+		priceRow(&batch[i], snap)
+	}
+	w.pending = append(w.pending, batch...)
+	if over := len(w.pending) - pendingMax; over > 0 {
+		s.dropped.Add(int64(over))
+		log.Warnf("tmx request log: %d unwritten rows over the pending limit dropped", over)
+		w.pending = append([]Row(nil), w.pending[over:]...)
+	}
+	defer func() { s.pendingRows.Store(int64(len(w.pending))) }()
+	if len(w.pending) == 0 || time.Now().Before(w.nextRetry) {
+		return
+	}
+	for len(w.pending) > 0 {
+		chunk := w.pending[:min(batchSize, len(w.pending))]
+		err := s.insert(chunk)
+		if err == nil {
+			s.written.Add(int64(len(chunk)))
+			w.pending = w.pending[len(chunk):]
+			continue
+		}
+		s.writeErrors.Add(1)
+		if !s.reachable() {
+			w.delay = min(max(2*w.delay, flushInterval), retryMaxDelay)
+			w.nextRetry = time.Now().Add(w.delay)
+			log.WithError(err).Warnf("tmx request log: database unavailable; %d rows kept for retry", len(w.pending))
+			return
+		}
+		for _, r := range chunk {
+			if errOne := s.insert([]Row{r}); errOne != nil {
+				s.rejected.Add(1)
+				log.WithError(errOne).Warnf("tmx request log: row rejected (trace %s, model %s)", r.TraceID, r.Model)
+			} else {
+				s.written.Add(1)
+			}
+		}
+		w.pending = w.pending[len(chunk):]
+	}
+	w.pending, w.delay, w.nextRetry = nil, 0, time.Time{}
+}
+
+func (s *Store) reachable() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return s.db.PingContext(ctx) == nil
+}
+
+func spoolPath() string {
+	dir := strings.TrimSpace(os.Getenv("WRITABLE_PATH"))
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, spoolFileName)
+}
+
+// spill saves rows still unwritten at shutdown; readSpool loads them on the next start.
+func (w *writer) spill() {
+	if len(w.pending) == 0 {
+		return
+	}
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	for i := range w.pending {
+		_ = enc.Encode(&w.pending[i])
+	}
+	if err := os.WriteFile(spoolPath(), b.Bytes(), 0o600); err != nil {
+		log.WithError(err).Errorf("tmx request log: %d unwritten rows lost at shutdown", len(w.pending))
+		return
+	}
+	log.Warnf("tmx request log: %d unwritten rows saved to %s", len(w.pending), spoolPath())
+}
+
+func (s *Store) readSpool() []Row {
+	path := spoolPath()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var rows []Row
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	for {
+		var r Row
+		if dec.Decode(&r) != nil {
+			break
+		}
+		rows = append(rows, r)
+	}
+	_ = os.Remove(path)
+	if len(rows) > 0 {
+		log.Infof("tmx request log: %d rows from the previous run queued for writing", len(rows))
+	}
+	return rows
+}
+
 // columnNames and rowFields must stay in the same order; they drive insert and scan.
 var columnNames = []string{"ts", "request_id", "trace_id", "session_id", "provider", "executor",
 	"model", "alias", "response_model", "auth_id", "auth_index", "auth_label", "auth_type",
@@ -274,7 +413,9 @@ var columnNames = []string{"ts", "request_id", "trace_id", "session_id", "provid
 	"status_code", "error", "latency_ms", "ttft_ms", "input_tokens", "output_tokens",
 	"reasoning_tokens", "cached_tokens", "cache_read", "cache_creation", "total_tokens",
 	"reasoning_effort", "service_tier", "uncached_input", "cache_write", "output_non_reasoning",
-	"accounting_quality", "source", "machine", "import_ref", "shadowed", "harness", "client_mode"}
+	"accounting_quality", "source", "machine", "import_ref", "shadowed", "harness", "client_mode",
+	"cache_write_1h", "speed", "cost_input", "cost_cache_read", "cost_cache_write", "cost_output", "cost_usd",
+	"priced_as", "price_source", "priced_at"}
 
 func rowFields(r *Row) []any {
 	return []any{&r.TS, &r.RequestID, &r.TraceID, &r.SessionID, &r.Provider, &r.Executor,
@@ -283,7 +424,9 @@ func rowFields(r *Row) []any {
 		&r.StatusCode, &r.Error, &r.LatencyMs, &r.TTFTMs, &r.InputTokens, &r.OutputTokens,
 		&r.ReasoningTokens, &r.CachedTokens, &r.CacheRead, &r.CacheCreation, &r.TotalTokens,
 		&r.ReasoningEffort, &r.ServiceTier, &r.UncachedInput, &r.CacheWrite, &r.OutputNonReasoning,
-		&r.AccountingQuality, &r.Source, &r.Machine, &r.importRefPtr, &r.Shadowed, &r.Harness, &r.ClientMode}
+		&r.AccountingQuality, &r.Source, &r.Machine, &r.importRefPtr, &r.Shadowed, &r.Harness, &r.ClientMode,
+		&r.CacheWrite1h, &r.Speed, &r.CostInput, &r.CostCacheRead, &r.CostCacheWrite, &r.CostOutput, &r.CostUSD,
+		&r.PricedAs, &r.PriceSource, &r.PricedAt}
 }
 
 var insertColumns = strings.Join(columnNames, ", ")
@@ -319,22 +462,58 @@ func (s *Store) insert(rows []Row) error {
 	return err
 }
 
+// Execer runs statements (a *sql.DB or the caller's *sql.Tx).
+type Execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// pricedColumns keep their values on a re-import that doesn't change what the row is priced on
+// (pricedOn): a row's cost is fixed when its tokens are written.
+var pricedColumns = map[string]bool{"cost_input": true, "cost_cache_read": true, "cost_cache_write": true,
+	"cost_output": true, "cost_usd": true, "priced_as": true, "price_source": true, "priced_at": true}
+
+var pricedOn = []string{"provider", "model", "uncached_input", "cache_read", "cache_write", "cache_write_1h",
+	"output_non_reasoning", "reasoning_tokens", "speed", "service_tier"}
+
 // UpsertImported writes usage rows derived from an imported session (source "extern:<harness>").
 // Rows are keyed by ImportRef, so re-importing a session updates them instead of adding copies.
+// A row keeps the cost it was first priced at unless its tokens, model or tier change.
 func (s *Store) UpsertImported(ctx context.Context, rows []Row) error {
+	if s == nil {
+		return nil
+	}
+	return s.UpsertImportedWith(ctx, s.db, rows)
+}
+
+// UpsertImportedWith is UpsertImported on ex (the caller's transaction, when the request log
+// lives in the same database).
+func (s *Store) UpsertImportedWith(ctx context.Context, ex Execer, rows []Row) error {
 	if s == nil || len(rows) == 0 {
 		return nil
 	}
+	snap := s.priceSnap()
+	for i := range rows {
+		priceRow(&rows[i], snap)
+	}
+	same := make([]string, len(pricedOn))
+	for i, c := range pricedOn {
+		same[i] = "t." + c + " IS NOT DISTINCT FROM EXCLUDED." + c
+	}
+	keep := "(t.price_source IS NOT NULL AND t.price_source <> 'unpriced' AND " + strings.Join(same, " AND ") + ")"
 	set := make([]string, 0, len(columnNames))
 	for _, c := range columnNames {
-		if c != "import_ref" {
+		switch {
+		case c == "import_ref":
+		case pricedColumns[c]:
+			set = append(set, c+" = CASE WHEN "+keep+" THEN t."+c+" ELSE EXCLUDED."+c+" END")
+		default:
 			set = append(set, c+" = EXCLUDED."+c)
 		}
 	}
 	for start := 0; start < len(rows); start += batchSize {
 		end := min(start+batchSize, len(rows))
 		values, args := insertValues(rows[start:end])
-		if _, err := s.db.ExecContext(ctx, "INSERT INTO "+s.table()+" ("+insertColumns+") VALUES "+values+
+		if _, err := ex.ExecContext(ctx, "INSERT INTO "+s.table()+" AS t ("+insertColumns+") VALUES "+values+
 			" ON CONFLICT (import_ref) WHERE import_ref IS NOT NULL DO UPDATE SET "+strings.Join(set, ", "),
 			args...); err != nil {
 			return err
@@ -346,6 +525,14 @@ func (s *Store) UpsertImported(ctx context.Context, rows []Row) error {
 // DeleteImported removes imported usage rows whose import_ref starts with prefix ("<session>#"),
 // except those listed in keep. It returns the number of rows removed.
 func (s *Store) DeleteImported(ctx context.Context, prefix string, keep []string) (int64, error) {
+	if s == nil {
+		return 0, nil
+	}
+	return s.DeleteImportedWith(ctx, s.db, prefix, keep)
+}
+
+// DeleteImportedWith is DeleteImported on ex.
+func (s *Store) DeleteImportedWith(ctx context.Context, ex Execer, prefix string, keep []string) (int64, error) {
 	if s == nil || prefix == "" {
 		return 0, nil
 	}
@@ -353,7 +540,7 @@ func (s *Store) DeleteImported(ctx context.Context, prefix string, keep []string
 	for i, k := range keep {
 		quoted[i] = `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(k) + `"`
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM `+s.table()+` WHERE import_ref IS NOT NULL
+	res, err := ex.ExecContext(ctx, `DELETE FROM `+s.table()+` WHERE import_ref IS NOT NULL
 		AND starts_with(import_ref, $1) AND NOT (import_ref = ANY($2::text[]))`, prefix,
 		"{"+strings.Join(quoted, ",")+"}")
 	if err != nil {

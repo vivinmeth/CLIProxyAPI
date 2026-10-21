@@ -91,6 +91,11 @@ type Detail struct {
 	TotalTokens         int64
 	TokenBreakdown      TokenBreakdown
 	ResponseServiceTier string
+	// CacheWrite1hTokens is the part of CacheCreationTokens written with a 1-hour TTL (Anthropic
+	// usage.cache_creation.ephemeral_1h_input_tokens); ResponseSpeed is Anthropic's usage.speed.
+	// tokenmaxx fork: both price differently.
+	CacheWrite1hTokens int64
+	ResponseSpeed      string
 }
 
 type requestedModelAliasContextKey struct{}

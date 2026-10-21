@@ -297,6 +297,7 @@ func registerTMXArchiveRoutes(v8 *gin.RouterGroup) {
 	g.GET("/sessions/*id", tmxArchive(tmxSessionGet))
 	g.DELETE("/sessions/*id", tmxArchive(tmxSessionDelete))
 	g.POST("/usage/rebuild", tmxArchive(tmxUsageRebuild))
+	g.POST("/usage/backfill-cache-ttl", tmxArchive(tmxUsageCacheTTL))
 	g.GET("/conversation", tmxArchive(tmxConversation))
 	g.GET("/exchanges", tmxArchive(tmxExchangeList))
 	g.GET("/exchanges/:trace", tmxArchive(tmxExchangeGet))
@@ -528,6 +529,18 @@ func tmxConversation(c *gin.Context, a *archive.Archive) {
 func tmxUsageRebuild(c *gin.Context, a *archive.Archive) {
 	dry := c.Query("dry_run") == "1" || c.Query("dry_run") == "true"
 	res, err := a.RebuildUsage(c.Request.Context(), strings.TrimSpace(c.Query("harness")), dry)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "result": res})
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+// tmxUsageCacheTTL: POST /tmx/archive/usage/backfill-cache-ttl?dry_run=1 — fill cache_write_1h of
+// proxied rows from their captured responses and reprice them.
+func tmxUsageCacheTTL(c *gin.Context, a *archive.Archive) {
+	dry := c.Query("dry_run") == "1" || c.Query("dry_run") == "true"
+	res, err := a.BackfillCacheTTL(c.Request.Context(), dry)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "result": res})
 		return

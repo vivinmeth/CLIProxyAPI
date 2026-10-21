@@ -64,10 +64,9 @@ type analytics struct {
 	reqMirror  *mirror // tmx.requests -> requests (nil when the request log is off)
 	exchMirror *mirror // tmx_archive.exchanges -> exchanges
 
-	wake       chan struct{}
-	stop       chan struct{}
-	done       chan struct{}
-	pricesDone chan struct{} // nil when prices are off (no request log)
+	wake chan struct{}
+	stop chan struct{}
+	done chan struct{}
 
 	processed   atomic.Int64
 	extracted   atomic.Int64
@@ -99,10 +98,6 @@ func (a *Archive) startAnalytics(ctx context.Context) {
 	}
 	a.analytics = an
 	go an.run()
-	if an.reqMirror != nil {
-		an.pricesDone = make(chan struct{})
-		go an.pricesLoop()
-	}
 	log.Info("tmx analytics: on")
 }
 
@@ -251,15 +246,15 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 	return nil
 }
 
-// ensureViews creates the price table and (re)creates the views over requests, in one
-// transaction so readers never see them missing.
+// ensureViews (re)creates the views over requests, in one transaction so readers never see them
+// missing.
 func (an *analytics) ensureViews(ctx context.Context) error {
 	tx, err := an.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	for _, stmt := range append(append([]string{}, pricesSchemaSQL...), analyticsViewsSQL...) {
+	for _, stmt := range analyticsViewsSQL {
 		if _, err = tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("analytics views: %w", err)
 		}
@@ -293,9 +288,6 @@ func (an *analytics) close() {
 	an.cancel() // in-flight work is abandoned; the journal keeps it for the next start
 	close(an.stop)
 	<-an.done
-	if an.pricesDone != nil {
-		<-an.pricesDone
-	}
 	_ = an.db.Close()
 }
 
@@ -1325,15 +1317,6 @@ func (a *Archive) AnalyticsStatus(ctx context.Context) (map[string]any, error) {
 		}
 		_ = rows.Close()
 	}
-	prices := map[string]any{}
-	if an.reqMirror != nil {
-		var pairs, unpriced int64
-		var updated sql.NullTime
-		if an.db.QueryRowContext(ctx, `SELECT count(*), count(*) FILTER (WHERE input IS NULL), max(updated_at)
-			FROM model_prices`).Scan(&pairs, &unpriced, &updated) == nil {
-			prices["models"], prices["unpriced"], prices["updated_at"] = pairs, unpriced, nullTimePtr(updated)
-		}
-	}
 	lastErr, _ := an.lastErr.Load().(string)
 	trgm, _ := an.getState(ctx, "trgm_index")
 	if trgm == "" {
@@ -1353,7 +1336,6 @@ func (a *Archive) AnalyticsStatus(ctx context.Context) (map[string]any, error) {
 		"last_run":         time.Unix(an.lastRunUnix.Load(), 0).UTC(),
 		"backfilling":      an.backfilling.Load(),
 		"trgm_index":       trgm,
-		"prices":           prices,
 	}, nil
 }
 

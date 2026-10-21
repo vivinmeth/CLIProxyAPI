@@ -118,6 +118,14 @@ func StartFromEnv(ctx context.Context) *Archive {
 	}
 	a.startAnalytics(ctx)
 	current.Store(a)
+	go func() {
+		// Imported usage rows written when a whole session was shadowed get their direct turns back.
+		if n, errR := a.Reshadow(context.Background()); errR != nil {
+			log.WithError(errR).Warn("tmx archive: reshadowing imported usage rows failed")
+		} else if n > 0 {
+			log.Infof("tmx archive: reshadowed %d imported usage rows", n)
+		}
+	}()
 	if !strings.EqualFold(strings.TrimSpace(os.Getenv("TMX_ARCHIVE_CAPTURE")), "off") {
 		capture.SetSink(a.enqueue)
 	}

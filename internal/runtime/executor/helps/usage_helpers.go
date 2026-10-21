@@ -1200,6 +1200,10 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 		CachedTokens:        cacheReadTokens,
 		CacheReadTokens:     cacheReadTokens,
 		CacheCreationTokens: cacheCreationTokens,
+		// tokenmaxx fork: 1-hour cache writes, fast mode and the billed tier price differently.
+		CacheWrite1hTokens:  usageNode.Get("cache_creation.ephemeral_1h_input_tokens").Int(),
+		ResponseSpeed:       usageNode.Get("speed").String(),
+		ResponseServiceTier: usageNode.Get("service_tier").String(),
 	}
 	if detail.CachedTokens == 0 {
 		detail.CachedTokens = detail.CacheCreationTokens
