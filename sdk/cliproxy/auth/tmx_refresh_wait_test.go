@@ -189,3 +189,29 @@ func TestRefreshWaitBudgetIsSharedPerRequest(t *testing.T) {
 	free.Unlock()
 }
 
+func TestRefreshLockCancelReschedulesRejectedToken(t *testing.T) {
+	const id = "refresh-cancel-reschedule"
+	m, _, started, release := registerRefreshWaitAuth(t, id, "old")
+	loop := newAuthAutoRefreshLoop(m, time.Hour, 1)
+	m.refreshLoop = loop
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = m.refreshAuthForRequest(context.Background(), id, "old") }()
+	<-started
+	loop.mu.Lock()
+	delete(loop.dirty, id)
+	loop.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := m.refreshAuthForRequest(ctx, id, "old"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled lock wait: %v", err)
+	}
+	loop.mu.Lock()
+	_, queued := loop.dirty[id]
+	loop.mu.Unlock()
+	close(release)
+	<-done
+	if !queued {
+		t.Fatal("a canceled refresh of a rejected token must stay scheduled")
+	}
+}
