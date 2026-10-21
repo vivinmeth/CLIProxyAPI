@@ -4,6 +4,7 @@ import (
 	"context"
 	executor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -106,5 +107,31 @@ func TestExternalQuotaModelWindowsKeepStatuses(t *testing.T) {
 	}
 	if reset, ok := weeklyResetAtForModel(a, now, "claude-fable-5"); !ok || !reset.Equal(now.Add(24*time.Hour)) {
 		t.Fatalf("Sonnet window used for Fable: %v %v", reset, ok)
+	}
+}
+
+func TestExternalQuotaModelWindowUsesCanonicalHeaderKeys(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	passive := http.CanonicalHeaderKey("Anthropic-Ratelimit-Unified-7d_model_claude-opus-5-Reset")
+	m := NewManager(nil, &ResetSoonestSelector{}, nil)
+	if _, err := m.Register(context.Background(), &Auth{ID: "canonical", Provider: "claude", Status: StatusActive,
+		Quota: QuotaState{ObservedAt: now, Signals: map[string]string{passive: strconv.FormatInt(now.Add(time.Hour).Unix(), 10)}}}); err != nil {
+		t.Fatal(err)
+	}
+	// An older poll must not land beside the fresher passive reading under a second spelling.
+	if m.ApplyQuotaObservation("canonical", "claude", []QuotaWindowObservation{{Window: "7d:claude-opus-5", ResetsAt: now.Add(48 * time.Hour), ObservedAt: now.Add(-time.Minute)}}) {
+		t.Fatal("older poll applied")
+	}
+	if !m.ApplyQuotaObservation("canonical", "claude", []QuotaWindowObservation{{Window: "7d:claude-opus-5", ResetsAt: now.Add(2 * time.Hour), ObservedAt: now.Add(time.Second)}}) {
+		t.Fatal("newer poll ignored")
+	}
+	a, _ := m.GetByID("canonical")
+	for key := range a.Quota.Signals {
+		if key != http.CanonicalHeaderKey(key) {
+			t.Fatalf("non-canonical signal key %q: %v", key, a.Quota.Signals)
+		}
+	}
+	if got := a.Quota.Signals[passive]; got != strconv.FormatInt(now.Add(2*time.Hour).Unix(), 10) {
+		t.Fatalf("newer poll must replace the passive reset: %v", a.Quota.Signals)
 	}
 }
