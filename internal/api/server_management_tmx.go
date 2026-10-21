@@ -12,13 +12,36 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/archive"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/pool"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/quota"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 const tmxMaxSummaryRange = 400 * 24 * time.Hour
 
-func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher) {
+func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher, managers ...*auth.Manager) {
+	v8.GET("/tmx/pool", func(c *gin.Context) {
+		var auths []*auth.Auth
+		if fetcher != nil {
+			auths = fetcher.TmxAuths()
+		}
+		var counts map[string]int
+		var counter pool.InFlightCounter
+		if len(managers) > 0 && managers[0] != nil {
+			auths = managers[0].List()
+			counts = managers[0].BoundSessionCounts()
+			counter, _ = any(managers[0]).(pool.InFlightCounter)
+		}
+		if adapter, ok := fetcher.(pool.InFlightCounter); ok {
+			counter = adapter
+		}
+		var accounts []quota.Account
+		if svc := quota.Default(); svc != nil {
+			accounts = svc.Accounts()
+		}
+		c.JSON(http.StatusOK, pool.Build(c.Request.Context(), auths, counts, accounts, counter, c.Query("model")))
+	})
 	v8.GET("/tmx/requests/summary", tmxRequestSummary)
 	v8.GET("/tmx/requests", tmxRequestList)
 	v8.GET("/tmx/requests/rollup", tmxRequestRollup)
@@ -741,4 +764,11 @@ func tmxExchangeGet(c *gin.Context, a *archive.Archive) {
 		return
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+func (s *Server) tmxPoolManager() *auth.Manager {
+	if s.handlers == nil {
+		return nil
+	}
+	return s.handlers.AuthManager
 }
