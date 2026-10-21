@@ -129,10 +129,17 @@ var tasksSQL = []string{
 			FROM thread_pull_requests p JOIN thread_roots r ON r.thread_id = p.thread_id
 			ORDER BY r.root_id, p.url, (p.state = 'merged') DESC) d
 		GROUP BY task_id
+	), all_tasks AS (
+		-- every root thread is a task (even before its sessions are imported), plus every task that
+		-- has sessions or commits
+		SELECT DISTINCT root_id AS task_id, 'thread'::text AS kind FROM thread_roots
+		UNION SELECT task_id, kind FROM task_sessions
+		UNION SELECT task_id, CASE WHEN task_id LIKE 'session:%' THEN 'session' ELSE 'thread' END FROM task_commits
 	)
-	SELECT ts.task_id, ts.kind, COALESCE(t.title, s.title, '') AS title, COALESCE(t.project, s.project, '') AS project,
-		COALESCE(t.created_at, ts.started_at) AS started_at, ts.ended_at, ts.sessions, ts.requests, ts.cost_usd,
-		ts.unpriced_requests, COALESCE(tc.commits, 0) AS commits, COALESCE(tc.exact_commits, 0) AS exact_commits,
+	SELECT a.task_id, a.kind, COALESCE(t.title, s.title, '') AS title, COALESCE(t.project, s.project, '') AS project,
+		COALESCE(t.created_at, ts.started_at) AS started_at, ts.ended_at, COALESCE(ts.sessions, 0) AS sessions,
+		COALESCE(ts.requests, 0) AS requests, ts.cost_usd, COALESCE(ts.unpriced_requests, 0) AS unpriced_requests,
+		COALESCE(tc.commits, 0) AS commits, COALESCE(tc.exact_commits, 0) AS exact_commits,
 		COALESCE(tc.additions, 0) AS additions, COALESCE(tc.deletions, 0) AS deletions, COALESCE(tc.files, 0) AS files,
 		COALESCE(tp.prs, 0) AS prs, COALESCE(tp.merged_prs, 0) AS merged_prs,
 		COALESCE(tp.pr_additions, 0) AS pr_additions, COALESCE(tp.pr_deletions, 0) AS pr_deletions,
@@ -140,11 +147,12 @@ var tasksSQL = []string{
 		-- (what landed through PRs)
 		ts.cost_usd / NULLIF(COALESCE(tc.additions, 0) + COALESCE(tc.deletions, 0), 0) AS cost_per_committed_line,
 		ts.cost_usd / NULLIF(COALESCE(tp.pr_additions, 0) + COALESCE(tp.pr_deletions, 0), 0) AS cost_per_merged_line
-	FROM task_sessions ts
-		LEFT JOIN threads t ON ts.kind = 'thread' AND t.id = ts.task_id
-		LEFT JOIN sessions s ON ts.kind = 'session' AND s.id = substr(ts.task_id, 9)
-		LEFT JOIN task_commits tc ON tc.task_id = ts.task_id
-		LEFT JOIN task_prs tp ON tp.task_id = ts.task_id`,
+		FROM all_tasks a
+		LEFT JOIN task_sessions ts ON ts.task_id = a.task_id
+		LEFT JOIN threads t ON a.kind = 'thread' AND t.id = a.task_id
+		LEFT JOIN sessions s ON a.kind = 'session' AND s.id = substr(a.task_id, 9)
+		LEFT JOIN task_commits tc ON tc.task_id = a.task_id
+		LEFT JOIN task_prs tp ON tp.task_id = a.task_id`,
 }
 
 // extractCommit rewrites one commit from its archive record (or removes it when gone).

@@ -95,6 +95,9 @@ func TestCommitsAndTasks(t *testing.T) {
 	if n := count(t, an, `SELECT count(DISTINCT root_id) FROM thread_roots WHERE thread_id IN ('t3:C1', 't3:C2')`); n != 1 {
 		t.Fatalf("cycle split into %d tasks", n)
 	}
+	if n := count(t, an, `SELECT count(*) FROM tasks WHERE task_id = 't3:C1' AND sessions = 0`); n != 1 {
+		t.Fatal("a root thread with no sessions is not a task") // C1 / C2: no sessions, still a task
+	}
 	if n := count(t, an, `SELECT prs FROM tasks WHERE task_id = 't3:R'`); n != 1 {
 		t.Fatalf("PR counted %d times", n)
 	}
