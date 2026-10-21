@@ -140,7 +140,7 @@ func newTMXReservation(ctx context.Context) (context.Context, *tmxReservation, f
 // The reservation covers selection, preparation, refresh, and the full upstream
 // response lifetime. Defers release it even if an executor panics.
 func (m *Manager) Execute(ctx context.Context, providers []string, req executor.Request, opts executor.Options) (executor.Response, error) {
-	ctx = withRefreshWaitBudget(ctx)
+	ctx = withTMXRequestBudgets(ctx)
 	if !m.tmxAdmissionEnabled() {
 		return m.executeWithoutAdmission(ctx, providers, req, opts)
 	}
@@ -150,7 +150,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req executor.
 	return m.executeWithoutAdmission(ctx, providers, req, opts)
 }
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req executor.Request, opts executor.Options) (executor.Response, error) {
-	ctx = withRefreshWaitBudget(ctx)
+	ctx = withTMXRequestBudgets(ctx)
 	if !m.tmxAdmissionEnabled() {
 		return m.executeCountWithoutAdmission(ctx, providers, req, opts)
 	}
@@ -160,7 +160,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req exec
 	return m.executeCountWithoutAdmission(ctx, providers, req, opts)
 }
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req executor.Request, opts executor.Options) (result *executor.StreamResult, err error) {
-	ctx = withRefreshWaitBudget(ctx)
+	ctx = withTMXRequestBudgets(ctx)
 	if !m.tmxAdmissionEnabled() {
 		return m.executeStreamWithoutAdmission(ctx, providers, req, opts)
 	}
