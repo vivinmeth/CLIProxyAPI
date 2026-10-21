@@ -24,7 +24,9 @@ func (s *Service) CloseContext(ctx context.Context) error {
 		due := a.Quota.ObservedAt.After(state.lastPassive)
 		s.mu.Unlock()
 		if due {
-			s.record(ctx, a.ID, spec.passive(a.Quota.Signals, a.Quota.ObservedAt), "passive", a.Quota.ObservedAt)
+			for _, r := range passiveReadings(a, spec, s.now()) {
+				s.record(ctx, a.ID, []Window{r.Window}, "passive", r.ObservedAt.UTC())
+			}
 			s.mu.Lock()
 			state.lastPassive = a.Quota.ObservedAt
 			s.mu.Unlock()
