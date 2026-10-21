@@ -109,7 +109,7 @@ var threadViewsSQL = []string{
 	ORDER BY session_id, thread_id, (role = 'subagent')`,
 	// Skills used: Skill tool calls (Claude Code, OpenCode), slash commands (Claude Code
 	// <command-name>), and skill files read (Codex / OpenCode load SKILL.md: a read tool or a
-	// shell command, not an edit; the skill is the directory holding SKILL.md, nested ones like
+	// shell command — not an edit, glob or grep; the skill is the directory holding SKILL.md, nested ones like
 	// skills/.system/imagegen included). Proxied twins of imported sessions are left out (the same
 	// calls would count twice). Trigger phrases in prose are a search away (items, kind = 'text',
 	// role = 'user').
@@ -126,10 +126,10 @@ var threadViewsSQL = []string{
 		SELECT i.session_id, i.seq, i.idx, i.ts, 'file',
 			substring(i.data::text from '/skills/(?:[^"]*/)?([^/"]+)/SKILL\.md')
 		FROM items i WHERE i.kind = 'tool_call' AND i.data::text LIKE '%/skills/%SKILL.md%'
-			AND lower(i.name) NOT IN ('write', 'edit', 'multiedit', 'apply_patch', 'str_replace_based_edit_tool',
-				'create_file', 'write_file', 'edit_file', 'patch')
+						AND lower(i.name) IN ('read', 'read_file', 'view', 'bash', 'shell', 'exec_command', 'local_shell_call',
+				'run_terminal_cmd')
 	) x JOIN sessions s ON s.id = x.session_id
-	WHERE s.shadowed_by IS NULL AND x.skill IS NOT NULL AND x.skill <> ''`,
+	WHERE s.shadowed_by IS NULL AND x.skill ~ '^[A-Za-z0-9][A-Za-z0-9._:-]*$'`,
 }
 
 // threadUsageSQL needs session_usage (requests mirror).
