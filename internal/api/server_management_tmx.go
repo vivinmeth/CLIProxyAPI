@@ -628,12 +628,18 @@ func tmxSessionList(c *gin.Context, a *archive.Archive) {
 		since = time.Unix(n, 0)
 	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
-	items, err := a.ListSessions(c.Request.Context(), c.Query("harness"), c.Query("machine"), since, limit)
-	if err != nil {
+	items, next, err := a.ListSessions(c.Request.Context(), c.Query("harness"), c.Query("machine"), since, limit,
+		strings.TrimSpace(c.Query("cursor")))
+	switch {
+	case errors.Is(err, archive.ErrBadCursor):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	case err != nil:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items})
+	// next: pass as ?cursor= for the following page; "" when this was the last.
+	c.JSON(http.StatusOK, gin.H{"items": items, "next": next})
 }
 
 func tmxSessionGet(c *gin.Context, a *archive.Archive) {
