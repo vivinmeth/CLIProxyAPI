@@ -946,3 +946,29 @@ func TestWriteErrorResponse_ContextCanceledUses499(t *testing.T) {
 		t.Fatalf("status = %d, want %d", recorder.Code, clienterror.StatusClientClosedRequest)
 	}
 }
+
+type upstreamRetryAfterTestError struct{ retryAfter time.Duration }
+
+func (e upstreamRetryAfterTestError) Error() string              { return "usage limit reached" }
+func (e upstreamRetryAfterTestError) StatusCode() int            { return http.StatusTooManyRequests }
+func (e upstreamRetryAfterTestError) RetryAfter() *time.Duration { return &e.retryAfter }
+
+func TestWriteErrorResponse_FirstUpstream429CarriesRetryAfter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      upstreamRetryAfterTestError{retryAfter: 2 * time.Hour},
+	})
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", recorder.Code)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "7200" {
+		t.Fatalf("Retry-After = %q, want 7200", got)
+	}
+}

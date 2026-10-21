@@ -29,8 +29,9 @@ func (resetsTestBackend) TmxSend(_ context.Context, _ *coreauth.Auth, method, ur
 	return 500, nil, nil
 }
 
-func (resetsTestBackend) TmxResetCooldown(context.Context, string) error { return nil }
-func (resetsTestBackend) TmxClearQuotaSignals(string) bool               { return true }
+func (resetsTestBackend) TmxClearRecoveredQuota(context.Context, string, coreauth.QuotaRecovery) error {
+	return nil
+}
 
 func TestTMXResetRoutesContract(t *testing.T) {
 	gin.SetMode(gin.TestMode)

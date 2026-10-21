@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"net/http"
 	"strings"
 
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
@@ -112,6 +113,12 @@ func observeClaudeStreamJSONPayload(payload []byte, hasDataPrefix bool, messageI
 }
 
 func observeClaudeSSEEvent(rawEvent []byte, messageID *string, completed *bool, streamErr *error) {
+	observeClaudeSSEEventWithHeaders(rawEvent, nil, false, messageID, completed, streamErr)
+}
+
+// observeClaudeSSEEventWithHeaders is observeClaudeSSEEvent with the response headers captured at
+// stream start, so an in-stream error is classified with the same quota semantics as over HTTP.
+func observeClaudeSSEEventWithHeaders(rawEvent []byte, headers http.Header, modelLevelCooling bool, messageID *string, completed *bool, streamErr *error) {
 	var dataLines [][]byte
 	for _, line := range bytes.Split(rawEvent, []byte("\n")) {
 		trimmed := bytes.TrimSpace(line)
@@ -136,8 +143,31 @@ func observeClaudeSSEEvent(rawEvent []byte, messageID *string, completed *bool, 
 	}
 	observeClaudeStreamJSONPayload(joined, true, messageID, completed)
 	if streamErr != nil && *streamErr == nil && gjson.ParseBytes(joined).Get("type").String() == "error" {
-		*streamErr = statusErr{code: 502, msg: string(joined)}
+		*streamErr = classifyClaudeStreamError(joined, headers, modelLevelCooling)
 	}
+}
+
+// claudeStatusOverloaded is Anthropic's non-standard "overloaded" status.
+const claudeStatusOverloaded = 529
+
+// classifyClaudeStreamError maps an SSE error event to the status the same refusal carries over
+// HTTP, so the auth manager applies the matching cooldown: a rate_limit_error is a 429 parsed with
+// the stream-start headers (window, reset, credential or model scope), overloaded_error a 529,
+// authentication/permission errors 401/403. Anything else stays a 502. The event has already been
+// forwarded, so this only decides cooldown and the client-visible error status; it never resumes
+// the turn on another credential.
+func classifyClaudeStreamError(payload []byte, headers http.Header, modelLevelCooling bool) error {
+	switch strings.TrimSpace(gjson.GetBytes(payload, "error.type").String()) {
+	case "rate_limit_error":
+		return classifyClaudeUpstreamErrorWithCooling(http.StatusTooManyRequests, headers, payload, modelLevelCooling)
+	case "overloaded_error":
+		return statusErr{code: claudeStatusOverloaded, msg: string(payload)}
+	case "authentication_error":
+		return statusErr{code: http.StatusUnauthorized, msg: string(payload)}
+	case "permission_error":
+		return statusErr{code: http.StatusForbidden, msg: string(payload)}
+	}
+	return statusErr{code: http.StatusBadGateway, msg: string(payload)}
 }
 
 func claudeMessageIDFromSSE(data []byte) string {

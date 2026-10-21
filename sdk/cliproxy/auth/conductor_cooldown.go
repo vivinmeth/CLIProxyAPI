@@ -1205,6 +1205,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						case 408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526:
 							state.NextRetryAfter = recoverableFailureRetryAfterWithHint(now, result.RetryAfter, disableCooling)
 							state.Unavailable = !state.NextRetryAfter.IsZero()
+						case statusOverloaded: // tmx
+							state.NextRetryAfter = overloadedFailureRetryAfter(now, result.RetryAfter, disableCooling)
+							state.Unavailable = !state.NextRetryAfter.IsZero()
 						default:
 							state.NextRetryAfter = recoverableFailureRetryAfter(now, disableCooling)
 							state.Unavailable = !state.NextRetryAfter.IsZero()
@@ -2745,6 +2748,10 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		case 408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526:
 			auth.StatusMessage = "transient upstream error"
 			auth.NextRetryAfter = recoverableFailureRetryAfterWithHint(now, retryAfter, disableCooling)
+			auth.Unavailable = !auth.NextRetryAfter.IsZero()
+		case statusOverloaded: // tmx
+			auth.StatusMessage = "transient upstream error"
+			auth.NextRetryAfter = overloadedFailureRetryAfter(now, retryAfter, disableCooling)
 			auth.Unavailable = !auth.NextRetryAfter.IsZero()
 		default:
 			if auth.StatusMessage == "" {

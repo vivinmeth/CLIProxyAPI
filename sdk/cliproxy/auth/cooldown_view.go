@@ -142,7 +142,7 @@ func cooldownErrorReason(err *Error) string {
 		return "not_found"
 	case 429:
 		return "quota"
-	case 408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526:
+	case 408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, statusOverloaded:
 		return "transient_error"
 	}
 	if err != nil {

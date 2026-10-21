@@ -329,6 +329,54 @@ func newCodexStatusErrWithCooling(statusCode int, body []byte, modelLevelCooling
 	return err
 }
 
+// newCodexHTTPStatusErr is newCodexStatusErrWithCooling for a refused HTTP response (request,
+// compact, images, websocket handshake). It folds the response headers into the backoff and
+// keeps the retry/quota headers on the error.
+//
+// Precedence for a 429 or 503:
+//   - usage_limit_reached (quota): the latest of the body's resets_at/resets_in_seconds, the
+//     reset of every window the X-Codex-* headers report exhausted, and Retry-After. A quota
+//     is gone until its last exhausted window resets, so the later deadline wins.
+//   - anything else (turn_rate_limit_exceeded, rate_limit_exceeded, model capacity, overload):
+//     a transient throttle, so the provider's Retry-After wins. Window resets are ignored.
+func newCodexHTTPStatusErr(statusCode int, headers http.Header, body []byte, modelLevelCooling bool) error {
+	err := newCodexStatusErrWithCooling(statusCode, body, modelLevelCooling)
+	err.retryAfter = codexHTTPRetryAfter(err.code, headers, []byte(err.msg), err.retryAfter, time.Now())
+	if kept := helps.CodexErrorResponseHeaders(headers); kept != nil {
+		return statusErrWithHeaders{statusErr: err, headers: kept}
+	}
+	return err
+}
+
+func codexHTTPRetryAfter(statusCode int, headers http.Header, body []byte, bodyRetryAfter *time.Duration, now time.Time) *time.Duration {
+	if statusCode != http.StatusTooManyRequests && statusCode != http.StatusServiceUnavailable {
+		return bodyRetryAfter
+	}
+	retryAt, hasRetryAfter := helps.ParseRetryAfterDeadline(headers, now)
+	if !isCodexUsageLimitError(body) {
+		if hasRetryAfter {
+			delay := retryAt.Sub(now)
+			return &delay
+		}
+		return bodyRetryAfter
+	}
+	var latest time.Time
+	if bodyRetryAfter != nil && *bodyRetryAfter > 0 {
+		latest = now.Add(*bodyRetryAfter)
+	}
+	if windowReset, ok := helps.CodexExhaustedWindowReset(headers, now); ok && windowReset.After(latest) {
+		latest = windowReset
+	}
+	if hasRetryAfter && retryAt.After(latest) {
+		latest = retryAt
+	}
+	if latest.IsZero() {
+		return bodyRetryAfter
+	}
+	delay := latest.Sub(now)
+	return &delay
+}
+
 func classifyCodexStatusError(statusCode int, body []byte) []byte {
 	code, errType, ok := codexStatusErrorClassification(statusCode, body)
 	if !ok {
