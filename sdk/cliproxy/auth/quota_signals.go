@@ -23,17 +23,9 @@ func ProviderSupportsQuotaObservation(provider string) bool {
 	}
 }
 
-// ObserveResponseHeadersForProvider replaces the passive quota snapshot with the
-// signals carried by the current upstream response.
-//
-// The snapshot is replaced rather than merged: a watermark such as Retry-After
-// or a "limit reached" flag only appears on the response that produced it, so
-// accumulating signals across responses would leave an expired value visible
-// indefinitely. Responses that carry no quota signal at all (transport
-// failures, 5xx, unrelated endpoints) leave the previous snapshot untouched.
-//
-// This function only ever touches ObservedAt and Signals. Cooldown and
-// scheduling fields are never read or written here.
+// ObserveResponseHeadersForProvider merges stable quota window fields while replacing
+// transient response evidence. Partial responses cannot erase another window's reset.
+// Cooldown and scheduling fields are never read or written here.
 func (q *QuotaState) ObserveResponseHeadersForProvider(provider string, headers http.Header, observedAt time.Time) bool {
 	if q == nil {
 		return false
@@ -48,18 +40,18 @@ func (q *QuotaState) ObserveResponseHeadersForProvider(provider string, headers 
 	if observedAt.IsZero() {
 		observedAt = time.Now()
 	}
-	q.Signals = next
-	q.ObservedAt = observedAt
+	q.mergeObservedSignals(next, observedAt)
 	return true
 }
 
 // ClearObservationSignals removes only passive observation data. It leaves
 // cooldown and scheduler state untouched.
 func (q *QuotaState) ClearObservationSignals() bool {
-	if q == nil || (len(q.Signals) == 0 && q.ObservedAt.IsZero()) {
+	if q == nil || (len(q.Signals) == 0 && len(q.SignalObservedAt) == 0 && q.ObservedAt.IsZero()) {
 		return false
 	}
 	q.Signals = nil
+	q.SignalObservedAt = nil
 	q.ObservedAt = time.Time{}
 	return true
 }
@@ -214,14 +206,24 @@ func isQuotaSignalHeaderForProvider(provider, name string) bool {
 	return false
 }
 
-// mergeQuotaObservation keeps the newest observation snapshot instead of
-// unioning signals captured at different times, so merging an older snapshot
-// can never resurrect a stale watermark.
+// mergeQuotaObservation preserves the freshest reading of each window field.
 func mergeQuotaObservation(target, source QuotaState) QuotaState {
-	if source.ObservedAt.IsZero() || source.ObservedAt.Before(target.ObservedAt) {
+	if source.ObservedAt.IsZero() {
 		return target
 	}
-	target.ObservedAt = source.ObservedAt
-	target.Signals = source.Clone().Signals
+	groups := map[time.Time]map[string]string{}
+	var times []time.Time
+	for key, value := range source.Signals {
+		at := source.SignalObservedTime(key)
+		if groups[at] == nil {
+			groups[at] = map[string]string{}
+			times = append(times, at)
+		}
+		groups[at][key] = value
+	}
+	sort.Slice(times, func(i, j int) bool { return times[i].Before(times[j]) })
+	for _, at := range times {
+		target.mergeObservedSignals(groups[at], at)
+	}
 	return target
 }

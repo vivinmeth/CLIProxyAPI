@@ -291,20 +291,21 @@ type QuotaState struct {
 	NextRecoverAt time.Time `json:"next_recover_at"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
-	// ObservedAt is the time the current Signals snapshot was observed.
-	ObservedAt time.Time `json:"observed_at,omitempty"`
-	// Signals stores bounded, provider-specific quota watermark values observed
-	// from upstream response headers or websocket quota events. It is a snapshot
-	// of one upstream response, not an accumulation across responses, so an
-	// expired watermark cannot linger after the response that produced it.
-	// Cooldown transitions must use applyCooldownFields so they cannot replace
-	// this snapshot.
-	Signals map[string]string `json:"signals,omitempty"`
+	// ObservedAt is the latest observation time; each retained field has its own clock.
+	ObservedAt       time.Time            `json:"observed_at,omitempty"`
+	Signals          map[string]string    `json:"signals,omitempty"`
+	SignalObservedAt map[string]time.Time `json:"signal_observed_at,omitempty"`
 }
 
 // Clone returns an independent copy of the quota state.
 func (q QuotaState) Clone() QuotaState {
 	copyQuota := q
+	if q.SignalObservedAt != nil {
+		copyQuota.SignalObservedAt = make(map[string]time.Time, len(q.SignalObservedAt))
+		for k, v := range q.SignalObservedAt {
+			copyQuota.SignalObservedAt[k] = v
+		}
+	}
 	if len(q.Signals) > 0 {
 		copyQuota.Signals = make(map[string]string, len(q.Signals))
 		for key, value := range q.Signals {

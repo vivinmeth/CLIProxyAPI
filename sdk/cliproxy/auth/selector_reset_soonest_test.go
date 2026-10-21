@@ -84,8 +84,8 @@ func TestWeeklyResetAtClaudePastReset(t *testing.T) {
 	past := now.Add(-time.Hour)
 	auth := observedAuth(t, "claude-a", "claude", claudeWeeklyHeaders(past, time.Time{}), now.Add(-7*24*time.Hour))
 	got, ok := weeklyResetAt(auth, now)
-	if !ok || !got.Equal(past) {
-		t.Fatalf("weeklyResetAt() = %v, %v; want %v, true", got, ok, past)
+	if ok {
+		t.Fatalf("weeklyResetAt() = %v, %v; past reset must be stale", got, ok)
 	}
 }
 

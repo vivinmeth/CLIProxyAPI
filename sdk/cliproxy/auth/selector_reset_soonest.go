@@ -76,6 +76,14 @@ const (
 func resetSoonestKey(auth *Auth, now time.Time) (int, time.Time) {
 	resetAt, ok := weeklyResetAt(auth, now)
 	if !ok {
+		// A rolled-over observation is stale, not a brand-new credential to probe.
+		if auth != nil {
+			for _, key := range []string{claudeWeeklyResetSignal, claudeWeeklyModelResetSignal, codexSecondaryResetAtSignal, codexPrimaryResetAtSignal, devinWeeklyResetSignal} {
+				if reset, valid := parseQuotaResetTimestamp(quotaSignalValue(auth.Quota.Signals, key)); valid && !reset.After(now) {
+					return resetSoonestRankPast, time.Time{}
+				}
+			}
+		}
 		return resetSoonestRankUnknown, time.Time{}
 	}
 	if !resetAt.After(now) {
@@ -118,8 +126,7 @@ func weeklyResetAt(auth *Auth, now time.Time) (time.Time, bool) {
 	if auth == nil || len(auth.Quota.Signals) == 0 {
 		return time.Time{}, false
 	}
-	signals := auth.Quota.Signals
-	observedAt := auth.Quota.ObservedAt
+	signals := auth.Quota.FreshSignals(now)
 
 	var candidates []time.Time
 	for _, name := range []string{claudeWeeklyResetSignal, claudeWeeklyModelResetSignal} {
@@ -127,10 +134,10 @@ func weeklyResetAt(auth *Auth, now time.Time) (time.Time, bool) {
 			candidates = append(candidates, resetAt)
 		}
 	}
-	if resetAt, ok := codexWindowResetAt(signals, observedAt, codexSecondaryResetAtSignal, codexSecondaryResetAfterSignal); ok {
+	if resetAt, ok := codexWindowResetAt(signals, auth.Quota.SignalObservedTime(codexSecondaryResetAfterSignal), codexSecondaryResetAtSignal, codexSecondaryResetAfterSignal); ok {
 		candidates = append(candidates, resetAt)
 	} else if minutes, okMinutes := parseQuotaInt(quotaSignalValue(signals, codexPrimaryWindowSignal)); okMinutes && minutes >= weeklyWindowMinutes {
-		if resetAtPrimary, okPrimary := codexWindowResetAt(signals, observedAt, codexPrimaryResetAtSignal, codexPrimaryResetAfterSignal); okPrimary {
+		if resetAtPrimary, okPrimary := codexWindowResetAt(signals, auth.Quota.SignalObservedTime(codexPrimaryResetAfterSignal), codexPrimaryResetAtSignal, codexPrimaryResetAfterSignal); okPrimary {
 			candidates = append(candidates, resetAtPrimary)
 		}
 	}
@@ -156,7 +163,7 @@ func weeklyResetAt(auth *Auth, now time.Time) (time.Time, bool) {
 	if !earliestFuture.IsZero() {
 		return earliestFuture, true
 	}
-	return latestPast, true
+	return time.Time{}, false
 }
 
 // codexWindowResetAt resolves a Codex window reset from its absolute reset-at signal or,
