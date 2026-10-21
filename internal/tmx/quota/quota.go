@@ -39,7 +39,7 @@ const (
 	pollNowMinGap   = 30 * time.Second
 	defaultSlowMins = 60
 
-	claudeUsageURL   = "https://api.anthropic.com/api/oauth/usage"
+	claudeUsageURL   = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"
 	claudeProfileURL = "https://api.anthropic.com/api/oauth/profile"
 )
 
@@ -161,6 +161,7 @@ type written struct {
 }
 
 type account struct {
+	polling chan struct{}
 	Account
 	current     map[string]Current
 	written     map[string]written
@@ -352,16 +353,30 @@ func (s *Service) tick(ctx context.Context) {
 			a.Label = label
 		}
 		observed := auth.Quota.ObservedAt
-		passiveWindows := spec.passive(auth.Quota.Signals, observed)
+		readings := passiveReadings(auth, spec, now)
+		passiveWindows := make([]Window, 0, len(readings))
+		for _, r := range readings {
+			passiveWindows = append(passiveWindows, r.Window)
+		}
 		passiveDue := !observed.IsZero() && observed.After(a.lastPassive)
 		fresh := s.passiveFresh(passiveWindows, observed, now)
+		for _, r := range readings {
+			if now.Sub(r.ObservedAt) >= s.pollEvery {
+				fresh = false
+			}
+		}
 		a.PassiveFresh = fresh
 		pollDue := s.pollDueLocked(a, passiveWindows, fresh, now)
+		if pollDue {
+			pollDue = s.reservePollLocked(a)
+		}
 		planDue := now.Sub(a.planAt) >= planEvery
 		s.mu.Unlock()
 
 		if passiveDue {
-			s.record(ctx, auth.ID, passiveWindows, "passive", observed.UTC())
+			for _, r := range readings {
+				s.record(ctx, auth.ID, []Window{r.Window}, "passive", r.ObservedAt.UTC())
+			}
 			s.mu.Lock()
 			a.lastPassive = observed
 			s.mu.Unlock()
@@ -390,17 +405,17 @@ func (s *Service) passiveFresh(windows []Window, observed, now time.Time) bool {
 // poll to slowEvery, unless a window only the usage API reports has passed its reset (its value is
 // then stale and must be re-read).
 func (s *Service) pollDueLocked(a *account, passiveWindows []Window, fresh bool, now time.Time) bool {
-	if now.Before(a.pauseUntil) {
+	if a.polling != nil || now.Before(a.pauseUntil) {
 		return false
 	}
 	if a.LastPollAt == nil {
 		return true
 	}
 	since := now.Sub(*a.LastPollAt)
-	if since < s.pollEvery {
+	if since < s.pollEvery+pollJitter(a.AuthID, s.pollEvery) {
 		return false
 	}
-	if !fresh || since >= s.slowEvery {
+	if !fresh || since >= s.slowEvery+pollJitter(a.AuthID, s.slowEvery) {
 		return true
 	}
 	covered := make(map[string]bool, len(passiveWindows))
@@ -416,10 +431,13 @@ func (s *Service) pollDueLocked(a *account, passiveWindows []Window, fresh bool,
 }
 
 func (s *Service) poll(ctx context.Context, spec providerSpec, auth *coreauth.Auth, a *account, planDue bool) {
+	defer s.finishPoll(a)
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	now := s.now().UTC()
-	status, body, err := s.fetch.TmxFetch(ctx, auth, spec.usageURL, spec.headers(auth))
+	status, body, err := ReadUsage(ctx, auth, func(readCtx context.Context) (int, []byte, error) {
+		return s.fetch.TmxFetch(readCtx, auth, spec.usageURL, spec.headers(auth))
+	})
 	var windows []Window
 	var usagePlan string
 	pollErr := ""
@@ -547,7 +565,19 @@ func (s *Service) PollNow(ctx context.Context, authID string) (Account, bool, er
 	}
 	throttled := now.Before(a.pauseUntil) || (a.LastPollAt != nil && now.Sub(*a.LastPollAt) < pollNowMinGap)
 	planDue := now.Sub(a.planAt) >= planEvery
+	waiting := a.polling
+	if !throttled && waiting == nil {
+		s.reservePollLocked(a)
+	}
 	s.mu.Unlock()
+	if waiting != nil {
+		select {
+		case <-ctx.Done():
+			return Account{}, true, ctx.Err()
+		case <-waiting:
+		}
+		throttled = true
+	}
 	if !throttled {
 		s.poll(ctx, spec, auth, a, planDue)
 	}
@@ -593,7 +623,7 @@ func (s *Service) viewLocked(a *account) Account {
 			if a.PassiveFresh {
 				every = s.slowEvery
 			}
-			next := a.LastPollAt.Add(every)
+			next := a.LastPollAt.Add(every + pollJitter(a.AuthID, every))
 			if a.pauseUntil.After(next) {
 				next = a.pauseUntil
 			}

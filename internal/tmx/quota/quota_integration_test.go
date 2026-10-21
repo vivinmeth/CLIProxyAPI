@@ -161,9 +161,9 @@ func TestQuotaServiceRecordsPassivePolledAndHistory(t *testing.T) {
 		t.Fatalf("no heartbeat rows written: %d", n)
 	}
 
-	// Rate limited: poll pauses for 30 minutes.
+	// Rate limited: poll pauses for 30 minutes. Advance beyond all account jitter.
 	f.status = 429
-	clock = clock.Add(10 * time.Minute)
+	clock = clock.Add(12 * time.Minute)
 	s.tick(ctx)
 	before := f.calls[claudeUsageURL]
 	clock = clock.Add(10 * time.Minute)
@@ -267,7 +267,7 @@ func TestQuotaSkipsPollWhenHeadersFresh(t *testing.T) {
 		t.Fatalf("polled despite fresh headers: %v", f.calls)
 	}
 	acc := s.Accounts()[0]
-	if !acc.PassiveFresh || acc.NextPollAt == nil || !acc.NextPollAt.Equal(time.Date(2026, 10, 20, 13, 0, 0, 0, time.UTC)) {
+	if !acc.PassiveFresh || acc.NextPollAt == nil || !acc.NextPollAt.Equal(time.Date(2026, 10, 20, 13, 0, 0, 0, time.UTC).Add(pollJitter(auth.ID, s.slowEvery))) {
 		t.Fatalf("fresh account = %+v", acc)
 	}
 	// 12:26: Fable passed its reset. Its reading is flagged stale and the next tick re-polls it.
