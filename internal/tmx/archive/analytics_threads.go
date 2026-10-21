@@ -123,11 +123,14 @@ var threadViewsSQL = []string{
 			substring(i.text from '<command-name>/?([^<]+)</command-name>')
 		FROM items i WHERE i.kind = 'text' AND i.role = 'user' AND i.text LIKE '%<command-name>%'
 		UNION ALL
-		SELECT i.session_id, i.seq, i.idx, i.ts, 'file',
-			substring(i.data::text from '/skills/(?:[^"]*/)?([^/"]+)/SKILL\.md')
-		FROM items i WHERE i.kind = 'tool_call' AND i.data::text LIKE '%/skills/%SKILL.md%'
-						AND lower(i.name) IN ('read', 'read_file', 'view', 'bash', 'shell', 'exec_command', 'local_shell_call',
-				'run_terminal_cmd')
+				SELECT i.session_id, i.seq, i.idx, i.ts, 'file', m[1]
+		FROM items i, regexp_matches(i.data::text, '/skills/(?:[^"/ ]+/)*?([^"/ ]+)/SKILL\.md', 'g') AS m
+		WHERE i.kind = 'tool_call' AND i.data::text LIKE '%/skills/%SKILL.md%'
+			AND (lower(i.name) IN ('read', 'read_file', 'view')
+				-- a shell command that reads; one that writes (redirect, tee, cp, mv, sed -i, heredoc)
+				-- creates or edits the skill
+				OR (lower(i.name) IN ('bash', 'shell', 'exec_command', 'local_shell_call', 'run_terminal_cmd')
+					AND i.data::text !~ '(>|\mtee\M|\mcp\M|\mmv\M|\minstall\M|sed -i|<<)'))
 	) x JOIN sessions s ON s.id = x.session_id
 	WHERE s.shadowed_by IS NULL AND x.skill ~ '^[A-Za-z0-9][A-Za-z0-9._:-]*$'`,
 }

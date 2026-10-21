@@ -35,7 +35,9 @@ func TestThreadsInAnalytics(t *testing.T) {
 	ingest("deleg-1", msg("d1", "assistant", `{"role":"assistant","content":"review"}`,
 		usage), msg("d2", "assistant", `{"role":"assistant","content":[`+
 		`{"type":"tool_use","id":"r","name":"Read","input":{"file_path":"/h/.codex/skills/.system/imagegen/SKILL.md"}},`+
-		`{"type":"tool_use","id":"w","name":"Write","input":{"file_path":"/h/.claude/skills/drafting/SKILL.md","content":"x"}}]}`, ""))
+		`{"type":"tool_use","id":"w","name":"Write","input":{"file_path":"/h/.claude/skills/drafting/SKILL.md","content":"x"}},`+
+		`{"type":"tool_use","id":"b","name":"Bash","input":{"command":"cat /h/skills/soul-loop/SKILL.md /h/skills/full-stop/SKILL.md"}},`+
+		`{"type":"tool_use","id":"c","name":"Bash","input":{"command":"cat > /h/skills/new-one/SKILL.md"}}]}`, ""))
 
 	merged := ts.Add(time.Hour)
 	batch := ThreadBatch{Source: "t3", Machine: "alien", Threads: []ThreadIngest{
@@ -83,7 +85,8 @@ func TestThreadsInAnalytics(t *testing.T) {
 		skills[s] = v
 	}
 	_ = rows.Close()
-	if len(skills) != 3 || skills["full-send"] != "tool" || skills["code-review"] != "command" || skills["imagegen"] != "file" {
+	if len(skills) != 5 || skills["full-send"] != "tool" || skills["code-review"] != "command" || skills["imagegen"] != "file" ||
+		skills["soul-loop"] != "file" || skills["full-stop"] != "file" {
 		t.Fatalf("skills = %v (an edited SKILL.md is not a use)", skills)
 	}
 	if err = an.db.QueryRow(`SELECT cost_usd FROM thread_usage WHERE thread_id = 't3:T2'`).Scan(&cost); err != nil || math.Abs(cost-4) > 1e-9 {
