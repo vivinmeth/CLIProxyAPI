@@ -56,6 +56,7 @@ type Store struct {
 
 	prices     atomic.Pointer[priceSnapshot]
 	stopPrices chan struct{}
+	spoolFile  string // pending-rows file, resolved once at Open (see spoolPath)
 }
 
 var current atomic.Pointer[Store]
@@ -130,6 +131,7 @@ func Open(ctx context.Context, dsn, schema string, retentionDays int) (*Store, e
 		queue:         make(chan Row, queueSize),
 		done:          make(chan struct{}),
 		stopPrices:    make(chan struct{}),
+		spoolFile:     spoolPath(),
 	}
 	if errSchema := s.ensureSchema(pingCtx); errSchema != nil {
 		_ = db.Close()
@@ -282,7 +284,7 @@ func (s *Store) run() {
 	defer prune.Stop()
 	s.prune()
 
-	w := &writer{s: s, pending: readSpool()}
+	w := &writer{s: s, pending: readSpool(s.spoolFile)}
 	w.spooled = len(w.pending) > 0
 	batch := make([]Row, 0, batchSize)
 	flush := func() {
@@ -350,6 +352,9 @@ func (w *writer) write(batch []Row) {
 	}()
 	if len(w.pending) == 0 || time.Now().Before(w.nextRetry) {
 		return
+	}
+	if w.delay > 0 { // retrying: save what is pending before possibly long database attempts
+		w.persistAt(time.Now())
 	}
 	backoff := func(err error) {
 		s.writeErrors.Add(1)
@@ -432,15 +437,17 @@ func spoolPath() string {
 	return filepath.Join(os.TempDir(), spoolFileName)
 }
 
-// spoolEvery: while rows are pending the spool is rewritten at most this often (a crash loses at
-// most this much of an outage's traffic; a long outage isn't rewritten on every flush).
+// spoolEvery: while rows are pending the spool is rewritten at most this often, before each
+// write attempt (a long outage isn't rewritten on every flush). A crash during an outage loses
+// the rows received since the last spool write: up to spoolEvery plus the batch being written.
+// When the database is healthy rows are never spooled; they live in memory for one flush.
 const spoolEvery = 10 * time.Second
 
 // persistAt mirrors the pending rows to the spool file (atomically) when they changed and the
 // last write is spoolEvery old (now zero = write regardless), or removes the file once nothing
 // is pending; readSpool loads it at the next start. A failed write stays dirty and is retried.
 func (w *writer) persistAt(now time.Time) {
-	path := spoolPath()
+	path := w.s.spoolFile
 	if len(w.pending) == 0 {
 		if !w.spooled && !w.dirty {
 			return
@@ -470,8 +477,8 @@ func (w *writer) persistAt(now time.Time) {
 	w.spooled, w.dirty, w.lastSpool = true, false, now
 }
 
-func readSpool() []Row {
-	raw, err := os.ReadFile(spoolPath())
+func readSpool(path string) []Row {
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}

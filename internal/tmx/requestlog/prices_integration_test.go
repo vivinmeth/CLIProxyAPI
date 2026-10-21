@@ -142,11 +142,11 @@ func TestWriterKeepsRowsWhileDatabaseIsDown(t *testing.T) {
 	if len(w.pending) != 1 || down.dropped.Load() != 0 {
 		t.Fatalf("pending=%d dropped=%d", len(w.pending), down.dropped.Load())
 	}
-	if raw, errR := os.ReadFile(spoolPath()); errR != nil || !strings.Contains(string(raw), `"kept"`) {
+	if raw, errR := os.ReadFile(down.spoolFile); errR != nil || !strings.Contains(string(raw), `"kept"`) {
 		t.Fatalf("spool = %q %v", raw, errR)
 	}
 	// "Crash" and restart: the spool is read back and written, then removed.
-	recovered := readSpool()
+	recovered := readSpool(down.spoolFile)
 	w2 := &writer{s: s, pending: recovered, spooled: len(recovered) > 0}
 	w2.write(nil)
 	// The same rows again (as if the first insert had committed without an acknowledgement).
@@ -157,7 +157,7 @@ func TestWriterKeepsRowsWhileDatabaseIsDown(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("spooled row written %d times", n)
 	}
-	if _, errS := os.Stat(spoolPath()); !os.IsNotExist(errS) {
+	if _, errS := os.Stat(s.spoolFile); !os.IsNotExist(errS) {
 		t.Fatalf("spool file left behind: %v", errS)
 	}
 }

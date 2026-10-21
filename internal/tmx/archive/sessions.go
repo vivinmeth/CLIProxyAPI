@@ -162,7 +162,10 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 	if viaProxy == nil {
 		var linked bool
 		if errLink := a.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM `+schema+`.exchanges
-			WHERE client_session_id = $1 OR session_id = $1)`, in.ExternalID).Scan(&linked); errLink == nil && linked {
+			WHERE client_session_id = $1 OR session_id = $1)`, in.ExternalID).Scan(&linked); errLink != nil {
+			// Guessing "not proxied" would count proxied traffic twice.
+			return nil, fmt.Errorf("proxied traffic lookup: %w", errLink)
+		} else if linked {
 			viaProxy = &linked
 		}
 	}
