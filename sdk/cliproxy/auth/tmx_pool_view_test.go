@@ -29,7 +29,7 @@ func TestPoolViewMatchesLiveAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	live, err := m.tmxPickWithAdmission(context.Background(), func(ctx context.Context) (refreshSelection, error) {
+	live, err := m.tmxPickWithAdmission(context.Background(), executor.Options{}, func(ctx context.Context) (refreshSelection, error) {
 		a, err := selector.Pick(ctx, "claude", "claude-sonnet-5", executor.Options{}, auths)
 		return refreshSelection{auth: a}, err
 	})

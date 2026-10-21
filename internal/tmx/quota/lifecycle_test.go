@@ -30,7 +30,9 @@ func TestQuotaCloseCancelsPollAndFlushesFinalPassive(t *testing.T) {
 	f := &fakeFetcher{calls: map[string]int{}}
 	s := openTestService(t, f, &now)
 	observed := now.Add(time.Second)
-	blocking := blockingLifecycleFetcher{make(chan struct{}), &auth.Auth{ID: "closing-account", Provider: "claude", Metadata: map[string]any{"access_token": "synthetic"}}}
+	// Unique per run: a reused ID finds its earlier rows and is not polled again.
+	id := "closing-account-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	blocking := blockingLifecycleFetcher{make(chan struct{}), &auth.Auth{ID: id, Provider: "claude", Metadata: map[string]any{"access_token": "synthetic"}}}
 	s.fetch = blocking
 	s.loopCtx, s.loopCancel = context.WithCancel(context.Background())
 	s.loopDone = make(chan struct{})
@@ -46,7 +48,7 @@ func TestQuotaCloseCancelsPollAndFlushesFinalPassive(t *testing.T) {
 		t.Fatal(err)
 	}
 	var count int
-	if err := s.db.QueryRow(`SELECT count(*) FROM ` + s.table + ` WHERE auth_id='closing-account' AND source='passive'`).Scan(&count); err != nil || count == 0 {
+	if err := s.db.QueryRow(`SELECT count(*) FROM ` + s.table + ` WHERE auth_id=$1 AND source='passive'`, id).Scan(&count); err != nil || count == 0 {
 		t.Fatalf("final passive flush rows=%d err=%v", count, err)
 	}
 }
