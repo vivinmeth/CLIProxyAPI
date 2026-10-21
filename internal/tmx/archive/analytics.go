@@ -195,7 +195,9 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 		`ALTER TABLE items ADD COLUMN IF NOT EXISTS data JSONB`,
 		`CREATE INDEX IF NOT EXISTS messages_external_idx ON messages (session_id, external_id)`,
 		`CREATE INDEX IF NOT EXISTS items_kind_name_idx ON items (kind, name)`,
-		`CREATE INDEX IF NOT EXISTS items_call_idx ON items (call_id) WHERE call_id <> ''`,
+		`DROP INDEX IF EXISTS items_call_idx`,
+		// Joins a tool_call to its tool_result within the session.
+		`CREATE INDEX IF NOT EXISTS items_session_call_idx ON items (session_id, call_id) WHERE call_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS items_ts_idx ON items (ts)`,
 		`CREATE TABLE IF NOT EXISTS failed (
 			journal_id BIGINT PRIMARY KEY,
