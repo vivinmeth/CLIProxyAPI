@@ -48,6 +48,7 @@ const (
 	analyticsVersion  = 2
 	journalTable      = schema + ".analytics_journal"
 	journalBatch      = 1000
+	sessionBatch      = 100 // imported sessions per step (see step)
 	analyticsPoll     = 3 * time.Second
 	prefetchChunkMsgs = 5000
 	maxAttempts       = 3
@@ -371,9 +372,15 @@ func (an *analytics) step() (bool, error) {
 
 	// The journal is a queue: processed entries are deleted. (A cursor over the BIGSERIAL id
 	// would skip entries whose transaction commits after a later id's.) Failed entries back off
-	// and don't hold up the rest.
-	rows, err := an.a.db.QueryContext(ctx, `SELECT id, kind, ref, attempts FROM `+journalTable+`
-		WHERE not_before IS NULL OR not_before <= now() ORDER BY id LIMIT $1`, journalBatch)
+	// and don't hold up the rest. Cheap live entries (usage rows, exchanges) go first; imported
+	// sessions, which can take seconds each, come at most sessionBatch per step, so a bulk
+	// import or backfill never holds live usage back for long.
+	rows, err := an.a.db.QueryContext(ctx, `(SELECT id, kind, ref, attempts FROM `+journalTable+`
+			WHERE kind <> 'session' AND (not_before IS NULL OR not_before <= now()) ORDER BY id LIMIT $1)
+		UNION ALL
+		(SELECT id, kind, ref, attempts FROM `+journalTable+`
+			WHERE kind = 'session' AND (not_before IS NULL OR not_before <= now()) ORDER BY id LIMIT $2)`,
+		journalBatch, sessionBatch)
 	if err != nil {
 		return false, err
 	}
@@ -392,6 +399,13 @@ func (an *analytics) step() (bool, error) {
 	if len(entries) == 0 {
 		return false, nil
 	}
+	nSessions := 0
+	for _, e := range entries {
+		if e.kind == "session" {
+			nSessions++
+		}
+	}
+	more := len(entries)-nSessions == journalBatch || nSessions == sessionBatch
 
 	// Collapse the batch: work is state-based, so each session is processed once.
 	var traces, requestIDs []string
@@ -499,7 +513,7 @@ func (an *analytics) step() (bool, error) {
 		}
 		an.processed.Add(int64(len(done)))
 	}
-	return len(entries) == journalBatch, nil
+	return more, nil
 }
 
 // buildDeferredIndexes rebuilds the trigram index after a backfill has drained the journal.

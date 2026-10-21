@@ -204,20 +204,10 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 	res.Created = created
 
 	for _, p := range prep {
-		var old string
-		errOld := tx.QueryRowContext(ctx, `SELECT message FROM `+schema+`.session_messages
-			WHERE session_id = $1 AND external_id = $2`, id, p.m.ExternalID).Scan(&old)
-		switch {
-		case errors.Is(errOld, sql.ErrNoRows):
-			res.Inserted++
-		case errOld != nil:
-			return nil, errOld
-		case old == p.hash:
-			res.Unchanged++
-		default:
-			res.Updated++
-		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO `+schema+`.session_messages (session_id,
+		// The upsert says what happened: a new row, a changed one (body, position, usage or
+		// metadata), or nothing (no row returned).
+		var inserted bool
+		errUp := tx.QueryRowContext(ctx, `INSERT INTO `+schema+`.session_messages (session_id,
 			external_id, seq, parent_id, ts, role, model, message, usage, metadata)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 			ON CONFLICT (session_id, external_id) DO UPDATE SET seq = EXCLUDED.seq,
@@ -227,10 +217,19 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 			WHERE session_messages.message IS DISTINCT FROM EXCLUDED.message
 				OR session_messages.seq IS DISTINCT FROM EXCLUDED.seq
 				OR session_messages.usage IS DISTINCT FROM EXCLUDED.usage
-				OR session_messages.metadata IS DISTINCT FROM EXCLUDED.metadata`,
+								OR session_messages.metadata IS DISTINCT FROM EXCLUDED.metadata
+			RETURNING (xmax = 0)`,
 			id, p.m.ExternalID, p.m.Seq, p.m.ParentID, timePtr(p.m.TS), p.m.Role, p.m.Model, p.hash,
-			nullJSON(p.m.Usage), rawOrEmpty(p.m.Metadata, "{}")); err != nil {
-			return nil, fmt.Errorf("message %q: %w", p.m.ExternalID, err)
+			nullJSON(p.m.Usage), rawOrEmpty(p.m.Metadata, "{}")).Scan(&inserted)
+		switch {
+		case errors.Is(errUp, sql.ErrNoRows):
+			res.Unchanged++
+		case errUp != nil:
+			return nil, fmt.Errorf("message %q: %w", p.m.ExternalID, errUp)
+		case inserted:
+			res.Inserted++
+		default:
+			res.Updated++
 		}
 	}
 	if in.Replace {

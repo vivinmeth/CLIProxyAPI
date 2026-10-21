@@ -111,3 +111,21 @@ func TestImportUsageSharesTheTransaction(t *testing.T) {
 		t.Fatal("archive committed without its usage rows")
 	}
 }
+
+// A re-sent message whose only change is its usage counts as updated, not unchanged.
+func TestResendWithChangedUsageCountsAsUpdated(t *testing.T) {
+	a, _ := openTestArchive(t)
+	ctx := context.Background()
+	ts := time.Date(2026, 10, 20, 10, 0, 0, 0, time.UTC)
+	in := SessionIngest{Harness: "claude-code", ExternalID: "resend", Messages: []MessageIngest{usageMsg("m1", 1, ts, u1)}}
+	if _, err := a.IngestSession(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := a.IngestSession(ctx, in); err != nil || res.Unchanged != 1 || res.Updated != 0 {
+		t.Fatalf("identical re-send = %+v %v", res, err)
+	}
+	in.Messages[0].Usage = json.RawMessage(`{"provider":"anthropic","model":"claude-opus-5-5","uncached_input":11,"output":5}`)
+	if res, err := a.IngestSession(ctx, in); err != nil || res.Updated != 1 || res.Unchanged != 0 {
+		t.Fatalf("usage-only change = %+v %v", res, err)
+	}
+}
