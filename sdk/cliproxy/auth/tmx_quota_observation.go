@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -64,7 +63,6 @@ func (q *QuotaState) mergeObservedSignals(next map[string]string, at time.Time) 
 		times[key] = old.SignalObservedTime(key)
 	}
 	for key, value := range next {
-		key = http.CanonicalHeaderKey(key)
 		if !stableQuotaSignal(key) && at.Before(old.ObservedAt) {
 			continue
 		}

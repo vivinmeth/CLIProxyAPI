@@ -57,3 +57,30 @@ func TestQuotaMergePreservesWindowClocksAndExpiresEvidence(t *testing.T) {
 		t.Fatal("clone aliases timestamps")
 	}
 }
+
+func TestExternalQuotaObservationFreshness(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	m := NewManager(nil, &ResetSoonestSelector{}, nil)
+	_, err := m.Register(context.Background(), &Auth{ID: "external", Provider: "claude", Status: StatusActive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	used := 99.0
+	if !m.ApplyQuotaObservation("external", "claude", []QuotaWindowObservation{{Window: "7d", UsedPercent: &used, ResetsAt: now.Add(time.Hour), ObservedAt: now}}) {
+		t.Fatal("fresh poll ignored")
+	}
+	used = 1
+	m.ApplyQuotaObservation("external", "claude", []QuotaWindowObservation{{Window: "7d", UsedPercent: &used, ResetsAt: now.Add(24 * time.Hour), ObservedAt: now.Add(-time.Minute)}, {Window: "5h", UsedPercent: &used, ResetsAt: now.Add(time.Hour), ObservedAt: now.Add(-time.Minute)}})
+	a, _ := m.GetByID("external")
+	if a.Quota.Signals["Anthropic-Ratelimit-Unified-7d-Utilization"] != "0.99" || a.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Utilization"] != "0.01" {
+		t.Fatalf("field freshness: %v", a.Quota.Signals)
+	}
+	if m.ApplyQuotaObservation("external", "codex", []QuotaWindowObservation{{Window: "7d", ResetsAt: now.Add(time.Hour), ObservedAt: now}}) {
+		t.Fatal("provider mismatch applied")
+	}
+	for _, w := range []QuotaWindowObservation{{Window: "7d", ResetsAt: now.Add(time.Hour), ObservedAt: now.Add(-7 * time.Hour)}, {Window: "7d", ResetsAt: now.Add(-time.Hour), ObservedAt: now}} {
+		if m.ApplyQuotaObservation("external", "claude", []QuotaWindowObservation{w}) {
+			t.Fatal("stale reading applied")
+		}
+	}
+}

@@ -18,7 +18,7 @@ import (
 
 const tmxMaxSummaryRange = 400 * 24 * time.Hour
 
-func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher) {
+func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher, observers ...quota.RoutingObserver) {
 	v8.GET("/tmx/requests/summary", tmxRequestSummary)
 	v8.GET("/tmx/requests", tmxRequestList)
 	v8.GET("/tmx/requests/rollup", tmxRequestRollup)
@@ -27,7 +27,7 @@ func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher) {
 	v8.POST("/tmx/requests/key-machines", tmxKeyMachinesSet)
 	registerTMXArchiveRoutes(v8)
 	if store := requestlog.Default(); store != nil {
-		quota.Start(store.DB(), store.Schema(), fetcher)
+		quota.Start(store.DB(), store.Schema(), fetcher, observers...)
 	}
 	v8.GET("/tmx/quota/current", tmxQuotaCurrent)
 	v8.GET("/tmx/quota/history", tmxQuotaHistory)

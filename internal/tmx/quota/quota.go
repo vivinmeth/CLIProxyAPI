@@ -173,7 +173,13 @@ type account struct {
 }
 
 // Service collects and stores quota snapshots.
+type RoutingObserver interface {
+	ApplyQuotaObservation(authID, provider string, windows []coreauth.QuotaWindowObservation) bool
+}
+
 type Service struct {
+	observer  RoutingObserver
+	seeded    map[string]uint64
 	db        *sql.DB
 	table     string
 	fetch     Fetcher
@@ -199,7 +205,7 @@ func Default() *Service {
 
 // Start creates the table and the collection loop once. db is the request-log database; schema
 // its schema ("tmx"). TMX_QUOTA=off disables it.
-func Start(db *sql.DB, schema string, fetch Fetcher) *Service {
+func Start(db *sql.DB, schema string, fetch Fetcher, observers ...RoutingObserver) *Service {
 	defaultMu.Lock()
 	defer defaultMu.Unlock()
 	if current != nil || db == nil || fetch == nil {
@@ -209,7 +215,7 @@ func Start(db *sql.DB, schema string, fetch Fetcher) *Service {
 		log.Info("tmx quota: disabled (TMX_QUOTA=off)")
 		return nil
 	}
-	s, err := newService(context.Background(), db, schema, fetch)
+	s, err := newService(context.Background(), db, schema, fetch, observers...)
 	if err != nil {
 		log.WithError(err).Warn("tmx quota: not started")
 		return nil
@@ -220,7 +226,7 @@ func Start(db *sql.DB, schema string, fetch Fetcher) *Service {
 	return s
 }
 
-func newService(ctx context.Context, db *sql.DB, schema string, fetch Fetcher) (*Service, error) {
+func newService(ctx context.Context, db *sql.DB, schema string, fetch Fetcher, observers ...RoutingObserver) (*Service, error) {
 	poll := defaultPollMins
 	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("TMX_QUOTA_POLL_MINUTES"))); err == nil && n >= 2 {
 		poll = n
@@ -232,6 +238,10 @@ func newService(ctx context.Context, db *sql.DB, schema string, fetch Fetcher) (
 	s := &Service{db: db, table: schema + ".quota_snapshots", fetch: fetch,
 		pollEvery: time.Duration(poll) * time.Minute, slowEvery: time.Duration(slow) * time.Minute,
 		now: time.Now, accounts: map[string]*account{}}
+	s.seeded = map[string]uint64{}
+	if len(observers) > 0 {
+		s.observer = observers[0]
+	}
 	for _, stmt := range []string{
 		`CREATE TABLE IF NOT EXISTS ` + s.table + ` (
 			id         BIGSERIAL PRIMARY KEY,
@@ -256,6 +266,7 @@ func newService(ctx context.Context, db *sql.DB, schema string, fetch Fetcher) (
 	if err := s.loadLatest(ctx); err != nil {
 		return nil, err
 	}
+	s.seedRouting()
 	return s, nil
 }
 
@@ -317,6 +328,7 @@ func (s *Service) loop() {
 
 // tick reads passive signals for every account and polls the ones that are due.
 func (s *Service) tick(ctx context.Context) {
+	s.seedRouting()
 	now := s.now()
 	seen := map[string]bool{}
 	defer func() {
@@ -451,6 +463,7 @@ func (s *Service) poll(ctx context.Context, spec providerSpec, auth *coreauth.Au
 		log.WithField("auth_id", auth.ID).Debugf("tmx quota: poll failed: %s", pollErr)
 		return
 	}
+	s.applyRouting(auth.ID, auth.Provider, windows, now)
 	s.record(ctx, auth.ID, windows, "polled", now)
 }
 
