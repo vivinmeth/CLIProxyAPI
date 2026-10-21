@@ -759,7 +759,8 @@ func (an *analytics) writeSession(ctx context.Context, s sessionRow, msgs []msgR
 	for first < len(msgs) && existing[first] == msgs[first].digest && existing[first] != "" {
 		first++
 	}
-	unchanged := first == len(msgs) && len(existing) == len(msgs)
+	sameVersion := !storedVersion.Valid || storedVersion.Int64 == analyticsVersion
+	unchanged := sameVersion && first == len(msgs) && len(existing) == len(msgs)
 
 	tx, err := an.db.BeginTx(ctx, nil)
 	if err != nil {

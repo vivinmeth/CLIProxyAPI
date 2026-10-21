@@ -171,6 +171,16 @@ func TestAnalyticsCostsLinksAndVersion(t *testing.T) {
 	if before == after || count(t, an, `SELECT version FROM sessions WHERE id = 'claude-code:cc-cost'`) != analyticsVersion {
 		t.Fatalf("old-version session not rewritten (xmin %s -> %s)", before, after)
 	}
+	// An old-version session whose transcript is now empty loses its old rows too.
+	if _, err := an.db.Exec(`UPDATE sessions SET version = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := an.writeSession(ctx, sessionRow{id: "claude-code:cc-cost", kind: "imported"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, an, `SELECT count(*) FROM messages WHERE session_id = 'claude-code:cc-cost'`); n != 0 {
+		t.Fatalf("emptied old-version session kept %d messages", n)
+	}
 }
 
 // A blob indexed after the upload pass read the spool must stay spooled (and go up next pass),

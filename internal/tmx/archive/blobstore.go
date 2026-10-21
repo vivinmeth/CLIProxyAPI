@@ -51,6 +51,9 @@ type BlobStore struct {
 	known     *lruSet
 	cache     *blobCache
 	lastSweep time.Time // upload loop only
+	// hashLocks serialise Put's spool write + index insert with the uploader's removal of an
+	// unindexed spool file of the same hash (striped by hash).
+	hashLocks [64]sync.Mutex
 	kick      chan struct{}
 	stopped   chan struct{}
 	stop      chan struct{}
@@ -130,6 +133,9 @@ func (b *BlobStore) Put(ctx context.Context, data []byte, mediaType, kind string
 		return hash, nil
 	}
 	compressed := b.enc.EncodeAll(data, nil)
+	lock := b.hashLock(hash)
+	lock.Lock()
+	defer lock.Unlock()
 	path := b.spoolPath(hash)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, compressed, 0o640); err != nil {
@@ -407,13 +413,32 @@ func (b *BlobStore) settleSpooled(hashes []string, indexed map[string]bool) {
 			_ = os.Remove(b.spoolPath(h))
 			continue
 		}
-		if st, err := os.Stat(b.spoolPath(h)); err == nil && time.Since(st.ModTime()) > strayAge {
-			var exists bool
-			if b.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM `+b.schema+`.blobs WHERE hash = $1)`, h).Scan(&exists) == nil && !exists {
-				_ = os.Remove(b.spoolPath(h))
-			}
-		}
+		b.removeStray(h)
 	}
+}
+
+// removeStray removes an unindexed spool file old enough to be from a Put that failed, under the
+// hash's lock so a concurrent Put of the same bytes can't lose its fresh file.
+func (b *BlobStore) removeStray(h string) {
+	lock := b.hashLock(h)
+	lock.Lock()
+	defer lock.Unlock()
+	st, err := os.Stat(b.spoolPath(h))
+	if err != nil || time.Since(st.ModTime()) <= strayAge {
+		return
+	}
+	var exists bool
+	if b.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM `+b.schema+`.blobs WHERE hash = $1)`, h).Scan(&exists) == nil && !exists {
+		_ = os.Remove(b.spoolPath(h))
+	}
+}
+
+func (b *BlobStore) hashLock(h string) *sync.Mutex {
+	var n byte
+	if len(h) > 0 {
+		n = h[len(h)-1]
+	}
+	return &b.hashLocks[int(n)%len(b.hashLocks)]
 }
 
 // uploadOne stores a single blob as its own object (legacy layout, used for very large blobs).
