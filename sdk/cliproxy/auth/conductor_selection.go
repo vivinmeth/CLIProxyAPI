@@ -1490,7 +1490,8 @@ func isCredentialRetryRoundStatus(status int) bool {
 		http.StatusInternalServerError,
 		http.StatusBadGateway,
 		http.StatusServiceUnavailable,
-		http.StatusGatewayTimeout:
+		http.StatusGatewayTimeout,
+		statusOverloaded: // tmx
 		return true
 	default:
 		return false
