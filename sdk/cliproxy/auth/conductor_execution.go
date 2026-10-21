@@ -173,7 +173,7 @@ func (m *Manager) executeWithoutAdmission(ctx context.Context, providers []strin
 				return resp, nil
 			}
 		}
-		return cliproxyexecutor.Response{}, lastErr
+		return cliproxyexecutor.Response{}, m.withPoolRetryAfter(ctx, lastErr, normalized, retryModel, opts)
 	}
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
@@ -225,7 +225,7 @@ func (m *Manager) executeCountWithoutAdmission(ctx context.Context, providers []
 			}
 		}
 		lastErr = preferredExecutionAttemptError(lastErr, preferredUpstreamErr)
-		return cliproxyexecutor.Response{}, unwrapExecutionBoundaryError(lastErr)
+		return cliproxyexecutor.Response{}, m.withPoolRetryAfter(ctx, unwrapExecutionBoundaryError(lastErr), normalized, retryModel, opts)
 	}
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
@@ -310,6 +310,7 @@ func (m *Manager) executeStreamWithoutAdmission(ctx context.Context, providers [
 				return result, nil
 			}
 		}
+		lastErr = m.withPoolRetryAfter(ctx, lastErr, normalized, retryModel, opts)
 		var bootstrapErr *streamBootstrapError
 		if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
 			return streamErrorResult(bootstrapErr.Headers(), lastErr), nil
