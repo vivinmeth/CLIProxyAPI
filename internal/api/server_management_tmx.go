@@ -281,8 +281,9 @@ func tmxRequestRollup(c *gin.Context) {
 		"rows": rows, "truncated": truncated})
 }
 
-// tmxRequestSessions: GET /tmx/requests/sessions?from&to&order=tokens|recent&limit plus the shared
-// filters — per-session totals, largest first (limit ≤ 1000, default 100).
+// tmxRequestSessions: GET /tmx/requests/sessions?from&to&order=tokens|recent&limit&cursor plus the
+// shared filters — per-session totals, largest first (limit ≤ 1000, default 100). next: pass it
+// back as ?cursor= (same filters and order) for the following page; "" when this was the last.
 func tmxRequestSessions(c *gin.Context) {
 	store := requestlog.Default()
 	if store == nil {
@@ -294,12 +295,17 @@ func tmxRequestSessions(c *gin.Context) {
 		return
 	}
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
-	sessions, err := store.SessionTotals(c.Request.Context(), f, strings.TrimSpace(c.Query("order")), limit)
-	if err != nil {
+	sessions, next, err := store.SessionTotals(c.Request.Context(), f, strings.TrimSpace(c.Query("order")), limit,
+		strings.TrimSpace(c.Query("cursor")))
+	switch {
+	case errors.Is(err, requestlog.ErrBadCursor):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	case err != nil:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"enabled": true, "sessions": sessions})
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "sessions": sessions, "next": next})
 }
 
 // tmxKeyMachinesSet: POST /tmx/requests/key-machines {"keys":[{"api_key_hash","machine"}]} —
@@ -563,12 +569,18 @@ func tmxCommitList(c *gin.Context, a *archive.Archive) {
 		since = time.Unix(n, 0)
 	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
-	items, err := a.ListCommits(c.Request.Context(), c.Query("repo"), c.Query("machine"), since, limit)
-	if err != nil {
+	items, next, err := a.ListCommits(c.Request.Context(), archive.CommitQuery{Repo: c.Query("repo"),
+		Machine: c.Query("machine"), SessionID: c.Query("session_id"), ThreadID: c.Query("thread_id"),
+		Since: since, Limit: limit, Cursor: strings.TrimSpace(c.Query("cursor"))})
+	switch {
+	case errors.Is(err, archive.ErrBadCursor):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	case err != nil:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items})
+	c.JSON(http.StatusOK, gin.H{"items": items, "next": next})
 }
 
 func tmxCommitDelete(c *gin.Context, a *archive.Archive) {
@@ -611,12 +623,18 @@ func tmxThreadList(c *gin.Context, a *archive.Archive) {
 		since = time.Unix(n, 0)
 	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
-	items, err := a.ListThreads(c.Request.Context(), c.Query("source"), c.Query("machine"), since, limit)
-	if err != nil {
+	items, next, err := a.ListThreads(c.Request.Context(), archive.ThreadQuery{Source: c.Query("source"),
+		Machine: c.Query("machine"), Since: since, Limit: limit, Cursor: strings.TrimSpace(c.Query("cursor")),
+		WithSessions: c.Query("include") == "sessions"})
+	switch {
+	case errors.Is(err, archive.ErrBadCursor):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	case err != nil:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items})
+	c.JSON(http.StatusOK, gin.H{"items": items, "next": next})
 }
 
 func tmxThreadGet(c *gin.Context, a *archive.Archive) {
@@ -698,12 +716,24 @@ func tmxArchiveStorage(c *gin.Context, a *archive.Archive) {
 	}
 }
 
-// tmxConversation: GET /tmx/archive/conversation?session_id=&harness=&trace_id=&kind=proxy|imported — a session
-// rebuilt for reading (imported transcript, or the proxied session's fullest captured request plus
-// its response), normalised to role/kind/text items.
+// tmxConversation: GET /tmx/archive/conversation?session_id=&harness=&trace_id=&kind=proxy|imported&offset=&limit=
+// — a session rebuilt for reading (imported transcript, or the proxied session's fullest captured
+// request plus its response), normalised to role/kind/text items, at most 4000 a page. Without
+// offset: the start of a transcript, the latest items of a proxied session; next_offset > 0 says
+// more items follow.
 func tmxConversation(c *gin.Context, a *archive.Archive) {
-	conv, err := a.Conversation(c.Request.Context(), c.Query("session_id"), strings.TrimSpace(c.Query("harness")),
-		strings.TrimSpace(c.Query("trace_id")), strings.TrimSpace(c.Query("kind")))
+	page := archive.ConvPage{Offset: -1}
+	if raw := strings.TrimSpace(c.Query("offset")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "offset must be a non-negative integer"})
+			return
+		}
+		page.Offset = n
+	}
+	page.Limit, _ = strconv.Atoi(c.Query("limit"))
+	conv, err := a.ConversationPage(c.Request.Context(), c.Query("session_id"), strings.TrimSpace(c.Query("harness")),
+		strings.TrimSpace(c.Query("trace_id")), strings.TrimSpace(c.Query("kind")), page)
 	switch {
 	case errors.Is(err, archive.ErrNoConversation):
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})

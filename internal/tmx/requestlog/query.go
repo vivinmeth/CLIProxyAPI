@@ -2,7 +2,10 @@ package requestlog
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -433,49 +436,100 @@ type SessionTotal struct {
 
 // SessionTotals returns per-session totals for rows matching f, largest total_tokens first (or
 // most recent first with order "recent"). Rows without a session id are skipped. Cost is the sum
-// of each row's stored list price.
-func (s *Store) SessionTotals(ctx context.Context, f Filter, order string, limit int) ([]SessionTotal, error) {
+// of each row's stored list price. A page at a time: pass the returned next cursor back (with the
+// same filter and order) for the following page ("" = no more).
+func (s *Store) SessionTotals(ctx context.Context, f Filter, order string, limit int, cursor string) ([]SessionTotal, string, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	where, args := f.where()
-	orderBy := "sum(total_tokens) DESC"
-	if order == "recent" {
-		orderBy = "max(ts) DESC"
+	recent := order == "recent"
+	key := "COALESCE(sum(total_tokens), 0)"
+	if recent {
+		key = "max(ts)"
 	}
-	args = append(args, limit)
+	where, args := f.where()
+	after := ""
+	if cursor != "" {
+		k, id, err := decodeSessionCursor(cursor, recent)
+		if err != nil {
+			return nil, "", err
+		}
+		args = append(args, k, id)
+		after = fmt.Sprintf(` WHERE (k, session_id) < ($%d, $%d)`, len(args)-1, len(args))
+	}
+	args = append(args, limit+1)
 	agg := func(col string) string {
 		return "COALESCE(array_agg(DISTINCT " + col + ") FILTER (WHERE " + col + " <> ''), '{}')"
 	}
-	q := `SELECT session_id, min(ts), max(ts), ` + agg("model") + `, ` + agg("auth_id") + `, ` +
+	q := `SELECT * FROM (SELECT session_id, min(ts), max(ts), ` + agg("model") + `, ` + agg("auth_id") + `, ` +
 		agg("machine") + `, ` + agg("source") + `, ` + agg("api_key_hash") + `, ` + agg("harness") + `,
 		count(*), count(*) FILTER (WHERE outcome = 'success'), count(*) FILTER (WHERE outcome = 'failed'),
 		count(*) FILTER (WHERE outcome = 'canceled'), count(*) FILTER (WHERE outcome = 'rejected'),
 		COALESCE(sum(uncached_input), 0), COALESCE(sum(cache_read), 0),
 		COALESCE(sum(cache_write), 0), COALESCE(sum(output_non_reasoning), 0), COALESCE(sum(reasoning_tokens), 0),
 		COALESCE(sum(total_tokens), 0), count(*) FILTER (WHERE accounting_quality NOT IN ('complete', '')),
-		COALESCE(sum(cache_write_1h), 0),` + costSelect + `
-		FROM ` + s.table() + where + ` AND session_id <> '' GROUP BY session_id ORDER BY ` + orderBy +
-		fmt.Sprintf(` LIMIT $%d`, len(args))
+		COALESCE(sum(cache_write_1h), 0),` + costSelect + `, ` + key + ` AS k
+		FROM ` + s.table() + where + ` AND session_id <> '' GROUP BY session_id) g` + after +
+		fmt.Sprintf(` ORDER BY k DESC, session_id DESC LIMIT $%d`, len(args))
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer func() { _ = rows.Close() }()
 	out := []SessionTotal{}
 	for rows.Next() {
 		var r SessionTotal
 		var models, auths, machines, sources, keys, harnesses pgTextArray
-		if err = rows.Scan(append([]any{&r.SessionID, &r.FirstTS, &r.LastTS, &models, &auths, &machines, &sources, &keys,
+		var k any
+		if err = rows.Scan(append(append([]any{&r.SessionID, &r.FirstTS, &r.LastTS, &models, &auths, &machines, &sources, &keys,
 			&harnesses, &r.Attempts, &r.Success, &r.Failed, &r.Canceled, &r.Rejected, &r.UncachedInput, &r.CacheRead,
 			&r.CacheWrite, &r.OutputNonReasoning, &r.ReasoningTokens, &r.TotalTokens, &r.Incomplete, &r.CacheWrite1h},
-			r.costTargets()...)...); err != nil {
-			return nil, err
+			r.costTargets()...), &k)...); err != nil {
+			return nil, "", err
+		}
+		if len(out) == limit {
+			return out, encodeSessionCursor(out[len(out)-1], recent), rows.Err()
 		}
 		r.Models, r.AuthIDs, r.Machines, r.Sources, r.KeyHashes, r.Harnesses = models, auths, machines, sources, keys, harnesses
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	return out, "", rows.Err()
+}
+
+// ErrBadCursor is returned for a cursor SessionTotals didn't produce, or one from the other order.
+var ErrBadCursor = errors.New("invalid cursor")
+
+// Session cursors carry the order they page ("t" tokens, "r" recent), the last row's sort key
+// and its session id.
+func encodeSessionCursor(r SessionTotal, recent bool) string {
+	key := "t|" + strconv.FormatInt(r.TotalTokens, 10)
+	if recent {
+		key = "r|" + r.LastTS.UTC().Format(time.RFC3339Nano)
+	}
+	return base64.RawURLEncoding.EncodeToString([]byte(key + "|" + r.SessionID))
+}
+
+func decodeSessionCursor(cursor string, recent bool) (any, string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	parts := strings.SplitN(string(raw), "|", 3)
+	if err != nil || len(parts) != 3 || parts[2] == "" {
+		return nil, "", ErrBadCursor
+	}
+	switch {
+	case recent && parts[0] == "r":
+		t, errT := time.Parse(time.RFC3339Nano, parts[1])
+		if errT != nil {
+			return nil, "", ErrBadCursor
+		}
+		return t, parts[2], nil
+	case !recent && parts[0] == "t":
+		n, errN := strconv.ParseInt(parts[1], 10, 64)
+		if errN != nil {
+			return nil, "", ErrBadCursor
+		}
+		return n, parts[2], nil
+	}
+	return nil, "", ErrBadCursor
 }
 
 // pgTextArray scans a Postgres text[] in its text form ("{a,b,\"c d\"}").

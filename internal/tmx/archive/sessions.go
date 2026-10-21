@@ -3,7 +3,6 @@ package archive
 import (
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -389,9 +388,6 @@ type SessionSummary struct {
 	UpdatedAt      time.Time       `json:"updated_at"`
 }
 
-// ErrBadCursor is returned for a cursor ListSessions didn't produce.
-var ErrBadCursor = errors.New("invalid cursor")
-
 // ListSessions lists ingested sessions, most recently updated first, a page at a time: pass the
 // returned next cursor back to get the following page ("" = no more). Paging is by
 // (updated_at, id), so a session re-imported while paging moves to the front instead of shifting
@@ -401,17 +397,9 @@ func (a *Archive) ListSessions(ctx context.Context, harness, machine string, sin
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	before, beforeID := time.Time{}, ""
-	if cursor != "" {
-		raw, err := base64.RawURLEncoding.DecodeString(cursor)
-		ts, id, ok := strings.Cut(string(raw), "|")
-		if err != nil || !ok {
-			return nil, "", ErrBadCursor
-		}
-		if before, err = time.Parse(time.RFC3339Nano, ts); err != nil {
-			return nil, "", ErrBadCursor
-		}
-		beforeID = id
+	before, beforeID, err := decodeCursor(cursor)
+	if err != nil {
+		return nil, "", err
 	}
 	rows, err := a.db.QueryContext(ctx, `SELECT s.id, s.harness, s.external_id, s.harness_version,
 		s.machine, s.project, s.cwd, s.title, s.via_proxy, s.started_at, s.ended_at, s.metadata,
@@ -442,7 +430,7 @@ func (a *Archive) ListSessions(ctx context.Context, harness, machine string, sin
 	if len(out) > limit {
 		out = out[:limit]
 		last := out[len(out)-1]
-		next = base64.RawURLEncoding.EncodeToString([]byte(last.UpdatedAt.UTC().Format(time.RFC3339Nano) + "|" + last.ID))
+		next = encodeCursor(last.UpdatedAt, last.ID)
 	}
 	return out, next, nil
 }

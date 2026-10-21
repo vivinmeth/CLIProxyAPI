@@ -157,25 +157,58 @@ func (a *Archive) DeleteCommit(ctx context.Context, id string) error {
 	return tx.Commit()
 }
 
-// ListCommits lists commits, newest first, as stored.
-func (a *Archive) ListCommits(ctx context.Context, repo, machine string, since time.Time, limit int) ([]json.RawMessage, error) {
-	if limit <= 0 || limit > 1000 {
-		limit = 100
+// CommitQuery filters ListCommits. SessionID matches a commit that names the session by its
+// external id or its archive id ("<harness>:<id>"), whichever form was sent; ThreadID is "t3:<id>".
+type CommitQuery struct {
+	Repo, Machine       string
+	SessionID, ThreadID string
+	Since               time.Time
+	Limit               int
+	Cursor              string // next from the previous page
+}
+
+// ListCommits lists commits, newest first (by committed_at, then id), as stored, a page at a
+// time: pass the returned next cursor back to get the following page ("" = no more).
+func (a *Archive) ListCommits(ctx context.Context, q CommitQuery) ([]json.RawMessage, string, error) {
+	if q.Limit <= 0 || q.Limit > 1000 {
+		q.Limit = 100
 	}
-	rows, err := a.db.QueryContext(ctx, `SELECT jsonb_build_object('id', id, 'machine', machine, 'ingested_at', ingested_at) || doc
-		FROM `+schema+`.commits WHERE ($1 = '' OR repo = $1) AND ($2 = '' OR machine = $2) AND ingested_at >= $3
-		ORDER BY committed_at DESC NULLS LAST LIMIT $4`, repo, machine, since, limit)
+	before, beforeID, err := decodeCursor(q.Cursor)
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	// An archive id also matches its bare external id, and a bare id any "<harness>:<id>".
+	sessionID := strings.TrimSpace(q.SessionID)
+	_, bare, _ := strings.Cut(sessionID, ":")
+	rows, err := a.db.QueryContext(ctx, `SELECT jsonb_build_object('id', id, 'machine', machine, 'ingested_at', ingested_at) || doc,
+			COALESCE(committed_at, 'epoch'), id
+		FROM `+schema+`.commits
+		WHERE ($1 = '' OR repo = $1) AND ($2 = '' OR machine = $2) AND ingested_at >= $3
+			AND ($5 = '' OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(COALESCE(doc->'session_ids', '[]')) s
+				WHERE s = $5 OR ($6 <> '' AND s = $6) OR right(s, length($5) + 1) = ':' || $5))
+			AND ($7 = '' OR COALESCE(doc->'thread_ids', '[]') ? $7)
+			AND ($8 = '' OR (COALESCE(committed_at, 'epoch'), id) < ($9, $8))
+		ORDER BY COALESCE(committed_at, 'epoch') DESC, id DESC LIMIT $4`,
+		q.Repo, q.Machine, q.Since, q.Limit+1, sessionID, bare, strings.TrimSpace(q.ThreadID), beforeID, before)
+	if err != nil {
+		return nil, "", err
 	}
 	defer func() { _ = rows.Close() }()
 	out := []json.RawMessage{}
+	var lastAt time.Time
+	var lastID string
 	for rows.Next() {
 		var doc []byte
-		if err = rows.Scan(&doc); err != nil {
-			return nil, err
+		var at time.Time
+		var id string
+		if err = rows.Scan(&doc, &at, &id); err != nil {
+			return nil, "", err
+		}
+		if len(out) == q.Limit {
+			return out, encodeCursor(lastAt, lastID), rows.Err()
 		}
 		out = append(out, doc)
+		lastAt, lastID = at, id
 	}
-	return out, rows.Err()
+	return out, "", rows.Err()
 }

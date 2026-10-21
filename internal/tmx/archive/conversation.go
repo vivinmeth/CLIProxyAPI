@@ -43,16 +43,22 @@ type ConvExchange struct {
 
 // Conversation is what GET /tmx/archive/conversation returns.
 type Conversation struct {
-	Kind      string         `json:"kind"` // imported | proxy
-	SessionID string         `json:"session_id"`
-	Harness   string         `json:"harness,omitempty"`
-	Title     string         `json:"title,omitempty"`
-	Model     string         `json:"model,omitempty"`
-	Items     []ConvItem     `json:"items"`
-	Truncated bool           `json:"truncated,omitempty"`
-	TraceID   string         `json:"trace_id,omitempty"` // proxy: the exchange the items come from
-	Exchanges []ConvExchange `json:"exchanges,omitempty"`
-	Source    string         `json:"source,omitempty"` // analytics | archive
+	Kind      string     `json:"kind"` // imported | proxy
+	SessionID string     `json:"session_id"`
+	Harness   string     `json:"harness,omitempty"`
+	Title     string     `json:"title,omitempty"`
+	Model     string     `json:"model,omitempty"`
+	Items     []ConvItem `json:"items"`
+	Truncated bool       `json:"truncated,omitempty"` // items is not the whole conversation
+	// Offset is the index of items[0] in the whole conversation; Total its item count (omitted
+	// when unknown: an imported session not extracted to analytics yet, read part way).
+	// NextOffset > 0: more items follow — pass it as offset for the next page.
+	Offset     int            `json:"offset"`
+	Total      *int           `json:"total,omitempty"`
+	NextOffset int            `json:"next_offset,omitempty"`
+	TraceID    string         `json:"trace_id,omitempty"` // proxy: the exchange the items come from
+	Exchanges  []ConvExchange `json:"exchanges,omitempty"`
+	Source     string         `json:"source,omitempty"` // analytics | archive
 }
 
 // ErrNoConversation is returned when nothing is archived for the session.
@@ -65,12 +71,55 @@ const (
 	convMaxItemData = 4 << 20
 )
 
-// Conversation rebuilds a session for reading. Imported sessions come from their stored messages
+// ConvPage picks a window of a conversation's items. Offset < 0 is the default window: the
+// start of an imported transcript, the latest items of a proxied session. Limit is at most (and
+// by default) convMaxItems.
+type ConvPage struct {
+	Offset, Limit int
+}
+
+func (p ConvPage) norm() ConvPage {
+	if p.Limit <= 0 || p.Limit > convMaxItems {
+		p.Limit = convMaxItems
+	}
+	return p
+}
+
+// window returns the [start, end) of a page over total items; tail picks the latest items for
+// the default window.
+func (p ConvPage) window(total int, tail bool) (int, int) {
+	start := p.Offset
+	if start < 0 {
+		start = 0
+		if tail && total > p.Limit {
+			start = total - p.Limit
+		}
+	}
+	start = min(start, total)
+	return start, min(start+p.Limit, total)
+}
+
+// setPage records the window [start, end) of total items on conv.
+func (conv *Conversation) setPage(start, end, total int) {
+	conv.Offset, conv.Total = start, &total
+	conv.Truncated = start > 0 || end < total
+	if end < total {
+		conv.NextOffset = end
+	}
+}
+
+// Conversation rebuilds a session for reading (the default window; see ConversationPage).
+func (a *Archive) Conversation(ctx context.Context, sessionID, harness, traceID, kind string) (*Conversation, error) {
+	return a.ConversationPage(ctx, sessionID, harness, traceID, kind, ConvPage{Offset: -1})
+}
+
+// ConversationPage rebuilds a session for reading. Imported sessions come from their stored messages
 // (harness narrows which harness:id to use). Proxied sessions come from the captured exchange with
 // the largest request (the main thread's latest turn carries the whole conversation) plus its
 // response; traceID picks a specific exchange instead.
 // kind "proxy" or "imported" forces one source; "" prefers the imported transcript when both exist.
-func (a *Archive) Conversation(ctx context.Context, sessionID, harness, traceID, kind string) (*Conversation, error) {
+func (a *Archive) ConversationPage(ctx context.Context, sessionID, harness, traceID, kind string, page ConvPage) (*Conversation, error) {
+	page = page.norm()
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" && traceID == "" {
 		return nil, fmt.Errorf("session_id or trace_id is required")
@@ -78,7 +127,7 @@ func (a *Archive) Conversation(ctx context.Context, sessionID, harness, traceID,
 	// Served from the analytics DB when the session is extracted there; a specific exchange
 	// (trace_id) and sessions not extracted yet are rebuilt from the archive.
 	if a.analytics != nil && traceID == "" {
-		conv, ok, err := a.analytics.conversation(ctx, sessionID, harness, kind)
+		conv, ok, err := a.analytics.conversation(ctx, sessionID, harness, kind, page)
 		if err != nil {
 			// The archive is the source of truth; an analytics outage must not break reading.
 			log.WithError(err).Warn("tmx analytics: conversation read failed, using the archive")
@@ -87,17 +136,20 @@ func (a *Archive) Conversation(ctx context.Context, sessionID, harness, traceID,
 		}
 	}
 	if kind == "imported" {
-		return a.importedConversation(ctx, sessionID, harness)
+		return a.importedConversation(ctx, sessionID, harness, page)
 	}
 	if traceID == "" && kind != "proxy" {
-		if conv, err := a.importedConversation(ctx, sessionID, harness); err == nil || !errors.Is(err, ErrNoConversation) {
+		if conv, err := a.importedConversation(ctx, sessionID, harness, page); err == nil || !errors.Is(err, ErrNoConversation) {
 			return conv, err
 		}
 	}
-	return a.proxyConversation(ctx, sessionID, traceID)
+	return a.proxyConversation(ctx, sessionID, traceID, page)
 }
 
-func (a *Archive) importedConversation(ctx context.Context, sessionID, harness string) (*Conversation, error) {
+// convMsgBatch is how many stored messages importedConversation rebuilds at a time.
+const convMsgBatch = 500
+
+func (a *Archive) importedConversation(ctx context.Context, sessionID, harness string, page ConvPage) (*Conversation, error) {
 	var id, h, title string
 	err := a.db.QueryRowContext(ctx, `SELECT id, harness, title FROM `+schema+`.sessions
 		WHERE (id = $1 OR external_id = $1) AND ($2 = '' OR harness = $2) ORDER BY updated_at DESC LIMIT 1`,
@@ -108,13 +160,46 @@ func (a *Archive) importedConversation(ctx context.Context, sessionID, harness s
 	if err != nil {
 		return nil, err
 	}
+	start := max(page.Offset, 0)
+	conv := &Conversation{Kind: "imported", SessionID: id, Harness: h, Title: title, Items: []ConvItem{}, Offset: start}
+	// Messages are rebuilt a batch at a time, counting items up to the window and stopping at
+	// the first item past it.
+	seen := 0
+	for msgOffset := 0; ; msgOffset += convMsgBatch {
+		n, more, err := a.importedBatch(ctx, id, msgOffset, func(it ConvItem) bool {
+			if seen >= start+page.Limit {
+				return false
+			}
+			if seen >= start {
+				conv.Items = append(conv.Items, it)
+			}
+			seen++
+			return true
+		})
+		if err != nil {
+			return nil, err
+		}
+		if more {
+			conv.Truncated, conv.NextOffset = true, start+page.Limit
+			return conv, nil
+		}
+		if n < convMsgBatch {
+			break
+		}
+	}
+	conv.setPage(min(start, seen), seen, seen)
+	return conv, nil
+}
+
+// importedBatch rebuilds up to convMsgBatch stored messages of a session from msgOffset and
+// hands their items to add, in order, until add returns false (more = true then).
+func (a *Archive) importedBatch(ctx context.Context, id string, msgOffset int, add func(ConvItem) bool) (int, bool, error) {
 	rows, err := a.db.QueryContext(ctx, `SELECT ts, role, model, message FROM `+schema+`.session_messages
-		WHERE session_id = $1 ORDER BY seq, ts LIMIT $2`, id, convMaxItems+1)
+		WHERE session_id = $1 ORDER BY seq, ts OFFSET $2 LIMIT $3`, id, msgOffset, convMsgBatch)
 	if err != nil {
-		return nil, err
+		return 0, false, err
 	}
 	defer func() { _ = rows.Close() }()
-	conv := &Conversation{Kind: "imported", SessionID: id, Harness: h, Title: title, Items: []ConvItem{}}
 	type stored struct {
 		ts                sql.NullTime
 		role, model, hash string
@@ -123,16 +208,12 @@ func (a *Archive) importedConversation(ctx context.Context, sessionID, harness s
 	for rows.Next() {
 		var m stored
 		if err = rows.Scan(&m.ts, &m.role, &m.model, &m.hash); err != nil {
-			return nil, err
-		}
-		if len(msgs) >= convMaxItems {
-			conv.Truncated = true
-			break
+			return 0, false, err
 		}
 		msgs = append(msgs, m)
 	}
 	if err = rows.Err(); err != nil {
-		return nil, err
+		return 0, false, err
 	}
 	_ = rows.Close()
 	hashes := make([]string, len(msgs))
@@ -141,28 +222,28 @@ func (a *Archive) importedConversation(ctx context.Context, sessionID, harness s
 	}
 	a.prefetchBodies(ctx, hashes)
 	for _, m := range msgs {
-		ts, role, model, hash := m.ts, m.role, m.model, m.hash
-		body, errBody := a.rebuildBody(ctx, hash)
+		body, errBody := a.rebuildBody(ctx, m.hash)
 		if errBody != nil {
-			return nil, fmt.Errorf("message: %w", errBody)
+			return 0, false, fmt.Errorf("message: %w", errBody)
 		}
-		msg := gjson.GetBytes(body, "message")
-		items := normalizeMessage(msg, role)
+		items := normalizeMessage(gjson.GetBytes(body, "message"), m.role)
 		for i := range items {
-			if ts.Valid {
-				t := ts.Time.UTC()
+			if m.ts.Valid {
+				t := m.ts.Time.UTC()
 				items[i].TS = &t
 			}
-			if model != "" && items[i].Role == "assistant" {
-				items[i].Model = model
+			if m.model != "" && items[i].Role == "assistant" {
+				items[i].Model = m.model
+			}
+			if !add(items[i]) {
+				return len(msgs), true, nil
 			}
 		}
-		conv.Items = append(conv.Items, items...)
 	}
-	return conv, nil
+	return len(msgs), false, nil
 }
 
-func (a *Archive) proxyConversation(ctx context.Context, sessionID, traceID string) (*Conversation, error) {
+func (a *Archive) proxyConversation(ctx context.Context, sessionID, traceID string, page ConvPage) (*Conversation, error) {
 	conv := &Conversation{Kind: "proxy", SessionID: sessionID, Items: []ConvItem{}}
 	if sessionID != "" {
 		rows, err := a.db.QueryContext(ctx, `SELECT trace_id, ts, url, status, request_bytes FROM `+schema+`.exchanges
@@ -232,9 +313,10 @@ func (a *Archive) proxyConversation(ctx context.Context, sessionID, traceID stri
 			conv.Items = append(conv.Items, it)
 		}
 	}
-	if len(conv.Items) > convMaxItems {
-		conv.Items, conv.Truncated = conv.Items[len(conv.Items)-convMaxItems:], true
-	}
+	total := len(conv.Items)
+	start, end := page.window(total, true)
+	conv.Items = conv.Items[start:end]
+	conv.setPage(start, end, total)
 	return conv, nil
 }
 
