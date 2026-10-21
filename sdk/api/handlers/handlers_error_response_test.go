@@ -972,3 +972,34 @@ func TestWriteErrorResponse_FirstUpstream429CarriesRetryAfter(t *testing.T) {
 		t.Fatalf("Retry-After = %q, want 7200", got)
 	}
 }
+
+// tmx: with passthrough-headers on, the upstream's raw Retry-After must not replace the computed
+// one (the later quota deadline wins, and the client cap applies).
+func TestWriteErrorResponse_ComputedRetryAfterOverridesPassthrough(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw, want string
+		delay           time.Duration
+	}{
+		{"later deadline wins", "60", "3600", time.Hour},
+		{"client cap", "259200", "86400", 72 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{PassthroughHeaders: true}, nil)
+			handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+				StatusCode: http.StatusTooManyRequests,
+				Error:      upstreamRetryAfterTestError{retryAfter: tc.delay},
+				Addon:      http.Header{"retry-after": {tc.raw}, "X-Codex-Primary-Used-Percent": {"100"}},
+			})
+			if got := recorder.Header().Values("Retry-After"); len(got) != 1 || got[0] != tc.want {
+				t.Fatalf("Retry-After = %v, want %s", got, tc.want)
+			}
+			if got := recorder.Header().Get("X-Codex-Primary-Used-Percent"); got != "100" {
+				t.Fatalf("other passthrough headers must stay: %q", got)
+			}
+		})
+	}
+}

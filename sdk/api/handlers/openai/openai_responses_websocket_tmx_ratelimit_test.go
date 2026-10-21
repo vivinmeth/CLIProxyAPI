@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/tidwall/gjson"
@@ -41,5 +42,31 @@ func TestResponsesWebsocketExposesCodexTurnRateLimit(t *testing.T) {
 	}
 	if shouldExposeResponsesUpstreamError(other) {
 		t.Fatal("other 429s keep upstream's silent close")
+	}
+}
+
+type wsRetryAfterTestError struct{ retryAfter time.Duration }
+
+func (e wsRetryAfterTestError) Error() string {
+	return `{"error":{"type":"usage_limit_reached","message":"limit"}}`
+}
+func (e wsRetryAfterTestError) StatusCode() int            { return http.StatusTooManyRequests }
+func (e wsRetryAfterTestError) RetryAfter() *time.Duration { return &e.retryAfter }
+
+// tmx: the envelope's Retry-After is the computed deadline, not the raw upstream header.
+func TestResponsesWebsocketErrorUsesComputedRetryAfter(t *testing.T) {
+	payload, err := buildResponsesWebsocketErrorPayload(&interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      wsRetryAfterTestError{retryAfter: time.Hour},
+		Addon:      http.Header{"Retry-After": {"60"}, "X-Codex-Primary-Used-Percent": {"100"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gjson.GetBytes(payload, "headers.Retry-After").String(); got != "3600" {
+		t.Errorf("Retry-After = %q, want 3600: %s", got, payload)
+	}
+	if got := gjson.GetBytes(payload, "headers.X-Codex-Primary-Used-Percent").String(); got != "100" {
+		t.Errorf("other headers must stay: %s", payload)
 	}
 }

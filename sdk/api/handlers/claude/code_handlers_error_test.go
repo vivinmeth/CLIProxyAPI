@@ -907,3 +907,25 @@ func TestClaudeStreamMultiLineDataEventsAreRecognizedAcrossChunks(t *testing.T) 
 		}
 	})
 }
+
+type claudeRetryAfterTestError struct{ retryAfter time.Duration }
+
+func (e claudeRetryAfterTestError) Error() string              { return "rate limited" }
+func (e claudeRetryAfterTestError) StatusCode() int            { return http.StatusTooManyRequests }
+func (e claudeRetryAfterTestError) RetryAfter() *time.Duration { return &e.retryAfter }
+
+// tmx: the computed Retry-After is authoritative over a raw passthrough one.
+func TestWriteClaudeErrorResponse_ComputedRetryAfterOverridesPassthrough(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := NewClaudeCodeAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{PassthroughHeaders: true}, nil))
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      claudeRetryAfterTestError{retryAfter: 72 * time.Hour},
+		Addon:      http.Header{"Retry-After": {"60"}},
+	})
+	if got := recorder.Header().Values("Retry-After"); len(got) != 1 || got[0] != "86400" {
+		t.Fatalf("Retry-After = %v, want the capped computed 86400", got)
+	}
+}
