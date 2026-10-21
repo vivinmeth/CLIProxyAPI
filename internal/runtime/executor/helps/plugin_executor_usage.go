@@ -58,9 +58,7 @@ func ObservePluginExecutorStreamUsage(protocol string, payload []byte, buffer *S
 	switch strings.ToLower(strings.TrimSpace(protocol)) {
 	case "claude":
 		IterateStreamLines(payload, func(line []byte) {
-			if detail, ok := parseClaudeStreamLine(line); ok {
-				ObserveMergedStreamUsage(buffer, detail)
-			}
+			buffer.ObserveClaudeStream(line)
 		})
 	case "gemini":
 		IterateStreamLines(payload, func(line []byte) {
@@ -71,7 +69,9 @@ func ObservePluginExecutorStreamUsage(protocol string, payload []byte, buffer *S
 	case "interactions", "interactions-response":
 		IterateStreamLines(payload, func(line []byte) {
 			if detail, ok := ParseInteractionsStreamUsage(line); ok {
-				ObserveMergedStreamUsage(buffer, detail)
+				// Interactions reports cumulative snapshots with cache inside input
+				// and reasoning separate from output. Preserve the parsed breakdown.
+				buffer.Observe(detail, true)
 			}
 		})
 	case "antigravity":

@@ -1541,8 +1541,8 @@ func TestKimiExecutor_MappedModelDoesNotWarnWhenUpstreamServesMappedModel(t *tes
 	}
 
 	record := capture.await(t)
-	if record.Model != "kimi-k2.8" {
-		t.Fatalf("record.Model = %q, want kimi-k2.8 (must preserve requested model)", record.Model)
+	if record.Model != "kimi-for-coding" || record.Alias != alias {
+		t.Fatalf("record.Model = %q, Alias = %q; want kimi-for-coding and %q", record.Model, record.Alias, alias)
 	}
 	if record.ResponseModel != "kimi-for-coding" {
 		t.Fatalf("record.ResponseModel = %q, want kimi-for-coding", record.ResponseModel)
@@ -1602,8 +1602,8 @@ func TestKimiExecutor_WarnsWhenUpstreamServesUnexpectedModel(t *testing.T) {
 	}
 
 	record := capture.await(t)
-	if record.Model != "kimi-k2.8" {
-		t.Fatalf("record.Model = %q, want kimi-k2.8", record.Model)
+	if record.Model != "kimi-for-coding" || record.Alias != alias {
+		t.Fatalf("record.Model = %q, Alias = %q; want kimi-for-coding and %q", record.Model, record.Alias, alias)
 	}
 	if record.ResponseModel != "unexpected-model-v2" {
 		t.Fatalf("record.ResponseModel = %q, want unexpected-model-v2", record.ResponseModel)

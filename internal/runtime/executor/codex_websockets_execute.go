@@ -42,6 +42,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
+	var streamUsage helps.StreamUsageBuffer
+	defer func() {
+		if err != nil {
+			streamUsage.PublishFailure(ctx, reporter, err)
+		}
+	}()
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -325,6 +331,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
 		helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)
 		payload = helps.RestoreCodexMultiAgentV2Response(payload, restoreMultiAgentV2)
+		streamUsage.ObserveCodexStream(payload)
 
 		if wsErr, ok := parseCodexWebsocketErrorWithCooling(payload, e.modelLevelCooling()); ok {
 			if sess != nil {
@@ -363,7 +370,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				}
 				streamErr := newCodexEmptyIncompleteStreamError()
 				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-				reporter.PublishFailure(ctx, streamErr)
+				streamUsage.PublishFailure(ctx, reporter, streamErr)
 				return resp, streamErr
 			}
 			payload = patchCodexCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)

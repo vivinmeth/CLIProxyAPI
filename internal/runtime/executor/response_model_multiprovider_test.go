@@ -198,8 +198,8 @@ func TestDevinStreamRecordsResponseModelFromUsage(t *testing.T) {
 	}
 
 	record := capture.await(t)
-	if record.Model != "devin/swe-2" {
-		t.Fatalf("record model = %q, want devin/swe-2", record.Model)
+	if record.Model != "swe-2-high" || record.Alias != alias {
+		t.Fatalf("record model = %q, alias = %q; want swe-2-high and %q", record.Model, record.Alias, alias)
 	}
 	if record.ResponseModel != "gpt-5-6-luna-low" {
 		t.Fatalf("record response model = %q, want gpt-5-6-luna-low", record.ResponseModel)
