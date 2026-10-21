@@ -41,7 +41,10 @@ func rejectedRow(ex *capture.Exchange) (requestlog.Row, bool) {
 	}
 	clientIP, _, _ := strings.Cut(h.Get("X-Forwarded-For"), ",")
 	request := capturePrefix(ex, "request", ex.RequestBody, 1<<20)
-	model := gjson.GetBytes(request, "model").String()
+	model := ex.RequestModel
+	if model == "" {
+		model = gjson.GetBytes(request, "model").String()
+	}
 	return requestlog.Row{
 		Source:     requestlog.SourceProxy,
 		TS:         ex.StartedAt.UTC(),
@@ -54,7 +57,7 @@ func rejectedRow(ex *capture.Exchange) (requestlog.Row, bool) {
 		Machine:    requestlog.MachineFromKey(key),
 		ClientIP:   strings.TrimSpace(clientIP),
 		UserAgent:  truncateString(h.Get("User-Agent"), 300),
-		Stream:     gjson.GetBytes(request, "stream").Bool(),
+		Stream:     ex.RequestStreaming || gjson.GetBytes(request, "stream").Bool(),
 		Outcome:    requestlog.OutcomeRejected,
 		StatusCode: ex.Status,
 		Error:      truncateString(string(capturePrefix(ex, "response", ex.ResponseBody, rejectedErrorMax)), rejectedErrorMax),

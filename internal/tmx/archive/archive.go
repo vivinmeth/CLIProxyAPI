@@ -368,7 +368,13 @@ func redactHeaders(h map[string][]string) map[string][]string {
 
 func (a *Archive) storeExchange(ctx context.Context, ex *capture.Exchange) error {
 	requestPrefix := capturePrefix(ex, "request", ex.RequestBody, 1<<20)
-	clientSession := clientSessionID(ex.RequestHeaders, requestPrefix)
+	clientSession := clientSessionID(ex.RequestHeaders, nil)
+	if clientSession == "" {
+		clientSession = ex.ClientSessionID
+	}
+	if clientSession == "" {
+		clientSession = clientSessionID(ex.RequestHeaders, requestPrefix)
+	}
 	if ex.SessionID == "" {
 		// The middleware runs before session resolution; derive it the same way upstream does so
 		// exchanges join tmx.requests.session_id.

@@ -7,6 +7,7 @@ package middleware
 
 import (
 	"fmt"
+	"net/http"
 	"strconv"
 	"time"
 
@@ -14,6 +15,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/capture"
+	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
+	"github.com/tidwall/gjson"
 )
 
 type tmxCapture struct {
@@ -100,7 +103,21 @@ func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
 	if w.tmx != nil {
 		group = w.tmx.group
 	}
-	ex.Bodies["request"] = capture.CaptureInGroup(w.extractRequestBody(c), nil, group)
+	requestBody := w.extractRequestBody(c)
+	// Extract identity while borrowing the original body: a bounded archive prefix
+	// may end before trailing metadata in a large spooled request.
+	ex.ClientSessionID = coresession.ClaudeMetadataSessionID(requestBody)
+	ex.RequestModel = gjson.GetBytes(requestBody, "model").String()
+	ex.RequestStreaming = gjson.GetBytes(requestBody, "stream").Bool()
+	if ex.SessionID == "" {
+		if info, ok := coresession.ExtractSessionInfo(http.Header(ex.RequestHeaders), requestBody, nil); ok {
+			ex.SessionID = coresession.NormalizeToCanonicalUUID(info.SessionID)
+			if ex.SessionID == "" {
+				ex.SessionID = info.SessionID
+			}
+		}
+	}
+	ex.Bodies["request"] = capture.CaptureInGroup(requestBody, nil, group)
 	if override := extractBodyOverride(c, responseBodyOverrideContextKey); len(override) > 0 {
 		ex.Bodies["response"] = capture.CaptureInGroup(override, nil, group)
 		if w.tmx != nil {

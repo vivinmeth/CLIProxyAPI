@@ -153,3 +153,23 @@ func TestTMXCaptureDiskFailureNeverInterruptsClient(t *testing.T) {
 		t.Fatal("failed capture submitted")
 	}
 }
+
+func TestTMXSpilledRequestPreservesTrailingSessionIdentity(t *testing.T) {
+	capture.Configure(1024, 512, t.TempDir())
+	defer capture.Configure(0, 0, "")
+	var exchange *capture.Exchange
+	capture.SetSink(func(ex *capture.Exchange) { exchange = ex })
+	defer capture.SetSink(nil)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest("POST", "/v1/messages", nil)
+	body := []byte(`{"messages":[{"role":"user","content":"` + strings.Repeat("x", 2<<20) + `"}],"metadata":{"user_id":"{\"session_id\":\"12345678-1234-4123-8123-123456789abc\"}"},"model":"opus","stream":true}`)
+	w := NewResponseWriterWrapper(ctx.Writer, nil, &RequestInfo{URL: "/v1/messages", Body: body, Timestamp: time.Now()})
+	w.tmxSubmit(ctx, 400)
+	if exchange == nil {
+		t.Fatal("missing exchange")
+	}
+	defer exchange.Release()
+	if !exchange.Bodies["request"].Spilled() || exchange.ClientSessionID != "12345678-1234-4123-8123-123456789abc" || exchange.SessionID == "" || exchange.RequestModel != "opus" || !exchange.RequestStreaming {
+		t.Fatalf("spooled request metadata lost: %+v", exchange)
+	}
+}
