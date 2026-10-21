@@ -130,8 +130,15 @@ func usageRefsWithout(in SessionIngest, sessionKey string) []string {
 // canonical ids the proxy gave it (exchanges map one to the other).
 func (a *Archive) proxiedSince(ctx context.Context, store *requestlog.Store, externalID string) *time.Time {
 	ids := []string{externalID}
-	if c := coresession.NormalizeToCanonicalUUID(externalID); c != externalID && c != "" {
-		ids = append(ids, c)
+	// Subagents are imported as "<parent>:<agent>" but reach the proxy under the parent's session
+	// id, so the parent's proxied traffic counts for them.
+	if parent, _, ok := strings.Cut(externalID, ":"); ok && parent != "" {
+		ids = append(ids, parent)
+	}
+	for _, id := range ids[:len(ids):len(ids)] {
+		if c := coresession.NormalizeToCanonicalUUID(id); c != id && c != "" {
+			ids = append(ids, c)
+		}
 	}
 	var first *time.Time
 	consider := func(t sql.NullTime) {
@@ -142,7 +149,8 @@ func (a *Archive) proxiedSince(ctx context.Context, store *requestlog.Store, ext
 	}
 	var canonical []string
 	if rows, err := a.db.QueryContext(ctx, `SELECT session_id, min(ts) FROM `+schema+`.exchanges
-		WHERE client_session_id = $1 OR session_id = $1 GROUP BY session_id`, externalID); err == nil {
+		WHERE client_session_id = ANY($1::text[]) OR session_id = ANY($1::text[]) GROUP BY session_id`,
+		pgTextArray(ids)); err == nil {
 		for rows.Next() {
 			var sid string
 			var ts sql.NullTime

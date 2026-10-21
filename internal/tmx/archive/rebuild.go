@@ -112,14 +112,21 @@ func (a *Archive) Reshadow(ctx context.Context) (int64, error) {
 	t := store.Schema() + ".requests"
 	// Same rule as proxiedSince: exchanges with the client's id, proxied rows under it or under
 	// the canonical ids those exchanges carry.
-	tag, err := a.db.ExecContext(ctx, `WITH first AS (
-			SELECT s.id, COALESCE(s.via_proxy, false) AS via, LEAST(
+	// Subagents ("<parent>:<agent>") also match their parent's id.
+	tag, err := a.db.ExecContext(ctx, `WITH ids AS (
+			SELECT s.id, COALESCE(s.via_proxy, false) AS via,
+				array_remove(ARRAY[s.external_id, NULLIF(split_part(s.external_id, ':', 1), s.external_id)], NULL) AS keys
+			FROM `+schema+`.sessions s WHERE s.via_proxy),
+		first AS (
+			SELECT ids.id, ids.via, LEAST(
 				(SELECT min(e.ts) FROM `+schema+`.exchanges e
-					WHERE e.client_session_id = s.external_id OR e.session_id = s.external_id),
-				(SELECT min(p.ts) FROM `+t+` p WHERE p.source = $1 AND (p.session_id = s.external_id
+					WHERE e.client_session_id = ANY(ids.keys) OR e.session_id = ANY(ids.keys)),
+				(SELECT min(p.ts) FROM `+t+` p WHERE p.source = $1 AND (p.session_id = ANY(ids.keys)
 					OR p.session_id IN (SELECT e.session_id FROM `+schema+`.exchanges e
-						WHERE e.client_session_id = s.external_id AND e.session_id <> '')))) AS since
-			FROM `+schema+`.sessions s)
+						WHERE e.client_session_id = ANY(ids.keys) AND e.session_id <> '')))) AS since
+			FROM ids
+			UNION ALL
+			SELECT s.id, false, NULL::timestamptz FROM `+schema+`.sessions s WHERE s.via_proxy IS NOT TRUE)
 		UPDATE `+t+` r SET shadowed = (f.via AND f.since IS NOT NULL AND r.ts >= f.since)
 		FROM first f
 		WHERE r.import_ref IS NOT NULL AND split_part(r.import_ref, '#', 1) = f.id

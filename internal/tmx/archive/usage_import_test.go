@@ -129,3 +129,31 @@ func TestResendWithChangedUsageCountsAsUpdated(t *testing.T) {
 		t.Fatalf("usage-only change = %+v %v", res, err)
 	}
 }
+
+// Subagent sessions ("<parent>:<agent>") reach the proxy under the parent's id: their usage is
+// shadowed from the parent's first proxied call, at ingest and by Reshadow.
+func TestSubagentUsageShadowedByParent(t *testing.T) {
+	a, rl := openTestArchive(t)
+	ctx := context.Background()
+	t0 := time.Date(2026, 10, 20, 11, 0, 0, 0, time.UTC)
+	if _, err := rl.DB().Exec(`INSERT INTO tmx.requests (ts, outcome, source, session_id) VALUES ($1, 'success', $2, 'parent-1')`,
+		t0, requestlog.SourceProxy); err != nil {
+		t.Fatal(err)
+	}
+	via := true
+	in := SessionIngest{Harness: "claude-code", ExternalID: "parent-1:agent-a", ViaProxy: &via,
+		Messages: []MessageIngest{usageMsg("s1", 1, t0.Add(time.Minute), u1)}}
+	if _, err := a.IngestSession(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	var sh bool
+	if err := rl.DB().QueryRow(`SELECT shadowed FROM tmx.requests WHERE import_ref = 'claude-code:parent-1:agent-a#s1'`).Scan(&sh); err != nil || !sh {
+		t.Fatalf("subagent row shadowed = %v (%v)", sh, err)
+	}
+	if _, err := rl.DB().Exec(`UPDATE tmx.requests SET shadowed = false WHERE import_ref IS NOT NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := a.Reshadow(ctx); err != nil || n != 1 {
+		t.Fatalf("reshadow = %d %v", n, err)
+	}
+}
