@@ -424,6 +424,9 @@ type RoutingConfig struct {
 	ResetSoonest ResetSoonestConfig `yaml:"reset-soonest,omitempty" json:"reset-soonest,omitempty"`
 	// SessionAffinityPersist defaults to true when the tmx request-log database is configured.
 	SessionAffinityPersist *bool `yaml:"session-affinity-persist,omitempty" json:"session-affinity-persist,omitempty"`
+	// OverloadMaxWait bounds the total time one client request waits on 529 overload pacing
+	// (duration string, default 5s; 0 returns the first overloaded round's 529 at once).
+	OverloadMaxWait string `yaml:"overload-max-wait,omitempty" json:"overload-max-wait,omitempty"`
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first", "reset-soonest".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`

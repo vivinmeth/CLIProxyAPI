@@ -113,6 +113,7 @@ type overloadBudget struct {
 	round    int
 	inRound  int
 	roundCap int
+	waited   time.Duration
 }
 
 func (b *overloadBudget) note() {
@@ -153,25 +154,74 @@ func (m *Manager) overloadRoundSpent(ctx context.Context, retryRound int, provid
 	return budget.total >= overloadRequestBudget || budget.inRound >= budget.roundCap
 }
 
-// overloadRetryWait spaces the next retry round after a 529 by the route's overload backoff, and
-// ends the retries once the request's overload budget is spent or the backoff exceeds maxWait.
-func (m *Manager) overloadRetryWait(ctx context.Context, err error, providers []string, model string, wait, maxWait time.Duration) (time.Duration, bool) {
-	if statusCodeFromError(err) != statusOverloaded {
-		return wait, true
+// defaultOverloadMaxWait is routing.overload-max-wait when unset or invalid.
+const defaultOverloadMaxWait = 5 * time.Second
+
+// overloadClientRetryAfterCap caps the Retry-After of a 529 returned once pacing gives up.
+const overloadClientRetryAfterCap = time.Minute
+
+// overloadMaxWait is the configured total overload wait per client request.
+func (m *Manager) overloadMaxWait() time.Duration {
+	if cfg := m.runtimeConfigSnapshot(); cfg != nil {
+		if raw := strings.TrimSpace(cfg.Routing.OverloadMaxWait); raw != "" {
+			if d, err := time.ParseDuration(raw); err == nil && d >= 0 {
+				return d
+			}
+		}
 	}
-	if budget, _ := ctx.Value(overloadBudgetKey{}).(*overloadBudget); budget != nil {
+	return defaultOverloadMaxWait
+}
+
+// overloadRetryWait spaces the next retry round after a 529 by the route's overload backoff, and
+// ends the retries once the request's overload budget is spent, the backoff exceeds maxWait, or
+// the wait no longer fits the request's overload-max-wait. It returns the wait (jitter included,
+// already charged to the request) and the ceiling to pass to waitForCooldown with it.
+func (m *Manager) overloadRetryWait(ctx context.Context, err error, providers []string, model string, wait, maxWait time.Duration) (time.Duration, time.Duration, bool) {
+	if statusCodeFromError(err) != statusOverloaded {
+		return wait, maxWait, true
+	}
+	budget, _ := ctx.Value(overloadBudgetKey{}).(*overloadBudget)
+	if budget != nil {
 		budget.mu.Lock()
 		spent := budget.total >= overloadRequestBudget
 		budget.mu.Unlock()
 		if spent {
-			return 0, false
+			return 0, 0, false
 		}
 	}
 	if backoff := m.overloadBackoff(providers, model); backoff > wait {
 		if maxWait <= 0 || backoff > maxWait {
-			return 0, false
+			return 0, 0, false
 		}
 		wait = backoff
 	}
-	return wait, true
+	if budget == nil || wait <= 0 {
+		return wait, maxWait, true
+	}
+	budget.mu.Lock()
+	defer budget.mu.Unlock()
+	remaining := m.overloadMaxWait() - budget.waited
+	if wait > remaining {
+		return 0, 0, false
+	}
+	ceiling := remaining
+	if maxWait > 0 && maxWait < ceiling {
+		ceiling = maxWait
+	}
+	wait = jitteredCooldownWait(wait, ceiling)
+	budget.waited += wait
+	return wait, wait, true
+}
+
+// overloadRetryAfter gives a 529 that ends a request the route's remaining overload backoff as
+// Retry-After (capped), so the client paces itself like the pool does.
+func (m *Manager) overloadRetryAfter(err error, providers []string, model string) (error, bool) {
+	if statusCodeFromError(err) != statusOverloaded {
+		return err, false
+	}
+	backoff := m.overloadBackoff(providers, model)
+	if backoff <= 0 {
+		return err, false
+	}
+	return &poolRetryAfterError{error: err, retryAfter: min(backoff, overloadClientRetryAfterCap)}, true
 }

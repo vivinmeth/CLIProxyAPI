@@ -151,13 +151,14 @@ func (m *Manager) executeWithoutAdmission(ctx context.Context, providers []strin
 		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, normalized, retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
+		waitCap := maxWait
 		if shouldRetry {
-			wait, shouldRetry = m.overloadRetryWait(ctx, errExec, normalized, retryModel, wait, maxWait)
+			wait, waitCap, shouldRetry = m.overloadRetryWait(ctx, errExec, normalized, retryModel, wait, maxWait)
 		}
 		if !shouldRetry {
 			break
 		}
-		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+		if errWait := waitForCooldown(ctx, wait, waitCap); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
 	}
@@ -214,13 +215,14 @@ func (m *Manager) executeCountWithoutAdmission(ctx context.Context, providers []
 		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, normalized, retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
+		waitCap := maxWait
 		if shouldRetry {
-			wait, shouldRetry = m.overloadRetryWait(ctx, errExec, normalized, retryModel, wait, maxWait)
+			wait, waitCap, shouldRetry = m.overloadRetryWait(ctx, errExec, normalized, retryModel, wait, maxWait)
 		}
 		if !shouldRetry {
 			break
 		}
-		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+		if errWait := waitForCooldown(ctx, wait, waitCap); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
 	}
@@ -289,13 +291,14 @@ func (m *Manager) executeStreamWithoutAdmission(ctx context.Context, providers [
 		}
 		lastErr = errStream
 		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errStream, attempt, normalized, retryModel, maxWait, homeRetryLimit, defaultRequestRetry, roundAttempted)
+		waitCap := maxWait
 		if shouldRetry && !m.HomeEnabled() {
-			wait, shouldRetry = m.overloadRetryWait(ctx, errStream, normalized, retryModel, wait, maxWait)
+			wait, waitCap, shouldRetry = m.overloadRetryWait(ctx, errStream, normalized, retryModel, wait, maxWait)
 		}
 		if !shouldRetry {
 			break
 		}
-		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+		if errWait := waitForCooldown(ctx, wait, waitCap); errWait != nil {
 			return nil, errWait
 		}
 		attempt++

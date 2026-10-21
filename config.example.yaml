@@ -161,6 +161,9 @@ routing:
     max-inflight-per-credential: 0 # 0 disables the cap; unknown credentials still get one probe.
   # Persist live session bindings in the tmx database (default true when configured).
   session-affinity-persist: true
+  # Total time one client request may wait on 529 overload pacing before the 529 (with the
+  # provider's remaining backoff as Retry-After) is returned. Default 5s; 0 disables the wait.
+  overload-max-wait: 5s
   strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first, reset-soonest
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.

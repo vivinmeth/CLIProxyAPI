@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
@@ -134,5 +135,50 @@ func TestOverloadPacingKeepsQuotaFailover(t *testing.T) {
 	}
 	if got := e.calls.Load(); got != 5 {
 		t.Fatalf("a 429 must still fail over across the pool: %d of 5 tried", got)
+	}
+}
+
+// A client request waits on overload pacing for at most routing.overload-max-wait in total, then
+// gets the 529 with the route's remaining backoff as Retry-After.
+func TestOverloadWaitBoundedByOverloadMaxWait(t *testing.T) {
+	cases := []struct {
+		name          string
+		maxWait       string
+		transient     int
+		wantCalls     int32
+		maxElapsed    time.Duration
+		maxRetryAfter string
+	}{
+		// The 10 s default overload cooldown never fits the 5 s default budget.
+		{name: "default-cooldown-exceeds-budget", wantCalls: 1, maxElapsed: time.Second, maxRetryAfter: "10"},
+		{name: "zero-budget", maxWait: "0", transient: 1, wantCalls: 1, maxElapsed: time.Second, maxRetryAfter: "1"},
+		// One ~1 s wait fits 1.5 s; the second does not.
+		{name: "one-wait-fits", maxWait: "1500ms", transient: 1, wantCalls: 2, maxElapsed: 2500 * time.Millisecond, maxRetryAfter: "1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, e := statusPool(t, statusOverloaded, 1)
+			m.SetRetryConfig(3, 30*time.Second, 0)
+			SetTransientErrorCooldownSeconds(tc.transient)
+			t.Cleanup(func() { SetTransientErrorCooldownSeconds(0) })
+			cfg := &internalconfig.Config{}
+			cfg.Routing.OverloadMaxWait = tc.maxWait
+			m.SetConfig(cfg)
+			start := time.Now()
+			_, err := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "claude-opus-5"}, cliproxyexecutor.Options{})
+			elapsed := time.Since(start)
+			if statusCodeFromError(err) != statusOverloaded {
+				t.Fatalf("err = %v, want 529", err)
+			}
+			if got := e.calls.Load(); got != tc.wantCalls {
+				t.Fatalf("upstream calls = %d, want %d", got, tc.wantCalls)
+			}
+			if elapsed > tc.maxElapsed {
+				t.Fatalf("request took %v, want <= %v", elapsed, tc.maxElapsed)
+			}
+			if got := SafeResponseHeaders(err).Get("Retry-After"); got != tc.maxRetryAfter {
+				t.Fatalf("Retry-After = %q, want %q (remaining overload backoff, rounded up)", got, tc.maxRetryAfter)
+			}
+		})
 	}
 }

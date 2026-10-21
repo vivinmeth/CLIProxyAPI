@@ -74,6 +74,9 @@ func (m *Manager) withPoolRetryAfter(ctx context.Context, err error, providers [
 	default:
 		return err
 	}
+	if overloaded, ok := m.overloadRetryAfter(err, providers, model); ok {
+		return overloaded
+	}
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
 		if p := canonicalSchedulingProvider(provider); p != "" {
