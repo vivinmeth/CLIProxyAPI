@@ -176,6 +176,7 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 	}
 	s.cfgMu.Lock()
 	s.cfg = cfg
+	s.configureTMXCapture(cfg)
 	s.cfgMu.Unlock()
 	if s.codexLiveHandler != nil {
 		if errUpdate := s.codexLiveHandler.UpdateConfig(cfg); errUpdate != nil {

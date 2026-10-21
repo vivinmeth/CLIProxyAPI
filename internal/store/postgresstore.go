@@ -1,7 +1,9 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -47,6 +49,7 @@ type PostgresStore struct {
 	authDir       string
 	cooldownStore *postgresCooldownStateStore
 	mu            sync.Mutex
+	authHashes    map[string][32]byte
 	persistAuthFn func(ctx context.Context, relID string, data []byte) error
 }
 
@@ -566,6 +569,32 @@ func (s *PostgresStore) upsertAuthRecord(ctx context.Context, relID, path string
 }
 
 func (s *PostgresStore) persistAuth(ctx context.Context, relID string, data []byte) error {
+	// All callers hold s.mu. Canonicalize JSON so whitespace/key order changes do not write.
+	var content any
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&content); err != nil {
+		return fmt.Errorf("postgres store: invalid auth JSON: %w", err)
+	}
+	canonical, err := json.Marshal(content)
+	if err != nil {
+		return err
+	}
+	hash := sha256.Sum256(canonical)
+	if old, ok := s.authHashes[relID]; ok && old == hash {
+		return nil
+	}
+	if err := s.writeAuthRecord(ctx, relID, data); err != nil {
+		return err
+	}
+	if s.authHashes == nil {
+		s.authHashes = make(map[string][32]byte)
+	}
+	s.authHashes[relID] = hash
+	return nil
+}
+
+func (s *PostgresStore) writeAuthRecord(ctx context.Context, relID string, data []byte) error {
 	if s.persistAuthFn != nil {
 		return s.persistAuthFn(ctx, relID, data)
 	}
@@ -586,6 +615,7 @@ func (s *PostgresStore) persistAuth(ctx context.Context, relID string, data []by
 }
 
 func (s *PostgresStore) deleteAuthRecord(ctx context.Context, relID string) error {
+	delete(s.authHashes, relID)
 	query := fmt.Sprintf("DELETE FROM %s WHERE id = $1", s.fullTableName(s.cfg.AuthTable))
 	if _, err := s.db.ExecContext(ctx, query, relID); err != nil {
 		return fmt.Errorf("postgres store: delete auth record: %w", err)

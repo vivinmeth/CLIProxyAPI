@@ -22,6 +22,10 @@ models:
 
 # Listener, TLS, network discovery, and server operation.
 server:
+  # Shutdown budget in seconds for HTTP/SSE/WebSocket drain plus worker flushes.
+  # Reserve up to 5 seconds for final persistence; 0 closes connections immediately.
+  shutdown-drain-timeout: 90
+
   # Server host/interface to bind to. Default is empty ("") to bind all interfaces (IPv4 + IPv6).
   # Use "127.0.0.1" or "localhost" to restrict access to local machine only.
   host: ""
@@ -152,6 +156,8 @@ routing:
     five-hour-threshold: 0.95
     seven-day-threshold: 0.98
     max-inflight-per-credential: 0 # 0 disables the cap; unknown credentials still get one probe.
+  # Persist live session bindings in the tmx database (default true when configured).
+  session-affinity-persist: true
   strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first, reset-soonest
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
@@ -1286,3 +1292,9 @@ plugins:
 #     switch-project: true
 #     switch-preview-model: true
 # antigravity-credits moved to oauth.providers.antigravity.antigravity-credits.
+
+
+# Full-traffic capture spills to the archive spool before exceeding these byte limits.
+archive:
+  live-capture-max-bytes: 536870912 # 512 MiB shared across live and queued captures
+  live-capture-exchange-max-bytes: 8388608 # 8 MiB per exchange; larger bodies stream to disk

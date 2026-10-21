@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/sessionbindings"
 	"os"
 	"time"
 
@@ -67,7 +69,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	defer func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), max(s.currentConfig().ShutdownDrainTimeout(), 5*time.Second))
 		defer shutdownCancel()
 		if errShutdown := s.Shutdown(shutdownCtx); errShutdown != nil {
 			log.Errorf("service shutdown returned error: %v", errShutdown)
@@ -101,6 +103,20 @@ func (s *Service) Run(ctx context.Context) error {
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(ctx, interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+	}
+
+	if !homeEnabled && s.coreManager != nil {
+		if store := requestlog.Default(); store != nil {
+			enabled := func() bool {
+				cfg := s.currentConfig()
+				return cfg != nil && cfg.Routing.SessionAffinity && (cfg.Routing.SessionAffinityPersist == nil || *cfg.Routing.SessionAffinityPersist)
+			}
+			var errBindings error
+			s.sessionBindings, errBindings = sessionbindings.Start(context.Background(), store.DB(), store.Schema(), s.coreManager, enabled)
+			if errBindings != nil {
+				log.WithError(errBindings).Warn("tmx: session persistence disabled")
+			}
+		}
 	}
 
 	if !homeEnabled {
@@ -244,7 +260,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 }
 
-// Shutdown stops background workers and immediately closes the HTTP server.
+// Shutdown drains requests before stopping their supporting workers.
 // It ensures all resources are properly cleaned up and connections are closed.
 // The shutdown is idempotent and can be called multiple times safely.
 //
@@ -262,6 +278,24 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if ctx == nil {
 			ctx = context.Background()
 		}
+
+		ctx, shutdownCancel, drainCtx, drainCancel := s.tmxShutdownWindow(ctx)
+		defer shutdownCancel()
+		defer drainCancel()
+		if s.server != nil {
+			if errStop := s.server.Stop(drainCtx); errStop != nil {
+				log.Errorf("error stopping API server: %v", errStop)
+				if shutdownErr == nil {
+					shutdownErr = errStop
+				}
+			}
+		}
+
+		s.sessionBindings.CloseContext(ctx)
+		if errUsage := usage.DefaultManager().StopAndWait(ctx); errUsage != nil {
+			log.WithError(errUsage).Warn("tmx: usage drain window elapsed")
+		}
+		s.flushTMXWorkers(ctx)
 
 		s.homeMu.Lock()
 		runCancel := s.runCancel
@@ -361,15 +395,6 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		// no legacy clients to persist
-
-		if s.server != nil {
-			if errStop := s.server.Stop(ctx); errStop != nil {
-				log.Errorf("error stopping API server: %v", errStop)
-				if shutdownErr == nil {
-					shutdownErr = errStop
-				}
-			}
-		}
 
 		if s.pluginHost != nil {
 			sdktranslator.SetPluginHooks(nil)

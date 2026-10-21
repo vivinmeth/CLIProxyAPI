@@ -19,6 +19,19 @@ func (a *tmxAdmission) counter(id string) *atomic.Int64 {
 	return v.(*atomic.Int64)
 }
 
+// InFlightCount reports upstream requests currently holding an admission
+// reservation on the credential (reset-soonest only; 0 otherwise).
+func (m *Manager) InFlightCount(authID string) int {
+	if m == nil {
+		return 0
+	}
+	v, ok := m.tmxAdmission.counts.Load(authID)
+	if !ok {
+		return 0
+	}
+	return int(v.(*atomic.Int64).Load())
+}
+
 type tmxAdmissionKey struct{}
 type tmxAdmissionViewKey struct{}
 type tmxAdmissionView struct {

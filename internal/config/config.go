@@ -4,8 +4,12 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+import "time"
+
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
+	Archive ArchiveConfig `yaml:"archive" json:"archive"`
+	Server  ServerConfig  `yaml:"server" json:"server"`
 	// Models selects optional catalog sources independently for each catalog.
 	Models ModelCatalogs `yaml:"models" json:"models"`
 
@@ -200,4 +204,25 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+}
+
+// ServerConfig controls the bounded shutdown window. Nil uses 90 seconds; zero closes immediately.
+type ServerConfig struct {
+	ShutdownDrainTimeout *int `yaml:"shutdown-drain-timeout,omitempty" json:"shutdown-drain-timeout,omitempty"`
+}
+
+func (c *Config) ShutdownDrainTimeout() time.Duration {
+	if c == nil || c.Server.ShutdownDrainTimeout == nil {
+		return 90 * time.Second
+	}
+	if *c.Server.ShutdownDrainTimeout < 0 {
+		return 0
+	}
+	return time.Duration(*c.Server.ShutdownDrainTimeout) * time.Second
+}
+
+// ArchiveConfig bounds fork capture allocations before they happen. Hot reload is supported.
+type ArchiveConfig struct {
+	LiveCaptureMaxBytes         int64 `yaml:"live-capture-max-bytes,omitempty" json:"live-capture-max-bytes,omitempty"`
+	LiveCaptureExchangeMaxBytes int64 `yaml:"live-capture-exchange-max-bytes,omitempty" json:"live-capture-exchange-max-bytes,omitempty"`
 }

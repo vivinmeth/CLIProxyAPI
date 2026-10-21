@@ -37,6 +37,8 @@ func Submit(ex *Exchange) {
 	}
 	if fn := sink.Load(); fn != nil {
 		(*fn)(ex)
+	} else {
+		ex.Release()
 	}
 }
 
@@ -49,20 +51,25 @@ type ChunkMark struct {
 // Exchange is one proxied HTTP exchange (one WebSocket connection counts as one exchange).
 // All byte slices are owned by the exchange; producers must pass copies.
 type Exchange struct {
-	TraceID         string
-	SessionID       string
-	URL             string
-	Method          string
-	StartedAt       time.Time
-	FinishedAt      time.Time
-	FirstChunkAt    time.Time
-	Status          int
-	Streaming       bool
-	RequestHeaders  map[string][]string
-	RequestBody     []byte
-	ResponseHeaders map[string][]string
-	ResponseBody    []byte
-	Chunks          []ChunkMark
+	// Bodies owns bounded memory/file sources, preferred over the legacy byte slices.
+	Bodies           map[string]*Body
+	TraceID          string
+	SessionID        string
+	ClientSessionID  string
+	RequestModel     string
+	RequestStreaming bool
+	URL              string
+	Method           string
+	StartedAt        time.Time
+	FinishedAt       time.Time
+	FirstChunkAt     time.Time
+	Status           int
+	Streaming        bool
+	RequestHeaders   map[string][]string
+	RequestBody      []byte
+	ResponseHeaders  map[string][]string
+	ResponseBody     []byte
+	Chunks           []ChunkMark
 	// Upstream side, as recorded by the executors.
 	APIRequest           []byte
 	APIResponse          []byte

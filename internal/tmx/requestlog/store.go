@@ -46,12 +46,16 @@ type Store struct {
 	schema        string
 	retentionDays int
 	queue         chan Row
+	queueMu       sync.RWMutex
+	closing       bool
 	dropped       atomic.Int64
 	written       atomic.Int64
 	writeErrors   atomic.Int64
 	rejected      atomic.Int64 // rows the database refused one by one (logged, not retried)
 	pendingRows   atomic.Int64
 	stopOnce      sync.Once
+	closeWaitOnce sync.Once
+	closeDone     chan struct{}
 	done          chan struct{}
 
 	keyMachines atomic.Pointer[map[string]string] // api_key_hash -> machine (key_machines)
@@ -251,6 +255,12 @@ func (s *Store) Enqueue(row Row) {
 	if s == nil {
 		return
 	}
+	s.queueMu.RLock()
+	defer s.queueMu.RUnlock()
+	if s.closing {
+		s.dropped.Add(1)
+		return
+	}
 	if row.RowKey == "" {
 		row.RowKey = newRowKey()
 	}
@@ -287,7 +297,10 @@ func (s *Store) Close() {
 	}
 	s.stopOnce.Do(func() {
 		close(s.stopPrices)
+		s.queueMu.Lock()
+		s.closing = true
 		close(s.queue)
+		s.queueMu.Unlock()
 		<-s.done
 		_ = s.db.Close()
 	})

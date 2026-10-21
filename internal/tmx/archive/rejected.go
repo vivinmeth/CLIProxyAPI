@@ -20,7 +20,7 @@ var modelPathPrefixes = []string{"/v1/", "/v1beta/", "/v1beta1/", "/api/provider
 // request-log row (outcome "rejected"). Exchanges that reached an upstream are recorded by the
 // usage plugin instead, so they return false here.
 func rejectedRow(ex *capture.Exchange) (requestlog.Row, bool) {
-	if ex == nil || ex.Status < 400 || len(ex.APIRequest) > 0 || len(ex.APIWebsocketTimeline) > 0 {
+	if ex == nil || ex.Status < 400 || ex.BodySize("upstream.request", ex.APIRequest) > 0 || ex.BodySize("upstream.ws", ex.APIWebsocketTimeline) > 0 {
 		return requestlog.Row{}, false
 	}
 	if ex.Method != http.MethodPost && !(ex.Method == http.MethodGet && isWebsocket(ex.RequestHeaders)) {
@@ -40,7 +40,11 @@ func rejectedRow(ex *capture.Exchange) (requestlog.Row, bool) {
 		latency = ex.FinishedAt.Sub(ex.StartedAt).Milliseconds()
 	}
 	clientIP, _, _ := strings.Cut(h.Get("X-Forwarded-For"), ",")
-	model := gjson.GetBytes(ex.RequestBody, "model").String()
+	request := capturePrefix(ex, "request", ex.RequestBody, 1<<20)
+	model := ex.RequestModel
+	if model == "" {
+		model = gjson.GetBytes(request, "model").String()
+	}
 	return requestlog.Row{
 		Source:     requestlog.SourceProxy,
 		TS:         ex.StartedAt.UTC(),
@@ -53,10 +57,10 @@ func rejectedRow(ex *capture.Exchange) (requestlog.Row, bool) {
 		Machine:    requestlog.MachineFromKey(key),
 		ClientIP:   strings.TrimSpace(clientIP),
 		UserAgent:  truncateString(h.Get("User-Agent"), 300),
-		Stream:     gjson.GetBytes(ex.RequestBody, "stream").Bool(),
+		Stream:     ex.RequestStreaming || gjson.GetBytes(request, "stream").Bool(),
 		Outcome:    requestlog.OutcomeRejected,
 		StatusCode: ex.Status,
-		Error:      truncateString(string(ex.ResponseBody), rejectedErrorMax),
+		Error:      truncateString(string(capturePrefix(ex, "response", ex.ResponseBody, rejectedErrorMax)), rejectedErrorMax),
 		LatencyMs:  latency,
 	}, true
 }
