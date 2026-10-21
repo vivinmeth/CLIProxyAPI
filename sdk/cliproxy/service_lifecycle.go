@@ -282,6 +282,8 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		ctx, shutdownCancel, drainCtx, drainCancel := s.tmxShutdownWindow(ctx)
 		defer shutdownCancel()
 		defer drainCancel()
+		drained := make(chan struct{})
+		checkpointDone := s.startTMXShutdownCheckpoint(ctx, drainCtx, drained)
 		if s.server != nil {
 			if errStop := s.server.Stop(drainCtx); errStop != nil {
 				log.Errorf("error stopping API server: %v", errStop)
@@ -291,6 +293,11 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
+		close(drained)
+		select {
+		case <-checkpointDone:
+		case <-ctx.Done():
+		}
 		s.sessionBindings.CloseContext(ctx)
 		if errUsage := usage.DefaultManager().StopAndWait(ctx); errUsage != nil {
 			log.WithError(errUsage).Warn("tmx: usage drain window elapsed")

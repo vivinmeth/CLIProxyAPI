@@ -46,6 +46,7 @@ type Store struct {
 	schema        string
 	retentionDays int
 	queue         chan Row
+	flush         chan chan struct{}
 	queueMu       sync.RWMutex
 	closing       bool
 	dropped       atomic.Int64
@@ -134,6 +135,7 @@ func Open(ctx context.Context, dsn, schema string, retentionDays int) (*Store, e
 		schema:        schema,
 		retentionDays: retentionDays,
 		queue:         make(chan Row, queueSize),
+		flush:         make(chan chan struct{}),
 		done:          make(chan struct{}),
 		stopPrices:    make(chan struct{}),
 		spoolFile:     spoolPath(),
@@ -332,6 +334,24 @@ func (s *Store) run() {
 			batch = append(batch, row)
 			if len(batch) >= batchSize {
 				flush()
+			}
+		case ack := <-s.flush:
+			// Flush the snapshot accepted before the checkpoint, without stopping intake.
+			n := len(s.queue)
+			stopped := false
+			for i := 0; i < n; i++ {
+				row, ok := <-s.queue
+				if !ok {
+					stopped = true
+					break
+				}
+				batch = append(batch, row)
+			}
+			flush()
+			w.persistAt(time.Time{})
+			close(ack)
+			if stopped {
+				return
 			}
 		case <-ticker.C:
 			flush()

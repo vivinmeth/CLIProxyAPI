@@ -78,3 +78,19 @@ func TestStoreRoundTrip(t *testing.T) {
 		t.Fatalf("written = %d", store.written.Load())
 	}
 }
+
+func TestCheckpointFlushesAcceptedRowsWithoutClosingDatabase(t *testing.T) {
+	s, _ := openPricedStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, id := range []string{"checkpoint-before", "checkpoint-after"} {
+		s.Enqueue(Row{TS: time.Now().UTC(), TraceID: id, Provider: "claude", Model: "opus", Outcome: OutcomeSuccess})
+		if err := s.FlushContext(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM `+s.table()+` WHERE trace_id=$1`, id).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("checkpoint row=%d err=%v", count, err)
+		}
+	}
+}

@@ -201,3 +201,11 @@ func (w *Worker) CloseContext(ctx context.Context) {
 	case <-ctx.Done():
 	}
 }
+
+// FlushContext checkpoints bindings while the service still accepts completions.
+func (w *Worker) FlushContext(ctx context.Context) error {
+	if w == nil || !w.enabled() {
+		return nil
+	}
+	return w.store.Save(ctx, w.manager.SnapshotSessionBindings())
+}

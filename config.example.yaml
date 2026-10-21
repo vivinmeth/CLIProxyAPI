@@ -23,7 +23,8 @@ models:
 # Listener, TLS, network discovery, and server operation.
 server:
   # Shutdown budget in seconds for HTTP/SSE/WebSocket drain plus worker flushes.
-  # Reserve up to 5 seconds for final persistence; 0 closes connections immediately.
+  # Checkpoint workers by T+5s while draining; reserve up to 5s for final persistence.
+  # 0 closes connections immediately. Container stop grace must exceed this budget.
   shutdown-drain-timeout: 90
   # Active WebSocket responses get this shorter grace; idle sockets close at drain start.
   shutdown-websocket-grace: 10

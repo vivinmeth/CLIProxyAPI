@@ -16,3 +16,21 @@ func (a *Archive) CloseContext(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+
+// FlushContext waits for accepted exchanges to reach the durable blob spool and
+// index. R2 upload can finish later; the uploader resumes from the spool on boot.
+func (a *Archive) FlushContext(ctx context.Context) error {
+	if a == nil {
+		return nil
+	}
+	var pending []chan struct{}
+	a.pending.Range(func(_, done any) bool { pending = append(pending, done.(chan struct{})); return true })
+	for _, done := range pending {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}

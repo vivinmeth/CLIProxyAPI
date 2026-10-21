@@ -2,6 +2,8 @@ package cliproxy
 
 import (
 	"context"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/archive"
@@ -32,4 +34,51 @@ func (s *Service) flushTMXWorkers(ctx context.Context) {
 			log.WithError(err).Warn("tmx: shutdown flush window elapsed")
 		}
 	}
+}
+
+// The independent checkpoint starts by T+5s (earlier for short shutdown windows).
+// It keeps sinks open so turns that finish later in the drain are still recorded.
+func tmxCheckpointDelay(drain context.Context) time.Duration {
+	delay := 5 * time.Second
+	if deadline, ok := drain.Deadline(); ok {
+		delay = min(delay, max(0, time.Until(deadline)/2))
+	}
+	return delay
+}
+
+func tmxStartCheckpoint(ctx, drain context.Context, drained <-chan struct{}, workers ...func(context.Context) error) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		timer := time.NewTimer(tmxCheckpointDelay(drain))
+		defer timer.Stop()
+		select {
+		case <-drained:
+			return
+		case <-timer.C:
+		case <-drain.Done():
+		}
+		// Start every worker independently: a blocked archive or DB must not prevent
+		// another worker from even beginning its checkpoint before the deadline.
+		var wg sync.WaitGroup
+		for _, flush := range workers {
+			wg.Go(func() {
+				if err := flush(ctx); err != nil {
+					log.WithError(err).Warn("tmx: early shutdown checkpoint incomplete")
+				}
+			})
+		}
+		wg.Wait()
+	}()
+	return done
+}
+
+func (s *Service) startTMXShutdownCheckpoint(ctx, drain context.Context, drained <-chan struct{}) <-chan struct{} {
+	return tmxStartCheckpoint(ctx, drain, drained,
+		s.sessionBindings.FlushContext,
+		usage.DefaultManager().FlushContext,
+		quota.Default().FlushPassiveContext,
+		archive.Default().FlushContext,
+		requestlog.Default().FlushContext,
+	)
 }

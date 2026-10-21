@@ -16,3 +16,27 @@ func (s *Store) CloseContext(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+
+// FlushContext checkpoints accepted rows while leaving the writer and shared DB
+// open for requests still draining. Pending failures are also persisted to disk.
+func (s *Store) FlushContext(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	ack := make(chan struct{})
+	select {
+	case s.flush <- ack:
+	case <-s.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-ack:
+		return nil
+	case <-s.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}

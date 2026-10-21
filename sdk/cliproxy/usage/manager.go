@@ -408,8 +408,9 @@ type Plugin interface {
 }
 
 type queueItem struct {
-	ctx    context.Context
-	record Record
+	flushed chan struct{}
+	ctx     context.Context
+	record  Record
 }
 
 // Manager maintains a queue of usage records and delivers them to registered plugins.
@@ -564,6 +565,10 @@ func (m *Manager) run(ctx context.Context) {
 		item := m.queue[0]
 		m.queue = m.queue[1:]
 		m.mu.Unlock()
+		if item.flushed != nil {
+			close(item.flushed)
+			continue
+		}
 		m.dispatch(item)
 	}
 }

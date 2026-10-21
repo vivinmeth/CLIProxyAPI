@@ -56,6 +56,7 @@ type Archive struct {
 	closeDone     chan struct{}
 	closing       atomic.Bool
 	queueMu       sync.RWMutex
+	pending       sync.Map // accepted exchanges -> completion channels
 }
 
 var current atomic.Pointer[Archive]
@@ -315,9 +316,13 @@ func (a *Archive) enqueue(ex *capture.Exchange) {
 		a.drop()
 		return
 	}
+	finished := make(chan struct{})
+	a.pending.Store(ex, finished)
 	select {
 	case a.queue <- ex:
 	default:
+		a.pending.Delete(ex)
+		close(finished)
 		a.queueBytes.Add(-size)
 		ex.Release()
 		a.drop()
@@ -345,6 +350,9 @@ func (a *Archive) worker() {
 		cancel()
 		ex.Release()
 		a.queueBytes.Add(-size)
+		if done, ok := a.pending.LoadAndDelete(ex); ok {
+			close(done.(chan struct{}))
+		}
 	}
 }
 

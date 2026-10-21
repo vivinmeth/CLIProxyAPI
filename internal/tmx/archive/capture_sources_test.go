@@ -3,6 +3,7 @@ package archive
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"os"
 	"testing"
@@ -64,5 +65,52 @@ func TestArchiveDropReleasesCaptureSources(t *testing.T) {
 	a.enqueue(ex)
 	if capture.LiveBytes() != before {
 		t.Fatal("closing drop leaked memory")
+	}
+}
+
+func TestArchiveCheckpointWaitsForAcceptedExchangesAndKeepsIntakeOpen(t *testing.T) {
+	a, _ := openTestArchive(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for _, id := range []string{"checkpoint-before", "checkpoint-after"} {
+		a.enqueue(&capture.Exchange{TraceID: id, URL: "/v1/messages", Method: "POST", StartedAt: time.Now(), Status: 200, RequestBody: []byte(`{"model":"opus"}`)})
+		if err := a.FlushContext(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.GetExchange(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCapturePerBodyThresholdPreservesRequestDedup(t *testing.T) {
+	a, _ := openTestArchive(t)
+	capture.Configure(1024, 512, t.TempDir())
+	defer capture.Configure(0, 0, "")
+	group := &capture.Group{}
+	payload := []byte(`{"messages":[{"role":"user","content":"` + string(bytes.Repeat([]byte("x"), 260)) + `"}]}`)
+	ex := &capture.Exchange{Bodies: map[string]*capture.Body{"request": capture.CaptureInGroup(payload, nil, group), "upstream.request": capture.CaptureInGroup(payload, nil, group)}}
+	defer ex.Release()
+	var previous string
+	for _, name := range []string{"request", "upstream.request"} {
+		hash, err := a.putCapture(context.Background(), ex, name, nil, "application/json", "request", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := a.blobs.Get(context.Background(), hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var manifest Manifest
+		if err = json.Unmarshal(raw, &manifest); err != nil {
+			t.Fatal(err)
+		}
+		if manifest.Format != "json" || len(manifest.Keys) == 0 || len(manifest.Keys[0].Items) != 1 {
+			t.Fatalf("small independent body lost section dedup: %+v", manifest)
+		}
+		if previous != "" && hash != previous {
+			t.Fatal("request copies did not dedup")
+		}
+		previous = hash
 	}
 }

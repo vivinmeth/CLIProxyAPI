@@ -14,6 +14,14 @@ func (s *Service) CloseContext(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	return s.FlushPassiveContext(ctx)
+}
+
+// FlushPassiveContext checkpoints current per-window observations without stopping polling.
+func (s *Service) FlushPassiveContext(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
 	for _, a := range s.fetch.TmxAuths() {
 		spec, _, ok := specFor(a)
 		if !ok || a.Quota.ObservedAt.IsZero() {
