@@ -55,3 +55,59 @@ func TestQuotaRoutingSeedAndPoll(t *testing.T) {
 		t.Fatal("tick resurrected snapshot after reset clearing")
 	}
 }
+
+// Load test B3: the boot seed runs before the watcher bootstrap re-syncs every auth file. The
+// re-sync (a plain Update of the same account) must not discard the seeded readings, which the
+// seed does not re-apply within the same registration.
+func TestQuotaBootSeedSurvivesWatcherResync(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	f := &fakeFetcher{auths: []*coreauth.Auth{{ID: "resync-a-hot", Provider: "claude", Status: coreauth.StatusActive}, {ID: "resync-b-cool", Provider: "claude", Status: coreauth.StatusActive}}, calls: map[string]int{}, status: 200}
+	s := openTestService(t, f, &now)
+	if _, err := s.db.Exec(`DELETE FROM ` + s.table); err != nil {
+		t.Fatal(err)
+	}
+	// resync-a-hot has the soonest weekly reset but is at 97% of its 5h window.
+	rows := []struct {
+		id, window string
+		used       float64
+		reset      time.Duration
+	}{
+		{"resync-a-hot", "7d", 20, time.Hour}, {"resync-a-hot", "5h", 97, 2 * time.Hour},
+		{"resync-b-cool", "7d", 20, 120 * time.Hour}, {"resync-b-cool", "5h", 10, 2 * time.Hour},
+	}
+	for _, r := range rows {
+		if _, err := s.db.Exec(`INSERT INTO `+s.table+` (ts,auth_id,provider,"window",used_pct,resets_at,source) VALUES ($1,$2,'claude',$3,$4,$5,'polled')`, now.Add(-time.Minute), r.id, r.window, r.used, now.Add(r.reset)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := coreauth.NewManager(nil, &coreauth.ResetSoonestSelector{}, nil)
+	for _, a := range f.auths {
+		if _, err := m.Register(context.Background(), a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	restored, err := newService(context.Background(), s.db, "tmxq", f, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pick := func() string {
+		t.Helper()
+		selected, errPick := (&coreauth.ResetSoonestSelector{}).Pick(m.PoolSelectionContext(context.Background()), "claude", "", executor.Options{}, m.List())
+		if errPick != nil {
+			t.Fatal(errPick)
+		}
+		return selected.ID
+	}
+	if got := pick(); got != "resync-b-cool" {
+		t.Fatalf("boot seed: picked %s, want resync-b-cool", got)
+	}
+	for _, a := range f.auths {
+		if _, err = m.Update(context.Background(), &coreauth.Auth{ID: a.ID, Provider: a.Provider, Status: coreauth.StatusActive}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	restored.seedRouting()
+	if got := pick(); got != "resync-b-cool" {
+		t.Fatalf("after the watcher re-sync picked %s: the seeded 97%% reading was lost", got)
+	}
+}

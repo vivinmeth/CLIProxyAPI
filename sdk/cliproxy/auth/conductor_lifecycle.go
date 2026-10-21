@@ -124,6 +124,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.RegistrationEpoch = m.authEpochs[auth.ID]
 	if existing, exists := m.auths[auth.ID]; exists && existing != nil {
 		auth.CredentialVersion = max(auth.CredentialVersion, existing.CredentialVersion) + 1
+		preserveQuotaObservations(existing, auth) // tmx
 	} else if auth.CredentialVersion == 0 {
 		auth.CredentialVersion = 1
 	}
@@ -415,6 +416,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			}
 		}
 	}
+	preserveQuotaObservations(existing, auth) // tmx
 	now := time.Now()
 	auth.UpdatedAt = now
 	cooldownStateChanged = normalizeModelStates(auth) || cooldownStateChanged
