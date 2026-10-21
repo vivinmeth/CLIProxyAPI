@@ -45,15 +45,15 @@ type Archive struct {
 
 	analytics *analytics // derived query layer; nil when TMX_ANALYTICS_DSN is unset
 
-	queue      chan *capture.Exchange
-	queueBytes atomic.Int64
-	captured   atomic.Int64
-	dropped    atomic.Int64
-	failed     atomic.Int64
-	wg         sync.WaitGroup
-	closeOnce  sync.Once
-	closing    atomic.Bool
-	queueMu    sync.RWMutex
+	queue         chan *capture.Exchange
+	queueBytes    atomic.Int64
+	captured      atomic.Int64
+	dropped       atomic.Int64
+	failed        atomic.Int64
+	wg            sync.WaitGroup
+	closeOnce     sync.Once
+	closing       atomic.Bool
+	queueMu       sync.RWMutex
 }
 
 var current atomic.Pointer[Archive]
@@ -302,19 +302,22 @@ func (a *Archive) enqueue(ex *capture.Exchange) {
 	a.queueMu.RLock()
 	defer a.queueMu.RUnlock()
 	if a.closing.Load() {
+		ex.Release()
 		a.drop()
 		return
 	}
-	size := int64(len(ex.RequestBody) + len(ex.ResponseBody) + len(ex.APIRequest) + len(ex.APIResponse) +
-		len(ex.WebsocketTimeline) + len(ex.APIWebsocketTimeline))
-	if a.queueBytes.Load()+size > queueBytesLimit {
+	size := exchangeMemory(ex)
+	if a.queueBytes.Add(size) > queueBytesLimit {
+		a.queueBytes.Add(-size)
+		ex.Release()
 		a.drop()
 		return
 	}
 	select {
 	case a.queue <- ex:
-		a.queueBytes.Add(size)
 	default:
+		a.queueBytes.Add(-size)
+		ex.Release()
 		a.drop()
 	}
 }
@@ -328,8 +331,7 @@ func (a *Archive) drop() {
 func (a *Archive) worker() {
 	defer a.wg.Done()
 	for ex := range a.queue {
-		size := int64(len(ex.RequestBody) + len(ex.ResponseBody) + len(ex.APIRequest) + len(ex.APIResponse) +
-			len(ex.WebsocketTimeline) + len(ex.APIWebsocketTimeline))
+		size := exchangeMemory(ex)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		if err := a.storeExchange(ctx, ex); err != nil {
 			if a.failed.Add(1)%20 == 1 {
@@ -339,6 +341,7 @@ func (a *Archive) worker() {
 			a.captured.Add(1)
 		}
 		cancel()
+		ex.Release()
 		a.queueBytes.Add(-size)
 	}
 }
@@ -362,11 +365,12 @@ func redactHeaders(h map[string][]string) map[string][]string {
 }
 
 func (a *Archive) storeExchange(ctx context.Context, ex *capture.Exchange) error {
-	clientSession := clientSessionID(ex.RequestHeaders, ex.RequestBody)
+	requestPrefix := capturePrefix(ex, "request", ex.RequestBody, 1<<20)
+	clientSession := clientSessionID(ex.RequestHeaders, requestPrefix)
 	if ex.SessionID == "" {
 		// The middleware runs before session resolution; derive it the same way upstream does so
 		// exchanges join tmx.requests.session_id.
-		if info, ok := coresession.ExtractSessionInfo(http.Header(ex.RequestHeaders), ex.RequestBody, nil); ok {
+		if info, ok := coresession.ExtractSessionInfo(http.Header(ex.RequestHeaders), requestPrefix, nil); ok {
 			ex.SessionID = coresession.NormalizeToCanonicalUUID(info.SessionID)
 			if ex.SessionID == "" {
 				ex.SessionID = info.SessionID
@@ -395,31 +399,36 @@ func (a *Archive) storeExchange(ctx context.Context, ex *capture.Exchange) error
 	if row.reqHeaders, err = headers(ex.RequestHeaders, "request.headers"); err != nil {
 		return err
 	}
-	if row.reqBody, err = a.splitBody(ctx, ex.RequestBody, "request"); err != nil {
+	if row.reqBody, err = a.putCapture(ctx, ex, "request", ex.RequestBody, "application/json", "request", true); err != nil {
 		return err
 	}
 	if row.respHeaders, err = headers(ex.ResponseHeaders, "response.headers"); err != nil {
 		return err
 	}
-	if row.respBody, err = put(ex.ResponseBody, contentTypeOf(ex.ResponseHeaders), "response.body"); err != nil {
+	if row.respBody, err = a.putCapture(ctx, ex, "response", ex.ResponseBody, contentTypeOf(ex.ResponseHeaders), "response.body", false); err != nil {
 		return err
 	}
-	if len(ex.Chunks) > 0 {
+	if ex.Bodies["chunks"] != nil {
+		row.chunks, err = a.putCapture(ctx, ex, "chunks", nil, "application/json", "response.chunks", false)
+		if err != nil {
+			return err
+		}
+	} else if len(ex.Chunks) > 0 {
 		data, _ := json.Marshal(ex.Chunks)
 		if row.chunks, err = put(data, "application/json", "response.chunks"); err != nil {
 			return err
 		}
 	}
-	if row.upReq, err = a.splitBody(ctx, ex.APIRequest, "upstream.request"); err != nil {
+	if row.upReq, err = a.putCapture(ctx, ex, "upstream.request", ex.APIRequest, "text/plain", "upstream.request", true); err != nil {
 		return err
 	}
-	if row.upResp, err = put(ex.APIResponse, "text/plain", "upstream.response"); err != nil {
+	if row.upResp, err = a.putCapture(ctx, ex, "upstream.response", ex.APIResponse, "text/plain", "upstream.response", false); err != nil {
 		return err
 	}
-	if row.ws, err = put(ex.WebsocketTimeline, "text/plain", "ws.timeline"); err != nil {
+	if row.ws, err = a.putCapture(ctx, ex, "ws", ex.WebsocketTimeline, "text/plain", "ws.timeline", false); err != nil {
 		return err
 	}
-	if row.upWS, err = put(ex.APIWebsocketTimeline, "text/plain", "upstream.ws.timeline"); err != nil {
+	if row.upWS, err = a.putCapture(ctx, ex, "upstream.ws", ex.APIWebsocketTimeline, "text/plain", "upstream.ws.timeline", false); err != nil {
 		return err
 	}
 	errorsJSON, _ := json.Marshal(append([]string{}, ex.Errors...))
@@ -450,7 +459,7 @@ func (a *Archive) storeExchange(ctx context.Context, ex *capture.Exchange) error
 		traceID, ex.StartedAt.UTC(), nullTime(ex.FinishedAt), ex.SessionID, ex.Method, ex.URL, ex.Status,
 		ex.Streaming, firstChunk, duration, row.reqHeaders, row.reqBody, row.respHeaders, row.respBody,
 		row.chunks, row.upReq, row.upResp, row.ws, row.upWS, string(errorsJSON),
-		len(ex.RequestBody), len(ex.ResponseBody), clientSession)
+		ex.BodySize("request", ex.RequestBody), ex.BodySize("response", ex.ResponseBody), clientSession)
 	if err == nil && a.analytics != nil {
 		a.analytics.poke()
 	}
@@ -508,24 +517,26 @@ func (a *Archive) Stats() map[string]any {
 		log.WithError(errCost).Debug("tmx archive: cost estimate failed")
 	}
 	return map[string]any{
-		"r2_cost_estimate": cost,
-		"env":              a.env,
-		"capture":          capture.Enabled(),
-		"captured":         a.captured.Load(),
-		"dropped":          a.dropped.Load(),
-		"failed":           a.failed.Load(),
-		"queued":           len(a.queue),
-		"queued_bytes":     a.queueBytes.Load(),
-		"blobs_stored":     a.blobs.stored.Load(),
-		"blobs_deduped":    a.blobs.dedup.Load(),
-		"blobs_uploaded":   a.blobs.uploaded.Load(),
-		"packs_uploaded":   a.blobs.packs.Load(),
-		"read_cache":       a.blobs.cache.stats(),
-		"upload_failures":  a.blobs.failures.Load(),
-		"unbacked_swept":   a.blobs.swept.Load(),
-		"spool_backlog":    a.blobs.SpoolBacklog(),
-		"r2_configured":    a.blobs.r2 != nil,
-		"analytics":        a.analytics != nil,
+		"r2_cost_estimate":     cost,
+		"env":                  a.env,
+		"capture":              capture.Enabled(),
+		"live_capture_bytes":   capture.LiveBytes(),
+		"live_capture_dropped": capture.Dropped(),
+		"captured":             a.captured.Load(),
+		"dropped":              a.dropped.Load(),
+		"failed":               a.failed.Load(),
+		"queued":               len(a.queue),
+		"queued_bytes":         a.queueBytes.Load(),
+		"blobs_stored":         a.blobs.stored.Load(),
+		"blobs_deduped":        a.blobs.dedup.Load(),
+		"blobs_uploaded":       a.blobs.uploaded.Load(),
+		"packs_uploaded":       a.blobs.packs.Load(),
+		"read_cache":           a.blobs.cache.stats(),
+		"upload_failures":      a.blobs.failures.Load(),
+		"unbacked_swept":       a.blobs.swept.Load(),
+		"spool_backlog":        a.blobs.SpoolBacklog(),
+		"r2_configured":        a.blobs.r2 != nil,
+		"analytics":            a.analytics != nil,
 	}
 }
 

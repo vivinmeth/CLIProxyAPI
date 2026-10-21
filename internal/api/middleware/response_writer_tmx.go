@@ -6,8 +6,8 @@ package middleware
 // client, with per-chunk timing, and submits the whole exchange at Finalize.
 
 import (
-	"bytes"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -17,9 +17,11 @@ import (
 )
 
 type tmxCapture struct {
-	body   bytes.Buffer
-	chunks []capture.ChunkMark
-	first  time.Time
+	group      *capture.Group
+	body       *capture.Body
+	chunks     *capture.Body
+	chunkCount int
+	first      time.Time
 }
 
 // tmxTee records a chunk written to the client. Called after the client write.
@@ -28,7 +30,8 @@ func (w *ResponseWriterWrapper) tmxTee(data []byte) {
 		return
 	}
 	if w.tmx == nil {
-		w.tmx = &tmxCapture{}
+		group := &capture.Group{}
+		w.tmx = &tmxCapture{group: group, body: group.NewBody(), chunks: group.NewBody()}
 	}
 	now := time.Now()
 	if w.tmx.first.IsZero() {
@@ -42,14 +45,31 @@ func (w *ResponseWriterWrapper) tmxTee(data []byte) {
 	if !start.IsZero() {
 		offset = now.Sub(start).Milliseconds()
 	}
-	w.tmx.body.Write(data)
-	w.tmx.chunks = append(w.tmx.chunks, capture.ChunkMark{OffsetMs: offset, Size: len(data)})
+	_, _ = w.tmx.body.Write(data)
+	var mark [96]byte
+	p := mark[:0]
+	if w.tmx.chunkCount == 0 {
+		p = append(p, '[')
+	} else {
+		p = append(p, ',')
+	}
+	p = append(p, `{"t":`...)
+	p = strconv.AppendInt(p, offset, 10)
+	p = append(p, `,"n":`...)
+	p = strconv.AppendInt(p, int64(len(data)), 10)
+	p = append(p, '}')
+	_, _ = w.tmx.chunks.Write(p)
+	w.tmx.chunkCount++
 }
 
 // tmxSubmit hands the finished exchange to the archive. It runs at the start of Finalize, while
 // the gin context and every spooled source are still available, and copies what it needs.
 func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
 	if c == nil || !capture.Enabled() || w.requestInfo == nil {
+		if w.tmx != nil {
+			w.tmx.body.Release()
+			w.tmx.chunks.Release()
+		}
 		return
 	}
 	ex := &capture.Exchange{
@@ -61,30 +81,43 @@ func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
 		Status:          status,
 		Streaming:       w.isStreaming,
 		RequestHeaders:  w.requestInfo.Headers,
-		RequestBody:     bytes.Clone(w.extractRequestBody(c)),
+		Bodies:          map[string]*capture.Body{},
 		ResponseHeaders: w.cloneHeaders(),
 		APIResponseAt:   w.extractAPIResponseTimestamp(c),
 	}
 	if c.Request != nil {
 		ex.SessionID = logging.GetClientRequestMetadata(c.Request.Context()).SessionID
 	}
+	group := &capture.Group{}
+	if w.tmx != nil {
+		group = w.tmx.group
+	}
+	ex.Bodies["request"] = capture.CaptureInGroup(w.extractRequestBody(c), nil, group)
 	if override := extractBodyOverride(c, responseBodyOverrideContextKey); len(override) > 0 {
-		ex.ResponseBody = bytes.Clone(override)
+		ex.Bodies["response"] = capture.CaptureInGroup(override, nil, group)
+		if w.tmx != nil {
+			w.tmx.body.Release()
+		}
 	} else if w.tmx != nil {
-		ex.ResponseBody = bytes.Clone(w.tmx.body.Bytes())
+		ex.Bodies["response"] = w.tmx.body
 	}
 	if w.tmx != nil {
-		ex.Chunks = w.tmx.chunks
+		if w.tmx.chunkCount > 0 {
+			_, _ = w.tmx.chunks.Write([]byte("]"))
+			ex.Bodies["chunks"] = w.tmx.chunks
+		} else {
+			w.tmx.chunks.Release()
+		}
 		ex.FirstChunkAt = w.tmx.first
 	}
-	ex.APIRequest = w.extractAPIRequest(c)
-	if len(ex.APIRequest) == 0 {
-		ex.APIRequest = w.extractDeferredAPIRequest(c)
+	request := w.extractAPIRequest(c)
+	if len(request) == 0 {
+		request = w.extractDeferredAPIRequest(c)
 	}
-	ex.APIRequest = withSource(ex.APIRequest, w.extractAPIRequestSource(c))
-	ex.APIResponse = withSource(w.extractAPIResponse(c), w.extractAPIResponseSource(c))
-	ex.WebsocketTimeline = withSource(w.extractWebsocketTimeline(c), w.extractWebsocketTimelineSource(c))
-	ex.APIWebsocketTimeline = withSource(w.extractAPIWebsocketTimeline(c), w.extractAPIWebsocketTimelineSource(c))
+	ex.Bodies["upstream.request"] = capture.CaptureInGroup(request, w.extractAPIRequestSource(c), group)
+	ex.Bodies["upstream.response"] = capture.CaptureInGroup(w.extractAPIResponse(c), w.extractAPIResponseSource(c), group)
+	ex.Bodies["ws"] = capture.CaptureInGroup(w.extractWebsocketTimeline(c), w.extractWebsocketTimelineSource(c), group)
+	ex.Bodies["upstream.ws"] = capture.CaptureInGroup(w.extractAPIWebsocketTimeline(c), w.extractAPIWebsocketTimelineSource(c), group)
 	if raw, ok := c.Get("API_RESPONSE_ERROR"); ok {
 		if errs, okErrs := raw.([]*interfaces.ErrorMessage); okErrs {
 			for _, e := range errs {
@@ -99,18 +132,9 @@ func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
 			}
 		}
 	}
+	if ex.CaptureError() != nil {
+		ex.Release()
+		return
+	}
 	capture.Submit(ex)
-}
-
-// withSource appends a spooled source's bytes (without consuming or deleting it) to payload.
-func withSource(payload []byte, source *logging.FileBodySource) []byte {
-	out := bytes.Clone(payload)
-	if source == nil || !source.HasPayload() {
-		return out
-	}
-	data, err := source.Bytes()
-	if err != nil {
-		return out
-	}
-	return append(out, data...)
 }

@@ -8,7 +8,8 @@ import "time"
 
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
-	Server ServerConfig `yaml:"server" json:"server"`
+	Archive ArchiveConfig `yaml:"archive" json:"archive"`
+	Server  ServerConfig  `yaml:"server" json:"server"`
 	// Models selects optional catalog sources independently for each catalog.
 	Models ModelCatalogs `yaml:"models" json:"models"`
 
@@ -218,4 +219,10 @@ func (c *Config) ShutdownDrainTimeout() time.Duration {
 		return 0
 	}
 	return time.Duration(*c.Server.ShutdownDrainTimeout) * time.Second
+}
+
+// ArchiveConfig bounds fork capture allocations before they happen. Hot reload is supported.
+type ArchiveConfig struct {
+	LiveCaptureMaxBytes         int64 `yaml:"live-capture-max-bytes,omitempty" json:"live-capture-max-bytes,omitempty"`
+	LiveCaptureExchangeMaxBytes int64 `yaml:"live-capture-exchange-max-bytes,omitempty" json:"live-capture-exchange-max-bytes,omitempty"`
 }
