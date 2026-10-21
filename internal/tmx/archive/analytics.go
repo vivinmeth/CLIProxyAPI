@@ -560,9 +560,12 @@ func installRequestTriggers(ctx context.Context, db *sql.DB, table string) error
 	}
 	stmts := []string{
 		`CREATE OR REPLACE FUNCTION ` + schema + `.analytics_journal_requests() RETURNS trigger LANGUAGE plpgsql AS $$
-		BEGIN
-			IF TG_OP = 'TRUNCATE' THEN
-				INSERT INTO ` + journalTable + ` (kind, ref) VALUES ('requests_truncate', '*');
+				BEGIN
+			-- Bulk updates (the request log's pricing pass) journal one full reconcile, not a row
+			-- each: hundreds of thousands of entries would hold live usage back.
+			IF TG_OP = 'TRUNCATE' OR (TG_OP = 'UPDATE' AND current_setting('tmx.analytics_bulk', true) = 'on') THEN
+				INSERT INTO ` + journalTable + ` (kind, ref) SELECT 'requests_truncate', '*'
+					WHERE NOT EXISTS (SELECT 1 FROM ` + journalTable + ` WHERE kind = 'requests_truncate' AND attempts = 0);
 			ELSIF TG_OP = 'DELETE' THEN
 				INSERT INTO ` + journalTable + ` (kind, ref) SELECT 'request', id::text FROM old_rows;
 			ELSE

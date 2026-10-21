@@ -178,22 +178,25 @@ func (s *Store) pricePending(ctx context.Context, retryUnpriced bool) (int, erro
 	lastID := int64(0)
 	for {
 		rows, err := s.db.QueryContext(ctx, `SELECT id, provider, model, uncached_input, cache_read, cache_write,
-			cache_write_1h, output_non_reasoning, reasoning_tokens, speed, service_tier FROM `+s.table()+`
-			WHERE `+cond+` AND id > $1 ORDER BY id LIMIT $2`, lastID, pricesBatch)
+			cache_write_1h, output_non_reasoning, reasoning_tokens, speed, service_tier, `+pricingInputs+`
+			FROM `+s.table()+` t WHERE `+cond+` AND id > $1 ORDER BY id LIMIT $2`, lastID, pricesBatch)
 		if err != nil {
 			return total, err
 		}
 		var ids []int64
+		var fps []string
 		var batch []Row
 		for rows.Next() {
 			var id int64
+			var fp string
 			var r Row
 			if err = rows.Scan(&id, &r.Provider, &r.Model, &r.UncachedInput, &r.CacheRead, &r.CacheWrite,
-				&r.CacheWrite1h, &r.OutputNonReasoning, &r.ReasoningTokens, &r.Speed, &r.ServiceTier); err != nil {
+				&r.CacheWrite1h, &r.OutputNonReasoning, &r.ReasoningTokens, &r.Speed, &r.ServiceTier, &fp); err != nil {
 				_ = rows.Close()
 				return total, err
 			}
 			ids = append(ids, id)
+			fps = append(fps, fp)
 			batch = append(batch, r)
 		}
 		if err = rows.Err(); err != nil {
@@ -208,16 +211,22 @@ func (s *Store) pricePending(ctx context.Context, retryUnpriced bool) (int, erro
 		for i := range batch {
 			priceRow(&batch[i], snap)
 		}
-		if err = s.writePrices(ctx, ids, batch, snap.fetchedAt); err != nil {
+		if err = s.writePrices(ctx, ids, fps, batch, snap.fetchedAt); err != nil {
 			return total, err
 		}
 		total += len(batch)
 	}
 }
 
+// pricingInputs fingerprints what a row is priced on (columns of alias t).
+const pricingInputs = `md5(concat_ws('|', t.provider, t.model, t.uncached_input, t.cache_read, t.cache_write,
+	t.cache_write_1h, t.output_non_reasoning, t.reasoning_tokens, t.speed, t.service_tier))`
+
 // writePrices stores the cost columns of already-written rows, only where they are still unpriced
-// (a concurrent token update reprices the row itself).
-func (s *Store) writePrices(ctx context.Context, ids []int64, rows []Row, at time.Time) error {
+// and their pricing inputs are what was priced (a row changed meanwhile is left for the next
+// pass). It runs as a bulk update: the analytics trigger journals one reconcile instead of an
+// entry per row (tmx_archive.analytics_journal_requests reads tmx.analytics_bulk).
+func (s *Store) writePrices(ctx context.Context, ids []int64, fps []string, rows []Row, at time.Time) error {
 	n := len(ids)
 	inp, cr, cw, out, tot := make([]*float64, n), make([]*float64, n), make([]*float64, n), make([]*float64, n), make([]*float64, n)
 	as, src := make([]string, n), make([]string, n)
@@ -226,15 +235,25 @@ func (s *Store) writePrices(ctx context.Context, ids []int64, rows []Row, at tim
 		inp[i], cr[i], cw[i], out[i], tot[i] = r.CostInput, r.CostCacheRead, r.CostCacheWrite, r.CostOutput, r.CostUSD
 		as[i], src[i] = r.PricedAs, *r.PriceSource
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE `+s.table()+` AS t SET cost_input = u.ci, cost_cache_read = u.ccr,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err = tx.ExecContext(ctx, `SET LOCAL tmx.analytics_bulk = 'on'`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE `+s.table()+` AS t SET cost_input = u.ci, cost_cache_read = u.ccr,
 		cost_cache_write = u.ccw, cost_output = u.co, cost_usd = u.ct, priced_as = u.pa, price_source = u.ps,
-		priced_at = $9
+		priced_at = $10
 		FROM unnest($1::bigint[], $2::float8[], $3::float8[], $4::float8[], $5::float8[], $6::float8[],
-			$7::text[], $8::text[]) AS u(id, ci, ccr, ccw, co, ct, pa, ps)
-		WHERE t.id = u.id AND (t.price_source IS NULL OR t.price_source = 'unpriced')`,
+			$7::text[], $8::text[], $9::text[]) AS u(id, ci, ccr, ccw, co, ct, pa, ps, fp)
+		WHERE t.id = u.id AND (t.price_source IS NULL OR t.price_source = 'unpriced') AND `+pricingInputs+` = u.fp`,
 		int64Array(ids), floatArray(inp), floatArray(cr), floatArray(cw), floatArray(out), floatArray(tot),
-		textArray(as), textArray(src), at)
-	return err
+		textArray(as), textArray(src), textArray(fps), at); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func int64Array(v []int64) string {

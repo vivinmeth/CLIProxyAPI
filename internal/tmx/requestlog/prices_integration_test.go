@@ -127,8 +127,8 @@ func TestWriterRejectsOnlyBadRows(t *testing.T) {
 	}
 }
 
-// While the database is down rows wait (nothing is dropped); at shutdown they go to the spool
-// and the next start writes them.
+// While the database is down rows wait (nothing is dropped) and are mirrored to the spool file;
+// the next start writes them, and a retry of rows that did commit inserts nothing twice.
 func TestWriterKeepsRowsWhileDatabaseIsDown(t *testing.T) {
 	s, schema := openPricedStore(t)
 	dsn := os.Getenv("TMX_REQUESTLOG_TEST_DSN")
@@ -142,15 +142,22 @@ func TestWriterKeepsRowsWhileDatabaseIsDown(t *testing.T) {
 	if len(w.pending) != 1 || down.dropped.Load() != 0 {
 		t.Fatalf("pending=%d dropped=%d", len(w.pending), down.dropped.Load())
 	}
-	w.spill()
 	if raw, errR := os.ReadFile(spoolPath()); errR != nil || !strings.Contains(string(raw), `"kept"`) {
 		t.Fatalf("spool = %q %v", raw, errR)
 	}
-	w2 := &writer{s: s, pending: s.readSpool()}
+	// "Crash" and restart: the spool is read back and written, then removed.
+	recovered := readSpool()
+	w2 := &writer{s: s, pending: recovered, spooled: len(recovered) > 0}
 	w2.write(nil)
+	// The same rows again (as if the first insert had committed without an acknowledgement).
+	w3 := &writer{s: s, pending: recovered}
+	w3.write(nil)
 	var n int
 	_ = s.db.QueryRow(`SELECT count(*) FROM ` + s.table() + ` WHERE trace_id = 'kept'`).Scan(&n)
 	if n != 1 {
 		t.Fatalf("spooled row written %d times", n)
+	}
+	if _, errS := os.Stat(spoolPath()); !os.IsNotExist(errS) {
+		t.Fatalf("spool file left behind: %v", errS)
 	}
 }

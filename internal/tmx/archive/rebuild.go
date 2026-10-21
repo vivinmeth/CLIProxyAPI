@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
@@ -102,35 +103,51 @@ func (a *Archive) RebuildUsage(ctx context.Context, harness string, dryRun bool)
 
 // Reshadow recomputes the shadowed flag of every imported usage row with the per-message rule
 // (usageRows): only rows from the session's first proxied call on duplicate proxied traffic.
-// Rows written when a whole session was shadowed get their direct turns back. Needs the request
-// log in the archive database; idempotent.
+// Rows written when a whole session was shadowed get their direct turns back. The first proxied
+// call is found exactly as at ingest (proxiedSince), for sessions marked as proxied only; one
+// set-based update applies it. Idempotent; rows already right aren't touched.
 func (a *Archive) Reshadow(ctx context.Context) (int64, error) {
 	store := requestlog.Default()
-	if !a.usageInArchiveDB(ctx, store) {
+	if store == nil {
 		return 0, nil
 	}
-	t := store.Schema() + ".requests"
-	// Same rule as proxiedSince: exchanges with the client's id, proxied rows under it or under
-	// the canonical ids those exchanges carry.
-	// Subagents ("<parent>:<agent>") also match their parent's id.
-	tag, err := a.db.ExecContext(ctx, `WITH ids AS (
-			SELECT s.id, COALESCE(s.via_proxy, false) AS via,
-				array_remove(ARRAY[s.external_id, NULLIF(split_part(s.external_id, ':', 1), s.external_id)], NULL) AS keys
-			FROM `+schema+`.sessions s WHERE s.via_proxy),
-		first AS (
-			SELECT ids.id, ids.via, LEAST(
-				(SELECT min(e.ts) FROM `+schema+`.exchanges e
-					WHERE e.client_session_id = ANY(ids.keys) OR e.session_id = ANY(ids.keys)),
-				(SELECT min(p.ts) FROM `+t+` p WHERE p.source = $1 AND (p.session_id = ANY(ids.keys)
-					OR p.session_id IN (SELECT e.session_id FROM `+schema+`.exchanges e
-						WHERE e.client_session_id = ANY(ids.keys) AND e.session_id <> '')))) AS since
-			FROM ids
-			UNION ALL
-			SELECT s.id, false, NULL::timestamptz FROM `+schema+`.sessions s WHERE s.via_proxy IS NOT TRUE)
-		UPDATE `+t+` r SET shadowed = (f.via AND f.since IS NOT NULL AND r.ts >= f.since)
-		FROM first f
-		WHERE r.import_ref IS NOT NULL AND split_part(r.import_ref, '#', 1) = f.id
-			AND r.shadowed IS DISTINCT FROM (f.via AND f.since IS NOT NULL AND r.ts >= f.since)`, requestlog.SourceProxy)
+	rows, err := a.db.QueryContext(ctx, `SELECT id, external_id, COALESCE(via_proxy, false) FROM `+schema+`.sessions`)
+	if err != nil {
+		return 0, err
+	}
+	var ids, since []string
+	type via struct{ id, ext string }
+	var proxied []via
+	for rows.Next() {
+		var id, ext string
+		var v bool
+		if err = rows.Scan(&id, &ext, &v); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if v {
+			proxied = append(proxied, via{id, ext})
+		} else {
+			ids, since = append(ids, id), append(since, "NULL")
+		}
+	}
+	if err = closeRows(rows); err != nil {
+		return 0, err
+	}
+	for _, p := range proxied {
+		ids = append(ids, p.id)
+		if t := a.proxiedSince(ctx, store, p.ext); t != nil {
+			since = append(since, t.UTC().Format(time.RFC3339Nano))
+		} else {
+			since = append(since, "NULL")
+		}
+	}
+	tag, err := store.DB().ExecContext(ctx, `UPDATE `+store.Schema()+`.requests r
+		SET shadowed = (u.since IS NOT NULL AND r.ts >= u.since)
+		FROM unnest($1::text[], $2::timestamptz[]) AS u(id, since)
+		WHERE r.import_ref IS NOT NULL AND split_part(r.import_ref, '#', 1) = u.id
+			AND r.shadowed IS DISTINCT FROM (u.since IS NOT NULL AND r.ts >= u.since)`,
+		pgTextArray(ids), "{"+strings.Join(since, ",")+"}")
 	if err != nil {
 		return 0, err
 	}

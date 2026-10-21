@@ -101,7 +101,11 @@ type Row struct {
 	// went through the proxy); they are excluded from totals unless asked for.
 	Shadowed bool `json:"shadowed"`
 
+	// RowKey identifies a proxied row across write retries (unique; empty for imported rows).
+	RowKey string `json:"row_key,omitempty"`
+
 	importRefPtr *string // scan/insert target for the nullable import_ref column
+	rowKeyPtr    *string // ... and row_key
 }
 
 // syncImportRef maps ImportRef to the nullable column (empty = NULL, so the unique index only
@@ -109,6 +113,11 @@ type Row struct {
 func (r *Row) syncImportRef() {
 	if r.Harness == "" {
 		r.Harness, r.ClientMode = HarnessFor(r.Source, r.UserAgent)
+	}
+	r.rowKeyPtr = nil
+	if r.RowKey != "" {
+		key := r.RowKey
+		r.rowKeyPtr = &key
 	}
 	if r.ImportRef == "" {
 		r.importRefPtr = nil
@@ -121,6 +130,9 @@ func (r *Row) syncImportRef() {
 func (r *Row) loadImportRef() {
 	if r.importRefPtr != nil {
 		r.ImportRef = *r.importRefPtr
+	}
+	if r.rowKeyPtr != nil {
+		r.RowKey = *r.rowKeyPtr
 	}
 }
 

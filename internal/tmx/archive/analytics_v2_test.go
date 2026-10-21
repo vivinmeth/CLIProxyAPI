@@ -10,6 +10,7 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
 	"github.com/tidwall/gjson"
 )
 
@@ -220,5 +221,33 @@ func TestPackUploadKeepsUnindexedSpoolAndSweeps(t *testing.T) {
 	b.uploadPending()
 	if got, err = b.Get(ctx, lostHash); err != nil || string(got) != string(lost) {
 		t.Fatalf("re-stored blob = %q %v", got, err)
+	}
+}
+
+// The request log's pricing pass is a bulk update: it journals one full reconcile, not an entry
+// per row, and analytics still ends up with the prices.
+func TestPricingPassJournalsOneReconcile(t *testing.T) {
+	a, an := openTestAnalytics(t)
+	rl := requestlog.Default()
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		if _, err := rl.DB().Exec(`INSERT INTO tmx.requests (ts, outcome, provider, model, uncached_input, total_tokens)
+			VALUES (now(), 'success', 'anthropic', 'claude-opus-5-5', 1000000, 1000000)`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	drain(t, an)
+	if n, err := rl.PricePending(ctx, false); err != nil || n != 5 {
+		t.Fatalf("priced %d (%v)", n, err)
+	}
+	var perRow, reconcile int
+	_ = a.db.QueryRow(`SELECT count(*) FILTER (WHERE kind = 'request'), count(*) FILTER (WHERE kind = 'requests_truncate')
+		FROM `+journalTable).Scan(&perRow, &reconcile)
+	if perRow != 0 || reconcile != 1 {
+		t.Fatalf("journal: %d request entries, %d reconciles", perRow, reconcile)
+	}
+	drain(t, an)
+	if n := count(t, an, `SELECT count(*) FROM requests WHERE cost_usd = 4`); n != 5 {
+		t.Fatalf("analytics priced rows = %d", n)
 	}
 }

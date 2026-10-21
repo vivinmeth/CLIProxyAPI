@@ -752,10 +752,12 @@ type usageTTFTRoundTripper struct {
 func (t usageTTFTRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	cliproxyexecutor.MarkUpstreamAttempt(req.Context())
 	// GetBody observes the final payload after user rules without consuming or
-	// rewriting the body sent upstream. Alias remains the client-facing name.
+	// rewriting the body sent upstream. Alias remains the client-facing name. Only a
+	// prefix is read ("model" leads the payloads we build): a full copy of every
+	// request body (large contexts, inline media) would be wasted memory.
 	if req.GetBody != nil {
 		if body, errBody := req.GetBody(); errBody == nil {
-			payload, errRead := io.ReadAll(body)
+			payload, errRead := io.ReadAll(io.LimitReader(body, 64<<10))
 			_ = body.Close()
 			if errRead == nil {
 				if model := gjson.GetBytes(payload, "model"); model.Type == gjson.String {
