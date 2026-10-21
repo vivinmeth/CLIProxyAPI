@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -514,11 +515,17 @@ func withCall(it ConvItem, callID string, isError bool) ConvItem {
 	return it
 }
 
-// withData attaches raw as the item's structured form when it is JSON (and not huge).
+// withData attaches raw as the item's structured form (not huge): JSON as is, free-form text (a
+// Codex apply_patch input) as a JSON string.
 func withData(it ConvItem, raw string) ConvItem {
 	raw = strings.TrimSpace(raw)
-	if raw != "" && len(raw) <= convMaxItemData && gjson.Valid(raw) {
+	if raw == "" || len(raw) > convMaxItemData {
+		return it
+	}
+	if gjson.Valid(raw) {
 		it.Data = raw
+	} else if b, err := json.Marshal(raw); err == nil {
+		it.Data = string(b)
 	}
 	return it
 }

@@ -76,6 +76,13 @@ func TestToolCallDataKeepsWholeArguments(t *testing.T) {
 	}
 }
 
+func TestFreeFormToolInputKeptAsString(t *testing.T) {
+	items := normalizeMessage(gjson.Parse(`{"type":"custom_tool_call","name":"apply_patch","call_id":"c","input":"*** Begin Patch\n*** End Patch"}`), "")
+	if gjson.Parse(items[0].Data).String() != "*** Begin Patch\n*** End Patch" {
+		t.Fatalf("data = %q", items[0].Data)
+	}
+}
+
 func TestPriceResolution(t *testing.T) {
 	cat, err := parsePriceCatalog([]byte(`{
 	"anthropic":{"models":{"claude-opus-5-5":{"cost":{"input":5,"output":25,"cache_read":0.5,"cache_write":6.25}},

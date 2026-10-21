@@ -118,6 +118,11 @@ func (b *BlobStore) spoolPath(hash string) string {
 // Put stores data and returns its hash. Already-stored content costs one index lookup at most.
 func (b *BlobStore) Put(ctx context.Context, data []byte, mediaType, kind string) (string, error) {
 	hash := HashOf(data)
+	// The whole check-then-store runs under the hash's lock: the sweep deletes a row and forgets
+	// the hash under the same lock, so a lookup can't re-learn a row that is being deleted.
+	lock := b.hashLock(hash)
+	lock.Lock()
+	defer lock.Unlock()
 	if b.known.Has(hash) {
 		b.dedup.Add(1)
 		return hash, nil
@@ -133,9 +138,6 @@ func (b *BlobStore) Put(ctx context.Context, data []byte, mediaType, kind string
 		return hash, nil
 	}
 	compressed := b.enc.EncodeAll(data, nil)
-	lock := b.hashLock(hash)
-	lock.Lock()
-	defer lock.Unlock()
 	path := b.spoolPath(hash)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, compressed, 0o640); err != nil {
@@ -162,21 +164,34 @@ func (b *BlobStore) Put(ctx context.Context, data []byte, mediaType, kind string
 func (b *BlobStore) Missing(ctx context.Context, hashes []string) ([]string, error) {
 	missing := []string{}
 	for _, h := range hashes {
-		if b.known.Has(h) {
-			continue
-		}
-		var exists bool
-		if err := b.db.QueryRowContext(ctx,
-			`SELECT EXISTS (SELECT 1 FROM `+b.schema+`.blobs WHERE hash = $1)`, h).Scan(&exists); err != nil {
+		exists, err := b.lookup(ctx, h)
+		if err != nil {
 			return nil, err
 		}
-		if exists {
-			b.known.Add(h)
-		} else {
+		if !exists {
 			missing = append(missing, h)
 		}
 	}
 	return missing, nil
+}
+
+// lookup reports whether a blob is indexed, remembering hits; under the hash's lock (see Put).
+func (b *BlobStore) lookup(ctx context.Context, h string) (bool, error) {
+	lock := b.hashLock(h)
+	lock.Lock()
+	defer lock.Unlock()
+	if b.known.Has(h) {
+		return true, nil
+	}
+	var exists bool
+	if err := b.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM `+b.schema+`.blobs WHERE hash = $1)`, h).Scan(&exists); err != nil {
+		return false, err
+	}
+	if exists {
+		b.known.Add(h)
+	}
+	return exists, nil
 }
 
 // Get returns the raw bytes of a blob.
@@ -389,19 +404,35 @@ func (b *BlobStore) sweepUnbacked() {
 		return
 	}
 	_ = rows.Close()
-	if len(gone) == 0 {
-		return
-	}
-	if _, err = b.db.ExecContext(ctx, `DELETE FROM `+b.schema+`.blobs WHERE hash = ANY($1::text[])
-		AND uploaded_at IS NULL`, pgArray(gone)); err != nil {
-		log.WithError(err).Warn("tmx archive: sweeping unbacked blob rows failed")
-		return
-	}
+	n := 0
 	for _, h := range gone {
-		b.known.Remove(h)
+		if b.sweepOne(ctx, h) {
+			n++
+		}
 	}
-	b.swept.Add(int64(len(gone)))
-	log.WithField("blobs", len(gone)).Warn("tmx archive: removed index rows of blobs that were never uploaded; re-import their sessions")
+	if n > 0 {
+		b.swept.Add(int64(n))
+		log.WithField("blobs", n).Warn("tmx archive: removed index rows of blobs that were never uploaded; re-import their sessions")
+	}
+}
+
+// sweepOne deletes one unbacked row and forgets the hash, under the hash's lock, rechecking that
+// no Put has spooled it again meanwhile.
+func (b *BlobStore) sweepOne(ctx context.Context, h string) bool {
+	lock := b.hashLock(h)
+	lock.Lock()
+	defer lock.Unlock()
+	if _, err := os.Stat(b.spoolPath(h)); !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	tag, err := b.db.ExecContext(ctx, `DELETE FROM `+b.schema+`.blobs WHERE hash = $1 AND uploaded_at IS NULL`, h)
+	if err != nil {
+		log.WithError(err).Warn("tmx archive: sweeping an unbacked blob row failed")
+		return false
+	}
+	b.known.Remove(h)
+	n, _ := tag.RowsAffected()
+	return n > 0
 }
 
 // settleSpooled removes the spool files of uploaded blobs. A file whose index row didn't exist
