@@ -219,32 +219,63 @@ type ThreadSummary struct {
 	CreatedAt  *time.Time `json:"created_at,omitempty"`
 	UpdatedAt  *time.Time `json:"updated_at,omitempty"`
 	IngestedAt time.Time  `json:"ingested_at"`
+	// Sessions is the thread's sessions as sent (ThreadQuery.WithSessions only).
+	Sessions json.RawMessage `json:"sessions,omitempty"`
 }
 
-// ListThreads lists threads, most recently updated first.
-func (a *Archive) ListThreads(ctx context.Context, source, machine string, since time.Time, limit int) ([]ThreadSummary, error) {
-	if limit <= 0 || limit > 1000 {
-		limit = 100
+// ThreadQuery filters ListThreads.
+type ThreadQuery struct {
+	Source, Machine string
+	Since           time.Time
+	Limit           int
+	Cursor          string // next from the previous page
+	WithSessions    bool
+}
+
+// ListThreads lists threads, most recently updated first (by updated_at, then id), a page at a
+// time: pass the returned next cursor back to get the following page ("" = no more).
+func (a *Archive) ListThreads(ctx context.Context, q ThreadQuery) ([]ThreadSummary, string, error) {
+	if q.Limit <= 0 || q.Limit > 1000 {
+		q.Limit = 100
+	}
+	before, beforeID, err := decodeCursor(q.Cursor)
+	if err != nil {
+		return nil, "", err
 	}
 	rows, err := a.db.QueryContext(ctx, `SELECT id, source, external_id, machine, COALESCE(doc->>'title', ''),
-		created_at, updated_at, ingested_at FROM `+schema+`.threads
+		created_at, updated_at, ingested_at, CASE WHEN $7 THEN COALESCE(doc->'sessions', '[]') END,
+		COALESCE(updated_at, 'epoch')
+		FROM `+schema+`.threads
 		WHERE ($1 = '' OR source = $1) AND ($2 = '' OR machine = $2) AND ingested_at >= $3
-		ORDER BY updated_at DESC NULLS LAST LIMIT $4`, source, machine, since, limit)
+			AND ($5 = '' OR (COALESCE(updated_at, 'epoch'), id) < ($6, $5))
+		ORDER BY COALESCE(updated_at, 'epoch') DESC, id DESC LIMIT $4`,
+		q.Source, q.Machine, q.Since, q.Limit+1, beforeID, before, q.WithSessions)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer func() { _ = rows.Close() }()
 	out := []ThreadSummary{}
+	var lastAt time.Time
 	for rows.Next() {
 		var t ThreadSummary
 		var created, updated sql.NullTime
-		if err = rows.Scan(&t.ID, &t.Source, &t.ExternalID, &t.Machine, &t.Title, &created, &updated, &t.IngestedAt); err != nil {
-			return nil, err
+		var sessions []byte
+		var at time.Time
+		if err = rows.Scan(&t.ID, &t.Source, &t.ExternalID, &t.Machine, &t.Title, &created, &updated, &t.IngestedAt,
+			&sessions, &at); err != nil {
+			return nil, "", err
+		}
+		if len(out) == q.Limit {
+			return out, encodeCursor(lastAt, out[len(out)-1].ID), rows.Err()
 		}
 		t.CreatedAt, t.UpdatedAt = nullTimePtr(created), nullTimePtr(updated)
+		if sessions != nil {
+			t.Sessions = sessions
+		}
 		out = append(out, t)
+		lastAt = at
 	}
-	return out, rows.Err()
+	return out, "", rows.Err()
 }
 
 // GetThread returns a thread record as stored.

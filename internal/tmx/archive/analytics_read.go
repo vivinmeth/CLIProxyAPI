@@ -12,7 +12,7 @@ import (
 
 // analyticsConversation serves GET /tmx/archive/conversation from the analytics DB. ok is false
 // when the session isn't extracted yet (the caller then rebuilds it from the archive).
-func (an *analytics) conversation(ctx context.Context, sessionID, harness, kind string) (*Conversation, bool, error) {
+func (an *analytics) conversation(ctx context.Context, sessionID, harness, kind string, page ConvPage) (*Conversation, bool, error) {
 	var id, k, h, title, model, traceID, ext, altJSON string
 	query := func(where string, args ...any) error {
 		return an.db.QueryRowContext(ctx, `SELECT id, kind, harness, title, model, trace_id, external_id,
@@ -40,16 +40,12 @@ func (an *analytics) conversation(ctx context.Context, sessionID, harness, kind 
 	if err = an.db.QueryRowContext(ctx, `SELECT count(*) FROM items WHERE session_id = $1`, id).Scan(&total); err != nil {
 		return nil, false, err
 	}
-	// Imported transcripts show the start; proxied sessions the latest items (as the archive path does).
-	offset := 0
-	if total > convMaxItems {
-		conv.Truncated = true
-		if k == "proxy" {
-			offset = total - convMaxItems
-		}
-	}
+	// By default imported transcripts show the start; proxied sessions the latest items (as the
+	// archive path does).
+	start, end := page.window(total, k == "proxy")
+	conv.setPage(start, end, total)
 	rows, err := an.db.QueryContext(ctx, `SELECT role, kind, text, name, call_id, is_error, ts, model FROM items
-		WHERE session_id = $1 ORDER BY seq, idx OFFSET $2 LIMIT $3`, id, offset, convMaxItems)
+		WHERE session_id = $1 ORDER BY seq, idx OFFSET $2 LIMIT $3`, id, start, end-start)
 	if err != nil {
 		return nil, false, err
 	}

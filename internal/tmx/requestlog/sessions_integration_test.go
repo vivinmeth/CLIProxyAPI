@@ -2,6 +2,7 @@ package requestlog
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -33,7 +34,7 @@ func TestSessionTotalsAndSessionRollup(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := Filter{From: base.Add(-time.Minute), To: base.Add(time.Hour)}
-	got, err := store.SessionTotals(ctx, f, "", 10)
+	got, _, err := store.SessionTotals(ctx, f, "", 10, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,9 +50,33 @@ func TestSessionTotalsAndSessionRollup(t *testing.T) {
 	if len(got[1].Machines) != 0 {
 		t.Fatalf("empty machine should not be listed: %+v", got[1].Machines)
 	}
-	recent, err := store.SessionTotals(ctx, f, "recent", 1)
+	recent, _, err := store.SessionTotals(ctx, f, "recent", 1, "")
 	if err != nil || len(recent) != 1 || recent[0].SessionID != "small" {
 		t.Fatalf("recent = %+v %v", recent, err)
+	}
+	// Paging: a page at a time in either order; a cursor of the other order is refused.
+	for order, want := range map[string]string{"": "[big small]", "recent": "[small big]"} {
+		var ids []string
+		cursor := ""
+		for {
+			page, next, errP := store.SessionTotals(ctx, f, order, 1, cursor)
+			if errP != nil {
+				t.Fatal(errP)
+			}
+			for _, r := range page {
+				ids = append(ids, r.SessionID)
+			}
+			if next == "" {
+				break
+			}
+			if _, _, errP = store.SessionTotals(ctx, f, map[string]string{"": "recent", "recent": ""}[order], 1, next); !errors.Is(errP, ErrBadCursor) {
+				t.Fatalf("cursor of the other order = %v", errP)
+			}
+			cursor = next
+		}
+		if fmt.Sprint(ids) != want {
+			t.Fatalf("order %q pages = %v", order, ids)
+		}
 	}
 	cube, _, err := store.Rollup(ctx, f, "day", "UTC", []string{"session_id", "model"}, 100)
 	if err != nil {
@@ -110,7 +135,7 @@ func TestHarnessColumnsWrittenAndGrouped(t *testing.T) {
 		}
 	}
 	f.Harness = "codex"
-	sessions, err := store.SessionTotals(ctx, f, "", 10)
+	sessions, _, err := store.SessionTotals(ctx, f, "", 10, "")
 	if err != nil || len(sessions) != 1 || sessions[0].SessionID != "s2" || sessions[0].Harnesses[0] != "codex" {
 		t.Fatalf("harness filter sessions = %+v %v", sessions, err)
 	}
