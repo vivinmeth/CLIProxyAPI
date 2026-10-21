@@ -53,6 +53,11 @@ func Build(ctx context.Context, auths []*auth.Auth, counts map[string]int, accou
 			filtered = append(filtered, credential)
 		}
 	}
+	if source, ok := counter.(interface {
+		PoolSelectionContext(context.Context) context.Context
+	}); ok {
+		ctx = source.PoolSelectionContext(ctx)
+	}
 	auths = filtered
 	sort.Slice(auths, func(i, j int) bool { return auths[i].ID < auths[j].ID })
 	byProvider := map[string][]*auth.Auth{}
@@ -97,7 +102,7 @@ func Build(ctx context.Context, auths []*auth.Auth, counts map[string]int, accou
 		latest[account.AuthID] = account
 	}
 	for _, a := range auths {
-		c := Credential{Provider: a.Provider, AuthID: a.ID, Label: maskLabel(a.Label), Enabled: !a.Disabled && a.Status != auth.StatusDisabled, Status: a.Status, Unavailable: a.Unavailable, Cooldowns: auth.CooldownSnapshotForAuth(a, now), Windows: []quota.Current{}, BoundSessions: counts[a.ID], RankModel: models[a.Provider]}
+		c := Credential{Provider: a.Provider, AuthID: maskLabel(a.ID), Label: maskLabel(a.Label), Enabled: !a.Disabled && a.Status != auth.StatusDisabled, Status: a.Status, Unavailable: a.Unavailable, Cooldowns: auth.CooldownSnapshotForAuth(a, now), Windows: []quota.Current{}, BoundSessions: counts[a.ID], RankModel: models[a.Provider]}
 		if c.Label == "" {
 			c.Label = maskLabel(a.ID)
 		}
@@ -197,6 +202,10 @@ func maskLabel(text string) string {
 		for i := 0; i < len(labels)-1; i++ {
 			labels[i] = labels[i][:1] + "•••"
 		}
-		return prefix + local[:1] + "•••@" + strings.Join(labels, ".") + suffix
+		initial := ""
+		if len(local) > 0 {
+			initial = local[:1]
+		}
+		return prefix + initial + "•••@" + strings.Join(labels, ".") + suffix
 	})
 }

@@ -23,17 +23,17 @@ const tmxMaxSummaryRange = 400 * 24 * time.Hour
 func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher, mgr *auth.Manager) {
 	v8.GET("/tmx/pool", func(c *gin.Context) {
 		var auths []*auth.Auth
-		if fetcher != nil {
-			auths = fetcher.TmxAuths()
-		}
+
 		var counts map[string]int
 		var counter pool.InFlightCounter
 		if mgr != nil {
 			auths = mgr.List()
 			counts = mgr.BoundSessionCounts()
-			counter, _ = any(mgr).(pool.InFlightCounter)
+			counter = mgr
+		} else if fetcher != nil {
+			auths = fetcher.TmxAuths()
 		}
-		if adapter, ok := fetcher.(pool.InFlightCounter); ok {
+		if adapter, ok := fetcher.(pool.InFlightCounter); ok && mgr == nil {
 			counter = adapter
 		}
 		var accounts []quota.Account

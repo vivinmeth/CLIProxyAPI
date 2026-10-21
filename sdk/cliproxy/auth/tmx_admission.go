@@ -95,19 +95,7 @@ func (m *Manager) tmxPickWithAdmission(ctx context.Context, pick func(context.Co
 	if _, ok := selector.(*ResetSoonestSelector); !ok {
 		return pick(ctx)
 	}
-	view := tmxAdmissionView{state: &m.tmxAdmission, five: .95, seven: .98}
-	if cfg := m.runtimeConfigSnapshot(); cfg != nil {
-		policy := cfg.Routing.ResetSoonest
-		if policy.FiveHourThreshold > 0 && policy.FiveHourThreshold <= 1 {
-			view.five = policy.FiveHourThreshold
-		}
-		if policy.SevenDayThreshold > 0 && policy.SevenDayThreshold <= 1 {
-			view.seven = policy.SevenDayThreshold
-		}
-		if policy.MaxInflightPerCredential > 0 {
-			view.cap = policy.MaxInflightPerCredential
-		}
-	}
+	view := m.tmxPoolAdmissionView()
 	if reservation == nil {
 		return pick(context.WithValue(ctx, tmxAdmissionViewKey{}, view))
 	}

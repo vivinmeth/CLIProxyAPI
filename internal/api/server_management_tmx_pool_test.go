@@ -61,3 +61,20 @@ func TestTMXPoolContract(t *testing.T) {
 		t.Fatal("disabled credential eligible")
 	}
 }
+
+type unusedPoolFetcher struct{}
+
+func (unusedPoolFetcher) TmxAuths() []*auth.Auth { panic("redundant TmxAuths call") }
+func (unusedPoolFetcher) TmxFetch(context.Context, *auth.Auth, string, map[string]string) (int, []byte, error) {
+	return 200, nil, nil
+}
+
+func TestPoolUsesManagerWithoutFetchingAuthsTwice(t *testing.T) {
+	r := gin.New()
+	registerTMXManagementRoutes(r.Group("/v8/management"), unusedPoolFetcher{}, auth.NewManager(nil, &auth.ResetSoonestSelector{}, nil))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("GET", "/v8/management/tmx/pool", nil))
+	if rec.Code != 200 {
+		t.Fatalf("status=%d", rec.Code)
+	}
+}
