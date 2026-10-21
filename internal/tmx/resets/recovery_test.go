@@ -56,7 +56,7 @@ func TestRecoveryOf(t *testing.T) {
 			slices.Sort(got.Windows)
 			want := append([]string(nil), tc.windows...)
 			slices.Sort(want)
-			if !slices.Equal(got.Windows, want) || got.CredentialQuota != tc.credential || got.ModelQuota != tc.model {
+			if !slices.Equal(got.Windows, want) || got.CredentialQuota != tc.credential || slices.Equal(got.ModelWindows, []string{"7d_oi"}) != tc.model {
 				t.Fatalf("recovery = %+v; want windows %v credential %v model %v", got, want, tc.credential, tc.model)
 			}
 		})
@@ -169,7 +169,7 @@ func TestRedeemWithoutPostReadReleasesOnlyScopedCooldown(t *testing.T) {
 	if len(f.recoveries) != 1 {
 		t.Fatalf("recoveries %+v", f.recoveries)
 	}
-	if r := f.recoveries[0]; r.CredentialQuota || r.ModelQuota || len(r.Windows) != 0 {
+	if r := f.recoveries[0]; r.CredentialQuota || len(r.ModelWindows) != 0 || len(r.Windows) != 0 {
 		t.Fatalf("an unverified 5h grant with the week exhausted releases nothing: %+v", r)
 	}
 }

@@ -72,7 +72,7 @@ func TestClearRecoveredQuotaReleasesOnlyQuotaLayers(t *testing.T) {
 		t.Fatalf("a model-scoped limit outside the recovery must survive: %+v", fable)
 	}
 
-	if _, err = manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{ModelQuota: true, Windows: []string{"7d_oi"}}); err != nil {
+	if _, err = manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{ModelWindows: []string{"7d_oi"}, Windows: []string{"7d_oi"}}); err != nil {
 		t.Fatal(err)
 	}
 	auth = recoveryState(t, manager, id)
@@ -158,5 +158,63 @@ func TestClearRecoveredQuotaDropsOnlyRecoveredSignals(t *testing.T) {
 		if auth.Quota.Signals != nil || !auth.Quota.ObservedAt.IsZero() {
 			t.Fatalf("with every window recovered the account is unobserved: %+v", auth.Quota)
 		}
+	})
+}
+
+func TestClearRecoveredQuotaFableKeepsOtherModelQuota(t *testing.T) {
+	const id = "recovery-fable-only"
+	manager := registerRecoveryAuth(t, id, "claude", nil)
+	markRecoveryResult(manager, id, "claude-sonnet-5", http.StatusTooManyRequests, time.Minute, false)
+	markRecoveryResult(manager, id, "claude-fable-5", http.StatusTooManyRequests, 72*time.Hour, false)
+	if _, err := manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{Windows: []string{"7d_oi"}, ModelWindows: []string{"7d_oi"}}); err != nil {
+		t.Fatal(err)
+	}
+	auth := recoveryState(t, manager, id)
+	if !auth.ModelStates["claude-sonnet-5"].Unavailable {
+		t.Fatal("a Fable recovery must not release an unrelated Sonnet 429")
+	}
+	if fable := auth.ModelStates["claude-fable-5"]; fable.Unavailable || fable.Quota.Exceeded {
+		t.Fatalf("the recovered Fable limit must go: %+v", fable)
+	}
+}
+
+func TestClearRecoveredQuotaFableUnderCredentialWrap(t *testing.T) {
+	setup := func(t *testing.T, id string) *Manager {
+		manager := registerRecoveryAuth(t, id, "claude", nil)
+		markRecoveryResult(manager, id, "claude-sonnet-5", http.StatusTooManyRequests, 72*time.Hour, false)
+		markRecoveryResult(manager, id, "claude-fable-5", http.StatusTooManyRequests, 72*time.Hour, false)
+		markRecoveryResult(manager, id, "claude-opus-5", http.StatusTooManyRequests, 72*time.Hour, true)
+		return manager
+	}
+	fableReleased := func(t *testing.T, auth *Auth) {
+		t.Helper()
+		if fable := auth.ModelStates["claude-fable-5"]; fable.Unavailable || fable.Quota.Exceeded {
+			t.Fatalf("recovered Fable quota reinstated from the credential shadow: %+v", fable)
+		}
+		if sonnet := auth.ModelStates["claude-sonnet-5"]; !sonnet.Unavailable || sonnet.Quota.Reason != "quota" {
+			t.Fatalf("Sonnet's independent quota beneath the wrap must be reinstated: %+v", sonnet)
+		}
+	}
+	t.Run("together", func(t *testing.T) {
+		const id = "recovery-wrap-together"
+		manager := setup(t, id)
+		if _, err := manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{Windows: []string{"5h", "7d", "7d_oi"}, CredentialQuota: true, ModelWindows: []string{"7d_oi"}}); err != nil {
+			t.Fatal(err)
+		}
+		fableReleased(t, recoveryState(t, manager, id))
+	})
+	t.Run("model first", func(t *testing.T) {
+		const id = "recovery-wrap-model-first"
+		manager := setup(t, id)
+		if _, err := manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{Windows: []string{"7d_oi"}, ModelWindows: []string{"7d_oi"}}); err != nil {
+			t.Fatal(err)
+		}
+		if auth := recoveryState(t, manager, id); auth.Quota.Reason != "credential_quota" || !auth.ModelStates["claude-fable-5"].Unavailable {
+			t.Fatalf("the shared block must stay over Fable: %+v", auth.ModelStates["claude-fable-5"])
+		}
+		if _, err := manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{Windows: []string{"5h", "7d"}, CredentialQuota: true}); err != nil {
+			t.Fatal(err)
+		}
+		fableReleased(t, recoveryState(t, manager, id))
 	})
 }

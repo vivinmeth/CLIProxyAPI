@@ -23,9 +23,10 @@ type QuotaRecovery struct {
 	// account and none is exhausted any more), together with the rejection markers in the
 	// signals (Retry-After, unified status/reset, limit-reached).
 	CredentialQuota bool
-	// ModelQuota releases model-scoped quota cooldowns, for a recovered model window such as
-	// Claude's 7d_oi (Fable).
-	ModelQuota bool
+	// ModelWindows are recovered model windows (Claude's 7d_oi for Fable, 7d_opus, 7d_sonnet,
+	// 7d_model_<slug>). They release the model-scoped quota cooldowns of matching models only,
+	// including one held beneath a credential quota; other models' limits stay.
+	ModelWindows []string
 }
 
 // ClearRecoveredQuota applies r to one auth. Unauthorized, transient, model-support and other
@@ -106,23 +107,29 @@ func releaseRecoveredQuotaCooldowns(auth *Auth, r QuotaRecovery, now time.Time) 
 		applyCooldownFields(&auth.Quota, QuotaState{})
 		changed = true
 	}
-	for _, state := range auth.ModelStates {
+	for model, state := range auth.ModelStates {
 		if state == nil || !state.Quota.Exceeded {
 			continue
 		}
 		reason := strings.TrimSpace(state.Quota.Reason)
 		wrapped := state.credentialQuotaPropagated || reason == "credential_quota"
+		shadow := state.credentialQuotaShadow
 		switch {
 		case wrapped && r.CredentialQuota:
-			// Reinstate the independent layer beneath the propagated credential quota.
-			if shadow := state.credentialQuotaShadow; shadow != nil && isModelStateActiveCooldown(shadow, now) {
+			// Reinstate the independent layer beneath the propagated credential quota, unless
+			// that layer is a model quota this credit recovered too.
+			if shadow != nil && isModelStateActiveCooldown(shadow, now) && !r.releasesModelQuota(model, shadow) {
 				*state = *shadow.cloneShallow()
 				state.UpdatedAt = now
 			} else {
 				resetModelState(state, now)
 			}
 			changed = true
-		case !wrapped && reason == "quota" && r.ModelQuota:
+		case wrapped && r.releasesModelQuota(model, shadow):
+			// The shared block stays; the recovered model quota must not resurface when it ends.
+			state.credentialQuotaShadow = nil
+			changed = true
+		case !wrapped && r.releasesModelQuota(model, state):
 			resetModelState(state, now)
 			changed = true
 		}
@@ -139,6 +146,37 @@ func releaseRecoveredQuotaCooldowns(auth *Auth, r QuotaRecovery, now time.Time) 
 		auth.LastError = nil
 	}
 	return true
+}
+
+// releasesModelQuota reports whether state is a model-scoped quota layer of model that one of
+// r's recovered model windows limits.
+func (r QuotaRecovery) releasesModelQuota(model string, state *ModelState) bool {
+	if state == nil || !state.Quota.Exceeded || strings.TrimSpace(state.Quota.Reason) != "quota" {
+		return false
+	}
+	for _, window := range r.ModelWindows {
+		if modelWindowLimits(window, model) {
+			return true
+		}
+	}
+	return false
+}
+
+// modelWindowLimits reports whether a Claude model window limits model, matching the families
+// routing ranks by (claudeWeeklyResetNames).
+func modelWindowLimits(window, model string) bool {
+	window = strings.ToLower(strings.TrimSpace(window))
+	model = strings.ToLower(model)
+	var family string
+	switch {
+	case window == "7d_oi":
+		family = "fable"
+	case strings.HasPrefix(window, "7d_model_"):
+		family = strings.TrimPrefix(window, "7d_model_")
+	case window == "7d_opus" || window == "7d_sonnet":
+		family = strings.TrimPrefix(window, "7d_")
+	}
+	return family != "" && strings.Contains(model, family)
 }
 
 // quotaStatusOnly reports whether the auth's status describes a quota refusal and nothing else.
