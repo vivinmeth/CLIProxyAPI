@@ -84,11 +84,12 @@ func (r *tmxReservation) reserve(counter *atomic.Int64) bool {
 	return true
 }
 
-func (m *Manager) tmxPickWithAdmission(ctx context.Context, pick func(context.Context) (refreshSelection, error)) (refreshSelection, error) {
+func (m *Manager) tmxPickWithAdmission(ctx context.Context, opts executor.Options, pick func(context.Context) (refreshSelection, error)) (refreshSelection, error) {
 	reservation, _ := ctx.Value(tmxAdmissionKey{}).(*tmxReservation)
 	m.mu.RLock()
 	selector := m.selector
 	m.mu.RUnlock()
+	outer := selector
 	if affinity, ok := selector.(*SessionAffinitySelector); ok {
 		selector = affinity.fallback
 	}
@@ -111,13 +112,15 @@ func (m *Manager) tmxPickWithAdmission(ctx context.Context, pick func(context.Co
 	if reservation == nil {
 		return pick(context.WithValue(ctx, tmxAdmissionViewKey{}, view))
 	}
+	// Body parsing for session affinity runs before the mutex; it holds only rank + reserve.
+	ctx = prepareTMXSession(ctx, outer, opts)
 	m.tmxAdmission.mu.Lock()
 	defer m.tmxAdmission.mu.Unlock()
 	reservation.clear()
 	if err := ctx.Err(); err != nil {
 		return refreshSelection{}, err
 	}
-	result, err := pick(context.WithValue(ctx, tmxAdmissionViewKey{}, view))
+	result, err := pick(context.WithValue(context.WithValue(ctx, tmxAdmissionViewKey{}, view), tmxUnderAdmissionKey{}, true))
 	if err == nil && result.auth != nil && !reservation.reserve(m.tmxAdmission.counter(result.auth.ID)) {
 		return refreshSelection{}, context.Canceled
 	}

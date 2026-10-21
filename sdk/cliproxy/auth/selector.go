@@ -1108,7 +1108,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	// Explicit harness identities are absolute authority. The LCP matcher is only
 	// consulted when no header, body, or execution-session identity is present.
-	explicitID, explicitFallbackID := extractExplicitSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	explicitID, explicitFallbackID := extractExplicitSessionIDsContext(ctx, opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if explicitID == "" {
 		if auth, handled, errLCP := s.pickLCP(ctx, provider, model, opts, auths, entry); handled || errLCP != nil {
 			return auth, errLCP
@@ -1130,7 +1130,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	primaryID, fallbackID := explicitID, explicitFallbackID
 	if primaryID == "" {
-		primaryID, fallbackID = extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+		primaryID, fallbackID = extractSessionIDsContext(ctx, opts.Headers, opts.OriginalRequest, opts.Metadata)
 	}
 	if primaryID != "" {
 		primaryID = cliproxysession.BoundSessionIdentity(primaryID)
@@ -1264,11 +1264,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	if namespace == "" {
 		return nil, false, nil
 	}
-	turns := cliproxysession.ExtractCanonicalTurns(opts.SourceFormat, opts.OriginalRequest)
-	if len(turns) == 0 {
-		return nil, false, nil
-	}
-	fingerprints, minPrefixLength, tailFingerprints, envDigest := s.matcher.PrepareExt(turns)
+	fingerprints, minPrefixLength, tailFingerprints, envDigest := tmxPrepareLCP(ctx, s.matcher, opts.SourceFormat, opts.OriginalRequest, opts.Headers)
 	if len(fingerprints) == 0 || minPrefixLength <= 0 || minPrefixLength > len(fingerprints) {
 		return nil, false, nil
 	}
@@ -1812,7 +1808,12 @@ func extractConversationAlias(payload []byte) string {
 // extractExplicitSessionIDs returns only client- or execution-provided identities.
 // LCP fallback must run after this function so explicit harness sessions remain authoritative.
 func extractExplicitSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
-	info, ok := cliproxysession.ExtractSessionInfo(headers, payload, metadata)
+	return extractExplicitSessionIDsContext(context.Background(), headers, payload, metadata)
+}
+
+// extractExplicitSessionIDsContext reuses session info the pick prepared (tokenmaxx).
+func extractExplicitSessionIDsContext(ctx context.Context, headers http.Header, payload []byte, metadata map[string]any) (string, string) {
+	info, ok := tmxExtractSessionInfo(ctx, headers, payload, metadata)
 	if !ok || info.ClientType == "lcp" {
 		return "", ""
 	}
@@ -1835,7 +1836,11 @@ func extractExplicitSessionIDs(headers http.Header, payload []byte, metadata map
 // fallbackID preserves an earlier binding when a stronger body identifier appears
 // later, and lets callers bind both identifiers when both are present.
 func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
-	if primaryID, fallbackID := extractExplicitSessionIDs(headers, payload, metadata); primaryID != "" {
+	return extractSessionIDsContext(context.Background(), headers, payload, metadata)
+}
+
+func extractSessionIDsContext(ctx context.Context, headers http.Header, payload []byte, metadata map[string]any) (string, string) {
+	if primaryID, fallbackID := extractExplicitSessionIDsContext(ctx, headers, payload, metadata); primaryID != "" {
 		return primaryID, fallbackID
 	}
 	if derivedID := normalizedSessionCandidate(cliproxysession.DerivedID(metadata)); derivedID != "" {

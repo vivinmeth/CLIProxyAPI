@@ -140,7 +140,7 @@ func retryDuringRefresh(m *Manager, ctx context.Context, providers []string, mod
 	ctx = context.WithValue(ctx, refreshSelectionContextKey{}, true)
 	for {
 		waits := m.refreshingCandidates(ctx, providers, model, opts, tried)
-		result, err := m.tmxPickWithAdmission(ctx, pick)
+		result, err := m.tmxPickWithAdmission(ctx, opts, pick)
 		if err == nil || !isAuthUnavailableError(err) {
 			return result, err
 		}
