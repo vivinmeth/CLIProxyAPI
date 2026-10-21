@@ -129,3 +129,45 @@ func TestPostgresCooldownRealRestartScopesAndRecovery(t *testing.T) {
 		t.Fatalf("recovery soft delete=%v err=%v", deleted, err)
 	}
 }
+
+func TestPostgresAuthSaveSkipsUnchangedRowAndPersistsRotation(t *testing.T) {
+	dsn := os.Getenv("TMX_COOLDOWN_TEST_DSN")
+	if dsn == "" {
+		t.Skip("TMX_COOLDOWN_TEST_DSN not set")
+	}
+	ctx := context.Background()
+	schema := fmt.Sprintf("auth_hash_test_%d", time.Now().UnixNano())
+	s, err := NewPostgresStore(ctx, PostgresStoreConfig{DSN: dsn, Schema: schema, SpoolDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = s.db.Exec(`DROP SCHEMA ` + schema + ` CASCADE`); _ = s.Close() }()
+	if err = s.EnsureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	credential := &auth.Auth{ID: "account.json", Provider: "claude", Metadata: map[string]any{"type": "claude", "access_token": "first"}}
+	if _, err = s.Save(ctx, credential); err != nil {
+		t.Fatal(err)
+	}
+	version := func() string {
+		var v string
+		if err := s.db.QueryRow(`SELECT xmin::text FROM ` + schema + `.auth_store WHERE id='account.json'`).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	first := version()
+	if _, err = s.Save(ctx, credential); err != nil {
+		t.Fatal(err)
+	}
+	if version() != first {
+		t.Fatal("unchanged Save upserted auth row")
+	}
+	credential.Metadata["access_token"] = "rotated"
+	if _, err = s.Save(ctx, credential); err != nil {
+		t.Fatal(err)
+	}
+	if version() == first {
+		t.Fatal("OAuth token rotation was not persisted immediately")
+	}
+}
