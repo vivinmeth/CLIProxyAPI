@@ -49,6 +49,7 @@ func drain(t *testing.T, an *analytics) {
 			t.Fatal(err)
 		}
 		if !more {
+			an.refreshLinks(true) // the worker refreshes request_sessions after draining
 			return
 		}
 	}

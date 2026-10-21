@@ -4,13 +4,30 @@ package archive
 // belongs to, its list-price cost (stored on the row by the request log, see
 // requestlog/prices.go), and per-session totals. Recreated on start so they follow the code.
 
+import (
+	"fmt"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+)
+
 var analyticsViewsSQL = []string{
-	`DROP VIEW IF EXISTS session_usage, request_costs, request_sessions CASCADE`, // dependents are recreated after
-	`DROP TABLE IF EXISTS model_prices`,                                          // v2's own price table; costs are now stored per row
+	`DROP VIEW IF EXISTS session_usage, request_costs CASCADE`, // dependents are recreated after
+	// request_sessions was a plain view before it was materialized: drop whichever it is.
+	`DO $$ BEGIN
+		IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'request_sessions' AND relkind = 'v') THEN
+			DROP VIEW request_sessions CASCADE;
+		END IF;
+		DROP MATERIALIZED VIEW IF EXISTS request_sessions CASCADE;
+	END $$`,
+	`DROP TABLE IF EXISTS model_prices`, // v2's own price table; costs are now stored per row
 	// Which extracted session (and message) a usage row belongs to. Imported rows: import_ref
 	// "<harness>:<session>#<message>". Proxied rows: the captured exchange (trace_id), else the
 	// client session id. canonical_session_id prefers the imported transcript over its proxied twin.
-	`CREATE VIEW request_sessions AS
+	// Materialized: computing the link per row is most of the cost of session_usage / thread_usage.
+	// The worker refreshes it after usage rows or sessions change (at most every linksRefresh);
+	// it starts empty and is filled right after start.
+	`CREATE MATERIALIZED VIEW request_sessions AS
 	SELECT r.id AS request_id, x.id AS session_id, COALESCE(s.shadowed_by, x.id) AS canonical_session_id,
 		m.seq AS message_seq, x.via
 	FROM requests r
@@ -32,8 +49,11 @@ var analyticsViewsSQL = []string{
 		) c ORDER BY c.p LIMIT 1
 	) x ON true
 	LEFT JOIN sessions s ON s.id = x.id
-	LEFT JOIN messages m ON r.import_ref <> '' AND m.session_id = x.id
-		AND m.external_id = split_part(r.import_ref, '#', 2)`,
+		LEFT JOIN messages m ON r.import_ref <> '' AND m.session_id = x.id
+		AND m.external_id = split_part(r.import_ref, '#', 2)
+	WITH NO DATA`,
+	`CREATE UNIQUE INDEX request_sessions_request_idx ON request_sessions (request_id)`,
+	`CREATE INDEX request_sessions_canonical_idx ON request_sessions (canonical_session_id)`,
 	// List-price cost per usage row, as stored on the row when its tokens were written
 	// (tmx.requests cost_* columns; NULL = unpriced or not priced yet).
 	`CREATE VIEW request_costs AS
@@ -53,4 +73,38 @@ var analyticsViewsSQL = []string{
 	FROM request_sessions rs JOIN request_costs c ON c.request_id = rs.request_id
 	WHERE rs.canonical_session_id IS NOT NULL AND NOT COALESCE(c.shadowed, false)
 	GROUP BY rs.canonical_session_id`,
+}
+
+// linksRefresh: request_sessions (and so session_usage / thread_usage) lags usage rows and
+// sessions by at most this much.
+const linksRefresh = 2 * time.Minute
+
+// refreshLinks refreshes request_sessions when something it reads changed and the last refresh
+// is linksRefresh old, or regardless with force. The first fill after start is a plain refresh
+// (the view starts empty); later ones are concurrent, so readers never wait.
+func (an *analytics) refreshLinks(force bool) {
+	if an.reqMirror == nil {
+		return
+	}
+	var populated bool
+	if err := an.db.QueryRowContext(an.ctx, `SELECT relispopulated FROM pg_class WHERE relname = 'request_sessions'
+		AND relkind = 'm'`).Scan(&populated); err != nil {
+		return
+	}
+	if populated && !force && (!an.linksDirty.Load() || time.Since(an.linksAt) < linksRefresh) {
+		return
+	}
+	an.linksDirty.Store(false)
+	stmt := `REFRESH MATERIALIZED VIEW CONCURRENTLY request_sessions`
+	if !populated {
+		stmt = `REFRESH MATERIALIZED VIEW request_sessions`
+	}
+	start := time.Now()
+	if _, err := an.db.ExecContext(an.ctx, stmt); err != nil {
+		an.linksDirty.Store(true)
+		an.setErr(fmt.Errorf("refresh request_sessions: %w", err))
+		return
+	}
+	an.linksAt = time.Now()
+	log.Debugf("tmx analytics: request_sessions refreshed in %s", time.Since(start).Round(time.Millisecond))
 }

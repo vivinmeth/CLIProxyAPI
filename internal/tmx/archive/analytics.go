@@ -70,6 +70,8 @@ type analytics struct {
 	done chan struct{}
 
 	processed   atomic.Int64
+	linksDirty  atomic.Bool // request_sessions needs a refresh
+	linksAt     time.Time   // last refresh (run loop only)
 	extracted   atomic.Int64
 	failures    atomic.Int64
 	backfilling atomic.Bool
@@ -318,6 +320,7 @@ func (an *analytics) run() {
 			}
 			if !more {
 				an.buildDeferredIndexes()
+				an.refreshLinks(false)
 				break
 			}
 			select {
@@ -497,10 +500,17 @@ func (an *analytics) step() (bool, error) {
 	// Done entries are deleted; failed ones retry after 1, 2, ... minutes and after maxAttempts go
 	// to the failed table (a backfill reruns them).
 	var done []string
+	cleared := map[string][]string{} // kind -> refs that went through: their old failures are moot
 	for _, e := range entries {
 		errE, bad := failedIDs[e.id]
 		if !bad {
 			done = append(done, fmt.Sprint(e.id))
+			if e.kind == "session" || e.kind == "proxy" || e.kind == "thread" {
+				cleared[e.kind] = append(cleared[e.kind], e.ref)
+			}
+			if e.kind != "thread" {
+				an.linksDirty.Store(true)
+			}
 			continue
 		}
 		an.setErr(fmt.Errorf("%s %s: %w", e.kind, e.ref, errE))
@@ -525,6 +535,9 @@ func (an *analytics) step() (bool, error) {
 			return false, err
 		}
 		an.processed.Add(int64(len(done)))
+	}
+	for kind, refs := range cleared {
+		_, _ = an.db.ExecContext(ctx, `DELETE FROM failed WHERE kind = $1 AND ref = ANY($2::text[])`, kind, pgTextArray(refs))
 	}
 	return more, nil
 }

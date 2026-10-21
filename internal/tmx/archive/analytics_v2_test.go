@@ -251,3 +251,26 @@ func TestPricingPassJournalsOneReconcile(t *testing.T) {
 		t.Fatalf("analytics priced rows = %d", n)
 	}
 }
+
+// A session that failed before (e.g. a blob was missing) and is now extracted loses its old
+// failure rows.
+func TestRecoveredSessionClearsFailures(t *testing.T) {
+	a, an := openTestAnalytics(t)
+	ctx := context.Background()
+	ts := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+	if _, err := a.IngestSession(ctx, SessionIngest{Harness: "opencode", ExternalID: "was-broken", StartedAt: &ts,
+		Messages: []MessageIngest{{ExternalID: "m", Seq: 1, Role: "user", TS: &ts, Message: json.RawMessage(`{"role":"user","content":"hi"}`)}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := an.db.Exec(`INSERT INTO failed (journal_id, kind, ref, error) VALUES (-1, 'session', 'opencode:was-broken', 'key missing'),
+		(-2, 'session', 'opencode:other', 'still broken')`); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, an)
+	if n := count(t, an, `SELECT count(*) FROM failed WHERE ref = 'opencode:was-broken'`); n != 0 {
+		t.Fatalf("stale failures left: %d", n)
+	}
+	if n := count(t, an, `SELECT count(*) FROM failed`); n != 1 {
+		t.Fatalf("other failures = %d", n)
+	}
+}
