@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
 )
 
 // tmxDrain tracks handler lifetimes, including handlers serving hijacked WebSockets.
@@ -111,3 +112,6 @@ func (d *tmxDrain) closeHijacked() {
 		delete(d.conns, conn)
 	}
 }
+
+func (w *tmxDrainWriter) FlushError() error           { return httpwire.FlushResponse(w.ResponseWriter) }
+func (w *tmxDrainWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
