@@ -43,6 +43,7 @@ type Server struct {
 
 	// server is the underlying HTTP server.
 	server *http.Server
+	drain  tmxDrain
 
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
 	listenerMu      sync.Mutex
@@ -169,6 +170,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 
 	// Add middleware
+	engine.Use(s.tmxDrainMiddleware())
 	engine.Use(logging.GinLogrusLogger())
 	engine.Use(logging.GinLogrusRecovery())
 	engine.Use(logging.CPATraceIDMiddleware())
@@ -422,6 +424,11 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 
+	s.cfgMu.RLock()
+	timeout := s.cfg.ShutdownDrainTimeout()
+	s.cfgMu.RUnlock()
+	s.drain.wait(ctx, timeout)
+	s.drain.closeHijacked()
 	s.listenerMu.Lock()
 	muxHTTP := s.muxHTTPListener
 	s.muxHTTPListener = nil
@@ -438,7 +445,7 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 
-	// Close the HTTP server immediately without graceful draining.
+	// Requests have completed or the bounded drain window has elapsed.
 	var errCloseServer error
 	if s.server != nil {
 		errCloseServer = s.server.Close()

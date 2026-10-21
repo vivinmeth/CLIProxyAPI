@@ -1280,3 +1280,7 @@ plugins:
 #     switch-project: true
 #     switch-preview-model: true
 # antigravity-credits moved to oauth.providers.antigravity.antigravity-credits.
+
+# Allow in-flight HTTP/SSE/WebSocket handlers to finish on SIGTERM (seconds; 0 closes immediately).
+server:
+  shutdown-drain-timeout: 90

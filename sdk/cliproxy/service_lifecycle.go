@@ -67,7 +67,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	defer func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), s.currentConfig().ShutdownDrainTimeout()+30*time.Second)
 		defer shutdownCancel()
 		if errShutdown := s.Shutdown(shutdownCtx); errShutdown != nil {
 			log.Errorf("service shutdown returned error: %v", errShutdown)
@@ -244,7 +244,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 }
 
-// Shutdown stops background workers and immediately closes the HTTP server.
+// Shutdown drains requests before stopping their supporting workers.
 // It ensures all resources are properly cleaned up and connections are closed.
 // The shutdown is idempotent and can be called multiple times safely.
 //
@@ -261,6 +261,15 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
 		if ctx == nil {
 			ctx = context.Background()
+		}
+
+		if s.server != nil {
+			if errStop := s.server.Stop(ctx); errStop != nil {
+				log.Errorf("error stopping API server: %v", errStop)
+				if shutdownErr == nil {
+					shutdownErr = errStop
+				}
+			}
 		}
 
 		s.homeMu.Lock()
@@ -361,15 +370,6 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		// no legacy clients to persist
-
-		if s.server != nil {
-			if errStop := s.server.Stop(ctx); errStop != nil {
-				log.Errorf("error stopping API server: %v", errStop)
-				if shutdownErr == nil {
-					shutdownErr = errStop
-				}
-			}
-		}
 
 		if s.pluginHost != nil {
 			sdktranslator.SetPluginHooks(nil)
