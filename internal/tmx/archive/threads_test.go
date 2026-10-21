@@ -92,6 +92,16 @@ func TestThreadsInAnalytics(t *testing.T) {
 	if err = an.db.QueryRow(`SELECT cost_usd FROM thread_usage WHERE thread_id = 't3:T2'`).Scan(&cost); err != nil || math.Abs(cost-4) > 1e-9 {
 		t.Fatalf("T2 cost = %v (%v), want 4", cost, err)
 	}
+	// Own cost: T1 alone is main + subagent (the delegate's session, listed by both, is T2's);
+	// own costs add up to the root total, and summing roots only doesn't double count.
+	var own, roots float64
+	if err = an.db.QueryRow(`SELECT own_cost_usd FROM thread_usage WHERE thread_id = 't3:T1'`).Scan(&own); err != nil || math.Abs(own-8) > 1e-9 {
+		t.Fatalf("T1 own cost = %v (%v), want 8", own, err)
+	}
+	if err = an.db.QueryRow(`SELECT sum(cost_usd) FROM thread_usage WHERE parent_id IS NULL AND thread_id LIKE 't3:T%'`).Scan(&roots); err != nil ||
+		math.Abs(roots-12) > 1e-9 {
+		t.Fatalf("root total = %v (%v), want 12", roots, err)
+	}
 	if n := count(t, an, `SELECT threads FROM thread_usage WHERE thread_id = 't3:C1'`); n != 2 {
 		t.Fatalf("cycle tree = %d threads", n)
 	}

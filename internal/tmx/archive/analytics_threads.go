@@ -138,7 +138,10 @@ var threadViewsSQL = []string{
 // threadUsageSQL needs session_usage (requests mirror).
 var threadUsageSQL = []string{
 	// Cost of a thread and everything it started (delegates, subagent threads) through the
-	// sessions they ran.
+	// sessions they ran. A row includes its children, so summing rows counts a delegate twice:
+	// total spend is the sum over rows with parent_id IS NULL. own_* is the thread alone: its
+	// sessions that no thread under it also lists (a session the parent lists too belongs to the
+	// delegate that ran it), so own costs add up to the tree total.
 	// UNION (not UNION ALL) ends the recursion even if parent links form a cycle; each session
 	// counts once per tree however many of its threads list it.
 	`CREATE VIEW thread_usage AS
@@ -149,15 +152,25 @@ var threadUsageSQL = []string{
 	), tree_sessions AS (
 		SELECT DISTINCT tree.root_id, st.session_id
 		FROM tree JOIN session_threads st ON st.thread_id = tree.thread_id
+	), own AS (
+		SELECT st.thread_id, count(*) AS sessions, sum(u.cost_usd) AS cost_usd
+		FROM session_threads st LEFT JOIN session_usage u ON u.session_id = st.session_id
+		WHERE NOT EXISTS (SELECT 1 FROM tree d JOIN session_threads sd ON sd.thread_id = d.thread_id
+			WHERE d.root_id = st.thread_id AND d.thread_id <> st.thread_id AND sd.session_id = st.session_id)
+		GROUP BY st.thread_id
+	), totals AS (
+		SELECT t.root_id AS thread_id, t.threads, count(ts.session_id) AS sessions,
+			COALESCE(sum(u.requests), 0) AS requests, COALESCE(sum(u.prompt_tokens), 0) AS prompt_tokens,
+			COALESCE(sum(u.output_tokens), 0) AS output_tokens, sum(u.cost_usd) AS cost_usd,
+			COALESCE(sum(u.unpriced_requests), 0) AS unpriced_requests
+		FROM (SELECT root_id, count(*) AS threads FROM tree GROUP BY root_id) t
+			LEFT JOIN tree_sessions ts ON ts.root_id = t.root_id
+			LEFT JOIN session_usage u ON u.session_id = ts.session_id
+		GROUP BY t.root_id, t.threads
 	)
-	SELECT t.root_id AS thread_id, t.threads, count(ts.session_id) AS sessions,
-		COALESCE(sum(u.requests), 0) AS requests, COALESCE(sum(u.prompt_tokens), 0) AS prompt_tokens,
-		COALESCE(sum(u.output_tokens), 0) AS output_tokens, sum(u.cost_usd) AS cost_usd,
-		COALESCE(sum(u.unpriced_requests), 0) AS unpriced_requests
-	FROM (SELECT root_id, count(*) AS threads FROM tree GROUP BY root_id) t
-		LEFT JOIN tree_sessions ts ON ts.root_id = t.root_id
-		LEFT JOIN session_usage u ON u.session_id = ts.session_id
-	GROUP BY t.root_id, t.threads`,
+	SELECT x.thread_id, th.parent_id, x.threads, x.sessions, x.requests, x.prompt_tokens, x.output_tokens,
+		x.cost_usd, x.unpriced_requests, COALESCE(o.sessions, 0) AS own_sessions, o.cost_usd AS own_cost_usd
+	FROM totals x JOIN threads th ON th.id = x.thread_id LEFT JOIN own o ON o.thread_id = x.thread_id`,
 }
 
 // extractThread rewrites one thread from its archive record (or removes it when gone).
