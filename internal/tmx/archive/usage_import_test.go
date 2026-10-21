@@ -3,6 +3,8 @@ package archive
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -181,5 +183,43 @@ func TestImportAccountAndBilling(t *testing.T) {
 	in.Messages[0].Usage = json.RawMessage(`{"provider":"openai","model":"gpt-5.5","billing":"prepaid"}`)
 	if _, err := a.IngestSession(ctx, in); err == nil {
 		t.Fatal("unknown billing accepted")
+	}
+}
+
+// Listing pages through every session with the next cursor, none twice, none skipped.
+func TestListSessionsPages(t *testing.T) {
+	a, _ := openTestArchive(t)
+	ctx := context.Background()
+	ts := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 7; i++ {
+		if _, err := a.IngestSession(ctx, SessionIngest{Harness: "nanx-app", ExternalID: fmt.Sprintf("p%d", i), Machine: "sonofanton",
+			StartedAt: &ts, Messages: []MessageIngest{usageMsg("m", 1, ts, "")}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := map[string]bool{}
+	cursor, pages := "", 0
+	for {
+		items, next, err := a.ListSessions(ctx, "nanx-app", "sonofanton", time.Unix(0, 0), 3, cursor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages++
+		for _, s := range items {
+			if seen[s.ID] {
+				t.Fatalf("%s listed twice", s.ID)
+			}
+			seen[s.ID] = true
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	if len(seen) != 7 || pages != 3 {
+		t.Fatalf("listed %d sessions in %d pages", len(seen), pages)
+	}
+	if _, _, err := a.ListSessions(ctx, "", "", time.Unix(0, 0), 3, "not-a-cursor"); !errors.Is(err, ErrBadCursor) {
+		t.Fatalf("bad cursor = %v", err)
 	}
 }

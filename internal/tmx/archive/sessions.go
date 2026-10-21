@@ -3,6 +3,7 @@ package archive
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -388,19 +389,39 @@ type SessionSummary struct {
 	UpdatedAt      time.Time       `json:"updated_at"`
 }
 
-// ListSessions lists ingested sessions, most recently updated first.
-func (a *Archive) ListSessions(ctx context.Context, harness, machine string, since time.Time, limit int) ([]SessionSummary, error) {
-	if limit <= 0 || limit > 500 {
+// ErrBadCursor is returned for a cursor ListSessions didn't produce.
+var ErrBadCursor = errors.New("invalid cursor")
+
+// ListSessions lists ingested sessions, most recently updated first, a page at a time: pass the
+// returned next cursor back to get the following page ("" = no more). Paging is by
+// (updated_at, id), so a session re-imported while paging moves to the front instead of shifting
+// the pages after it.
+func (a *Archive) ListSessions(ctx context.Context, harness, machine string, since time.Time, limit int,
+	cursor string) ([]SessionSummary, string, error) {
+	if limit <= 0 || limit > 1000 {
 		limit = 100
+	}
+	before, beforeID := time.Time{}, ""
+	if cursor != "" {
+		raw, err := base64.RawURLEncoding.DecodeString(cursor)
+		ts, id, ok := strings.Cut(string(raw), "|")
+		if err != nil || !ok {
+			return nil, "", ErrBadCursor
+		}
+		if before, err = time.Parse(time.RFC3339Nano, ts); err != nil {
+			return nil, "", ErrBadCursor
+		}
+		beforeID = id
 	}
 	rows, err := a.db.QueryContext(ctx, `SELECT s.id, s.harness, s.external_id, s.harness_version,
 		s.machine, s.project, s.cwd, s.title, s.via_proxy, s.started_at, s.ended_at, s.metadata,
 		(SELECT count(*) FROM `+schema+`.session_messages m WHERE m.session_id = s.id), s.updated_at
 		FROM `+schema+`.sessions s
 		WHERE ($1 = '' OR s.harness = $1) AND ($2 = '' OR s.machine = $2) AND s.updated_at >= $3
-		ORDER BY s.updated_at DESC LIMIT $4`, harness, machine, since, limit)
+			AND ($5 = '' OR (s.updated_at, s.id) < ($6, $5))
+		ORDER BY s.updated_at DESC, s.id DESC LIMIT $4`, harness, machine, since, limit+1, beforeID, before)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer func() { _ = rows.Close() }()
 	out := []SessionSummary{}
@@ -409,12 +430,21 @@ func (a *Archive) ListSessions(ctx context.Context, harness, machine string, sin
 		var meta []byte
 		if err = rows.Scan(&s.ID, &s.Harness, &s.ExternalID, &s.HarnessVersion, &s.Machine, &s.Project,
 			&s.CWD, &s.Title, &s.ViaProxy, &s.StartedAt, &s.EndedAt, &meta, &s.Messages, &s.UpdatedAt); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		s.Metadata = meta
 		out = append(out, s)
 	}
-	return out, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(out) > limit {
+		out = out[:limit]
+		last := out[len(out)-1]
+		next = base64.RawURLEncoding.EncodeToString([]byte(last.UpdatedAt.UTC().Format(time.RFC3339Nano) + "|" + last.ID))
+	}
+	return out, next, nil
 }
 
 // StoredMessage is a message as returned by GetSession.
