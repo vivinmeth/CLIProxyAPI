@@ -170,7 +170,9 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 	store := requestlog.Default()
 	var since *time.Time
 	if viaProxy != nil && *viaProxy {
-		since = a.proxiedSince(ctx, store, in.ExternalID)
+		if since, err = a.proxiedSince(ctx, store, in.ExternalID); err != nil {
+			return nil, fmt.Errorf("proxied traffic lookup: %w", err)
+		}
 	}
 	usageInTx := a.usageInArchiveDB(ctx, store)
 
@@ -290,6 +292,8 @@ type DeleteResult struct {
 // Content blobs stay (they are shared and content-addressed); proxied traffic is untouched.
 func (a *Archive) DeleteSession(ctx context.Context, id string) (*DeleteResult, error) {
 	res := &DeleteResult{SessionID: id}
+	store := requestlog.Default()
+	usageInTx := a.usageInArchiveDB(ctx, store)
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -309,11 +313,19 @@ func (a *Archive) DeleteSession(ctx context.Context, id string) (*DeleteResult, 
 	if err = a.journal(ctx, tx, "session", id); err != nil {
 		return nil, fmt.Errorf("analytics journal: %w", err)
 	}
+	// Usage rows go with the session, in the same transaction when they share the database.
+	if usageInTx {
+		if res.UsageRows, err = store.DeleteImportedWith(ctx, tx, id+"#", nil); err != nil {
+			return nil, fmt.Errorf("usage rows: %w", err)
+		}
+	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
-	if res.UsageRows, err = requestlog.Default().DeleteImported(ctx, id+"#", nil); err != nil {
-		return res, fmt.Errorf("usage rows: %w", err)
+	if !usageInTx {
+		if res.UsageRows, err = store.DeleteImported(ctx, id+"#", nil); err != nil {
+			return res, fmt.Errorf("usage rows: %w", err)
+		}
 	}
 	return res, nil
 }
