@@ -295,6 +295,10 @@ type QuotaState struct {
 	ObservedAt       time.Time            `json:"observed_at,omitempty"`
 	Signals          map[string]string    `json:"signals,omitempty"`
 	SignalObservedAt map[string]time.Time `json:"signal_observed_at,omitempty"`
+	// SignalClearedAt (tokenmaxx) marks signals cleared by a quota reset, keyed by a lowercase
+	// name or a name prefix ending in "-". Readings observed at or before the mark predate the
+	// reset and are never merged back.
+	SignalClearedAt map[string]time.Time `json:"signal_cleared_at,omitempty"`
 }
 
 // Clone returns an independent copy of the quota state.
@@ -304,6 +308,12 @@ func (q QuotaState) Clone() QuotaState {
 		copyQuota.SignalObservedAt = make(map[string]time.Time, len(q.SignalObservedAt))
 		for k, v := range q.SignalObservedAt {
 			copyQuota.SignalObservedAt[k] = v
+		}
+	}
+	if q.SignalClearedAt != nil {
+		copyQuota.SignalClearedAt = make(map[string]time.Time, len(q.SignalClearedAt))
+		for k, v := range q.SignalClearedAt {
+			copyQuota.SignalClearedAt[k] = v
 		}
 	}
 	if len(q.Signals) > 0 {

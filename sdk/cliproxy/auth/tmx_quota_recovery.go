@@ -52,9 +52,9 @@ func (m *Manager) ClearRecoveredQuota(ctx context.Context, authID string, r Quot
 		cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 	}
 
-	changed := dropRecoveredQuotaSignals(&auth.Quota, auth.Provider, r)
+	changed := dropRecoveredQuotaSignals(&auth.Quota, auth.Provider, r, now)
 	for _, state := range auth.ModelStates {
-		if state != nil && dropRecoveredQuotaSignals(&state.Quota, auth.Provider, r) {
+		if state != nil && dropRecoveredQuotaSignals(&state.Quota, auth.Provider, r, now) {
 			changed = true
 		}
 	}
@@ -195,8 +195,11 @@ var (
 	codexRejectionSignals = []string{"retry-after", "x-codex-limit-reached", "x-codex-allowed"}
 )
 
-func dropRecoveredQuotaSignals(q *QuotaState, provider string, r QuotaRecovery) bool {
-	if q == nil || len(q.Signals) == 0 {
+// dropRecoveredQuotaSignals deletes the recovered windows' signals and marks them cleared, even
+// when absent, so a reading taken before the reset (an in-flight refresh or poll) can't restore
+// them.
+func dropRecoveredQuotaSignals(q *QuotaState, provider string, r QuotaRecovery, now time.Time) bool {
+	if q == nil {
 		return false
 	}
 	recovered := make(map[string]bool, len(r.Windows))
@@ -215,8 +218,10 @@ func dropRecoveredQuotaSignals(q *QuotaState, provider string, r QuotaRecovery) 
 			exact = claudeRejectionSignals
 		}
 	case "codex":
-		for _, slot := range []string{"primary", "secondary"} {
-			if recovered[codexSignalWindowName(q.Signals, slot)] {
+		// Without a window length (no signals left), a slot is its usual window, as polls map it.
+		for slot, usual := range map[string]string{"primary": "5h", "secondary": "7d"} {
+			name := codexSignalWindowName(q.Signals, slot)
+			if recovered[name] || (name == slot && recovered[usual]) {
 				prefixes = append(prefixes, "x-codex-"+slot+"-")
 			}
 		}
@@ -224,6 +229,7 @@ func dropRecoveredQuotaSignals(q *QuotaState, provider string, r QuotaRecovery) 
 			exact = codexRejectionSignals
 		}
 	}
+	q.markSignalsCleared(append(append([]string(nil), prefixes...), exact...), now)
 	changed := false
 	for key := range q.Signals {
 		lower := strings.ToLower(key)
@@ -236,11 +242,13 @@ func dropRecoveredQuotaSignals(q *QuotaState, provider string, r QuotaRecovery) 
 		}
 		if drop {
 			delete(q.Signals, key)
+			delete(q.SignalObservedAt, key)
 			changed = true
 		}
 	}
 	if changed && len(q.Signals) == 0 {
 		q.Signals = nil
+		q.SignalObservedAt = nil
 		q.ObservedAt = time.Time{}
 	}
 	return changed

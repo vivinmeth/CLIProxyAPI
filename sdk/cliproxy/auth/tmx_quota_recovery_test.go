@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -217,4 +218,56 @@ func TestClearRecoveredQuotaFableUnderCredentialWrap(t *testing.T) {
 		}
 		fableReleased(t, recoveryState(t, manager, id))
 	})
+}
+
+func TestClearRecoveredQuotaSignalsStayClearedAgainstOlderObservations(t *testing.T) {
+	const id = "recovery-watermark"
+	now := time.Now()
+	key := http.CanonicalHeaderKey("Anthropic-Ratelimit-Unified-5h-Utilization")
+	resetKey := http.CanonicalHeaderKey("Anthropic-Ratelimit-Unified-5h-Reset")
+	manager := registerRecoveryAuth(t, id, "claude", map[string]string{key: "1", resetKey: strconv.FormatInt(now.Add(time.Hour).Unix(), 10)})
+	// A token refresh started from this snapshot before the credit was redeemed.
+	base := recoveryState(t, manager, id)
+	updated := base.Clone()
+	if _, err := manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{Windows: []string{"5h"}, CredentialQuota: true}); err != nil {
+		t.Fatal(err)
+	}
+	current := recoveryState(t, manager, id)
+	if merged := MergeRefreshedAuth(base, current, updated); merged.Quota.Signals[key] != "" {
+		t.Fatalf("a refresh begun before the reset restored the cleared window: %v", merged.Quota.Signals)
+	}
+
+	// A usage poll read before the reset and delivered after it.
+	full := 100.0
+	manager.ApplyQuotaObservation(id, "claude", []QuotaWindowObservation{{Window: "5h", UsedPercent: &full, ResetsAt: now.Add(time.Hour), ObservedAt: now.Add(-time.Second)}})
+	if got := recoveryState(t, manager, id).Quota.Signals[key]; got != "" {
+		t.Fatalf("an older poll restored the cleared window: %q", got)
+	}
+	// A reading taken after the reset is accepted.
+	low := 2.0
+	manager.ApplyQuotaObservation(id, "claude", []QuotaWindowObservation{{Window: "5h", UsedPercent: &low, ResetsAt: now.Add(5 * time.Hour), ObservedAt: time.Now().Add(time.Millisecond)}})
+	if got := recoveryState(t, manager, id).Quota.Signals[key]; got != "0.02" {
+		t.Fatalf("a post-reset reading must be accepted: %q", got)
+	}
+}
+
+func TestClearRecoveredQuotaMarksCodexWindowsWithoutSignals(t *testing.T) {
+	const id = "recovery-watermark-codex"
+	manager := registerRecoveryAuth(t, id, "codex", nil)
+	if _, err := manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{Windows: []string{"7d"}}); err != nil {
+		t.Fatal(err)
+	}
+	full := 100.0
+	now := time.Now()
+	manager.ApplyQuotaObservation(id, "codex", []QuotaWindowObservation{
+		{Window: "7d", UsedPercent: &full, ResetsAt: now.Add(48 * time.Hour), ObservedAt: now.Add(-time.Second)},
+		{Window: "5h", UsedPercent: &full, ResetsAt: now.Add(time.Hour), ObservedAt: now.Add(-time.Second)},
+	})
+	signals := recoveryState(t, manager, id).Quota.Signals
+	if _, ok := signals["X-Codex-Secondary-Used-Percent"]; ok {
+		t.Fatalf("a pre-reset weekly reading came back: %v", signals)
+	}
+	if signals["X-Codex-Primary-Used-Percent"] != "100" {
+		t.Fatalf("the unrecovered 5h window must still be observed: %v", signals)
+	}
 }

@@ -66,6 +66,9 @@ func (q *QuotaState) mergeObservedSignals(next map[string]string, at time.Time) 
 		if !stableQuotaSignal(key) && at.Before(old.ObservedAt) {
 			continue
 		}
+		if old.signalClearedSince(key, at) {
+			continue
+		}
 		if _, exists := merged[key]; exists && old.SignalObservedTime(key).After(at) {
 			continue
 		}
@@ -90,6 +93,39 @@ func (q *QuotaState) mergeObservedSignals(next map[string]string, at time.Time) 
 	q.SignalObservedAt = times
 	if at.After(q.ObservedAt) {
 		q.ObservedAt = at
+	}
+}
+
+// signalClearedSince reports whether a quota reset cleared name at or after at.
+func (q QuotaState) signalClearedSince(name string, at time.Time) bool {
+	lower := strings.ToLower(name)
+	for mark, clearedAt := range q.SignalClearedAt {
+		if at.After(clearedAt) {
+			continue
+		}
+		if lower == mark || (strings.HasSuffix(mark, "-") && strings.HasPrefix(lower, mark)) {
+			return true
+		}
+	}
+	return false
+}
+
+// markSignalsCleared records that a reset cleared names (lowercase names or "-"-terminated
+// prefixes) at at. Marks older than any acceptable reading are dropped.
+func (q *QuotaState) markSignalsCleared(names []string, at time.Time) {
+	if len(names) == 0 {
+		return
+	}
+	if q.SignalClearedAt == nil {
+		q.SignalClearedAt = make(map[string]time.Time, len(names))
+	}
+	for mark, clearedAt := range q.SignalClearedAt {
+		if at.Sub(clearedAt) > QuotaObservationMaxAge {
+			delete(q.SignalClearedAt, mark)
+		}
+	}
+	for _, name := range names {
+		q.SignalClearedAt[strings.ToLower(name)] = at
 	}
 }
 

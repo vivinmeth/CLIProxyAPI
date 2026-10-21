@@ -133,6 +133,9 @@ func (m *Manager) ApplyQuotaObservation(authID, provider string, windows []Quota
 		for key := range fields {
 			if _, exists := a.Quota.Signals[http.CanonicalHeaderKey(key)]; exists && !w.ObservedAt.After(a.Quota.SignalObservedTime(key)) {
 				delete(fields, key)
+			} else if a.Quota.signalClearedSince(key, w.ObservedAt) {
+				// Read before a reset credit cleared this window.
+				delete(fields, key)
 			}
 		}
 		if len(fields) == 0 {
