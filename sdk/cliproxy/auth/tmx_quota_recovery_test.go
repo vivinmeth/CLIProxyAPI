@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -72,7 +73,7 @@ func TestClearRecoveredQuotaReleasesOnlyQuotaLayers(t *testing.T) {
 		t.Fatalf("a model-scoped limit outside the recovery must survive: %+v", fable)
 	}
 
-	if _, err = manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{ModelQuota: true, Windows: []string{"7d_oi"}}); err != nil {
+	if _, err = manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{ModelWindows: []string{"7d_oi"}, Windows: []string{"7d_oi"}}); err != nil {
 		t.Fatal(err)
 	}
 	auth = recoveryState(t, manager, id)
@@ -159,4 +160,114 @@ func TestClearRecoveredQuotaDropsOnlyRecoveredSignals(t *testing.T) {
 			t.Fatalf("with every window recovered the account is unobserved: %+v", auth.Quota)
 		}
 	})
+}
+
+func TestClearRecoveredQuotaFableKeepsOtherModelQuota(t *testing.T) {
+	const id = "recovery-fable-only"
+	manager := registerRecoveryAuth(t, id, "claude", nil)
+	markRecoveryResult(manager, id, "claude-sonnet-5", http.StatusTooManyRequests, time.Minute, false)
+	markRecoveryResult(manager, id, "claude-fable-5", http.StatusTooManyRequests, 72*time.Hour, false)
+	if _, err := manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{Windows: []string{"7d_oi"}, ModelWindows: []string{"7d_oi"}}); err != nil {
+		t.Fatal(err)
+	}
+	auth := recoveryState(t, manager, id)
+	if !auth.ModelStates["claude-sonnet-5"].Unavailable {
+		t.Fatal("a Fable recovery must not release an unrelated Sonnet 429")
+	}
+	if fable := auth.ModelStates["claude-fable-5"]; fable.Unavailable || fable.Quota.Exceeded {
+		t.Fatalf("the recovered Fable limit must go: %+v", fable)
+	}
+}
+
+func TestClearRecoveredQuotaFableUnderCredentialWrap(t *testing.T) {
+	setup := func(t *testing.T, id string) *Manager {
+		manager := registerRecoveryAuth(t, id, "claude", nil)
+		markRecoveryResult(manager, id, "claude-sonnet-5", http.StatusTooManyRequests, 72*time.Hour, false)
+		markRecoveryResult(manager, id, "claude-fable-5", http.StatusTooManyRequests, 72*time.Hour, false)
+		markRecoveryResult(manager, id, "claude-opus-5", http.StatusTooManyRequests, 72*time.Hour, true)
+		return manager
+	}
+	fableReleased := func(t *testing.T, auth *Auth) {
+		t.Helper()
+		if fable := auth.ModelStates["claude-fable-5"]; fable.Unavailable || fable.Quota.Exceeded {
+			t.Fatalf("recovered Fable quota reinstated from the credential shadow: %+v", fable)
+		}
+		if sonnet := auth.ModelStates["claude-sonnet-5"]; !sonnet.Unavailable || sonnet.Quota.Reason != "quota" {
+			t.Fatalf("Sonnet's independent quota beneath the wrap must be reinstated: %+v", sonnet)
+		}
+	}
+	t.Run("together", func(t *testing.T) {
+		const id = "recovery-wrap-together"
+		manager := setup(t, id)
+		if _, err := manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{Windows: []string{"5h", "7d", "7d_oi"}, CredentialQuota: true, ModelWindows: []string{"7d_oi"}}); err != nil {
+			t.Fatal(err)
+		}
+		fableReleased(t, recoveryState(t, manager, id))
+	})
+	t.Run("model first", func(t *testing.T) {
+		const id = "recovery-wrap-model-first"
+		manager := setup(t, id)
+		if _, err := manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{Windows: []string{"7d_oi"}, ModelWindows: []string{"7d_oi"}}); err != nil {
+			t.Fatal(err)
+		}
+		if auth := recoveryState(t, manager, id); auth.Quota.Reason != "credential_quota" || !auth.ModelStates["claude-fable-5"].Unavailable {
+			t.Fatalf("the shared block must stay over Fable: %+v", auth.ModelStates["claude-fable-5"])
+		}
+		if _, err := manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{Windows: []string{"5h", "7d"}, CredentialQuota: true}); err != nil {
+			t.Fatal(err)
+		}
+		fableReleased(t, recoveryState(t, manager, id))
+	})
+}
+
+func TestClearRecoveredQuotaSignalsStayClearedAgainstOlderObservations(t *testing.T) {
+	const id = "recovery-watermark"
+	now := time.Now()
+	key := http.CanonicalHeaderKey("Anthropic-Ratelimit-Unified-5h-Utilization")
+	resetKey := http.CanonicalHeaderKey("Anthropic-Ratelimit-Unified-5h-Reset")
+	manager := registerRecoveryAuth(t, id, "claude", map[string]string{key: "1", resetKey: strconv.FormatInt(now.Add(time.Hour).Unix(), 10)})
+	// A token refresh started from this snapshot before the credit was redeemed.
+	base := recoveryState(t, manager, id)
+	updated := base.Clone()
+	if _, err := manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{Windows: []string{"5h"}, CredentialQuota: true}); err != nil {
+		t.Fatal(err)
+	}
+	current := recoveryState(t, manager, id)
+	if merged := MergeRefreshedAuth(base, current, updated); merged.Quota.Signals[key] != "" {
+		t.Fatalf("a refresh begun before the reset restored the cleared window: %v", merged.Quota.Signals)
+	}
+
+	// A usage poll read before the reset and delivered after it.
+	full := 100.0
+	manager.ApplyQuotaObservation(id, "claude", []QuotaWindowObservation{{Window: "5h", UsedPercent: &full, ResetsAt: now.Add(time.Hour), ObservedAt: now.Add(-time.Second)}})
+	if got := recoveryState(t, manager, id).Quota.Signals[key]; got != "" {
+		t.Fatalf("an older poll restored the cleared window: %q", got)
+	}
+	// A reading taken after the reset is accepted.
+	low := 2.0
+	manager.ApplyQuotaObservation(id, "claude", []QuotaWindowObservation{{Window: "5h", UsedPercent: &low, ResetsAt: now.Add(5 * time.Hour), ObservedAt: time.Now().Add(time.Millisecond)}})
+	if got := recoveryState(t, manager, id).Quota.Signals[key]; got != "0.02" {
+		t.Fatalf("a post-reset reading must be accepted: %q", got)
+	}
+}
+
+func TestClearRecoveredQuotaMarksCodexWindowsWithoutSignals(t *testing.T) {
+	const id = "recovery-watermark-codex"
+	manager := registerRecoveryAuth(t, id, "codex", nil)
+	if _, err := manager.ClearRecoveredQuota(context.Background(), id, QuotaRecovery{Windows: []string{"7d"}}); err != nil {
+		t.Fatal(err)
+	}
+	full := 100.0
+	now := time.Now()
+	manager.ApplyQuotaObservation(id, "codex", []QuotaWindowObservation{
+		{Window: "7d", UsedPercent: &full, ResetsAt: now.Add(48 * time.Hour), ObservedAt: now.Add(-time.Second)},
+		{Window: "5h", UsedPercent: &full, ResetsAt: now.Add(time.Hour), ObservedAt: now.Add(-time.Second)},
+	})
+	signals := recoveryState(t, manager, id).Quota.Signals
+	if _, ok := signals["X-Codex-Secondary-Used-Percent"]; ok {
+		t.Fatalf("a pre-reset weekly reading came back: %v", signals)
+	}
+	if signals["X-Codex-Primary-Used-Percent"] != "100" {
+		t.Fatalf("the unrecovered 5h window must still be observed: %v", signals)
+	}
 }

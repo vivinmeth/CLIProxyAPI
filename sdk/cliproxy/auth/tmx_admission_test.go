@@ -294,3 +294,24 @@ func TestResetSoonestLiveConfigAndModelContext(t *testing.T) {
 		t.Fatal("threshold hot reload ignored")
 	}
 }
+
+func TestResetSoonestAdmissionParsesBodiesOutsideMutex(t *testing.T) {
+	m, e := admissionFixture(t, 2, 0, false, true)
+	close(e.release)
+	before := tmxSessionParsesUnderAdmission.Load()
+	requests := []executor.Options{
+		coldOptions(1),
+		// No explicit session: the LCP matcher fingerprints the conversation.
+		{SourceFormat: "claude", OriginalRequest: []byte(`{"model":"claude-sonnet-5","system":"be brief","messages":[{"role":"user","content":"first question"},{"role":"assistant","content":"answer"},{"role":"user","content":"follow-up"}]}`)},
+	}
+	for i, opts := range requests {
+		go func() { <-e.entered }()
+		if _, err := m.Execute(context.Background(), []string{"claude"}, executor.Request{Model: "claude-sonnet-5"}, opts); err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+	}
+	if got := tmxSessionParsesUnderAdmission.Load() - before; got != 0 {
+		t.Fatalf("%d request body parses ran under the admission mutex", got)
+	}
+	assertNoReservations(t, m)
+}

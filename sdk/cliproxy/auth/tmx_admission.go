@@ -84,11 +84,12 @@ func (r *tmxReservation) reserve(counter *atomic.Int64) bool {
 	return true
 }
 
-func (m *Manager) tmxPickWithAdmission(ctx context.Context, pick func(context.Context) (refreshSelection, error)) (refreshSelection, error) {
+func (m *Manager) tmxPickWithAdmission(ctx context.Context, opts executor.Options, pick func(context.Context) (refreshSelection, error)) (refreshSelection, error) {
 	reservation, _ := ctx.Value(tmxAdmissionKey{}).(*tmxReservation)
 	m.mu.RLock()
 	selector := m.selector
 	m.mu.RUnlock()
+	outer := selector
 	if affinity, ok := selector.(*SessionAffinitySelector); ok {
 		selector = affinity.fallback
 	}
@@ -99,13 +100,15 @@ func (m *Manager) tmxPickWithAdmission(ctx context.Context, pick func(context.Co
 	if reservation == nil {
 		return pick(context.WithValue(ctx, tmxAdmissionViewKey{}, view))
 	}
+	// Body parsing for session affinity runs before the mutex; it holds only rank + reserve.
+	ctx = prepareTMXSession(ctx, outer, opts)
 	m.tmxAdmission.mu.Lock()
 	defer m.tmxAdmission.mu.Unlock()
 	reservation.clear()
 	if err := ctx.Err(); err != nil {
 		return refreshSelection{}, err
 	}
-	result, err := pick(context.WithValue(ctx, tmxAdmissionViewKey{}, view))
+	result, err := pick(context.WithValue(context.WithValue(ctx, tmxAdmissionViewKey{}, view), tmxUnderAdmissionKey{}, true))
 	if err == nil && result.auth != nil && !reservation.reserve(m.tmxAdmission.counter(result.auth.ID)) {
 		return refreshSelection{}, context.Canceled
 	}
@@ -125,6 +128,7 @@ func newTMXReservation(ctx context.Context) (context.Context, *tmxReservation, f
 // The reservation covers selection, preparation, refresh, and the full upstream
 // response lifetime. Defers release it even if an executor panics.
 func (m *Manager) Execute(ctx context.Context, providers []string, req executor.Request, opts executor.Options) (executor.Response, error) {
+	ctx = withTMXRequestBudgets(ctx)
 	if !m.tmxAdmissionEnabled() {
 		return m.executeWithoutAdmission(ctx, providers, req, opts)
 	}
@@ -134,6 +138,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req executor.
 	return m.executeWithoutAdmission(ctx, providers, req, opts)
 }
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req executor.Request, opts executor.Options) (executor.Response, error) {
+	ctx = withTMXRequestBudgets(ctx)
 	if !m.tmxAdmissionEnabled() {
 		return m.executeCountWithoutAdmission(ctx, providers, req, opts)
 	}
@@ -143,6 +148,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req exec
 	return m.executeCountWithoutAdmission(ctx, providers, req, opts)
 }
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req executor.Request, opts executor.Options) (result *executor.StreamResult, err error) {
+	ctx = withTMXRequestBudgets(ctx)
 	if !m.tmxAdmissionEnabled() {
 		return m.executeStreamWithoutAdmission(ctx, providers, req, opts)
 	}

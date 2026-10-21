@@ -151,6 +151,9 @@ func (m *Manager) executeWithoutAdmission(ctx context.Context, providers []strin
 		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, normalized, retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
+		if shouldRetry {
+			wait, shouldRetry = m.overloadRetryWait(ctx, errExec, normalized, retryModel, wait, maxWait)
+		}
 		if !shouldRetry {
 			break
 		}
@@ -173,7 +176,7 @@ func (m *Manager) executeWithoutAdmission(ctx context.Context, providers []strin
 				return resp, nil
 			}
 		}
-		return cliproxyexecutor.Response{}, lastErr
+		return cliproxyexecutor.Response{}, m.withPoolRetryAfter(ctx, lastErr, normalized, retryModel, opts)
 	}
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
@@ -211,6 +214,9 @@ func (m *Manager) executeCountWithoutAdmission(ctx context.Context, providers []
 		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, normalized, retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
+		if shouldRetry {
+			wait, shouldRetry = m.overloadRetryWait(ctx, errExec, normalized, retryModel, wait, maxWait)
+		}
 		if !shouldRetry {
 			break
 		}
@@ -225,7 +231,7 @@ func (m *Manager) executeCountWithoutAdmission(ctx context.Context, providers []
 			}
 		}
 		lastErr = preferredExecutionAttemptError(lastErr, preferredUpstreamErr)
-		return cliproxyexecutor.Response{}, unwrapExecutionBoundaryError(lastErr)
+		return cliproxyexecutor.Response{}, m.withPoolRetryAfter(ctx, unwrapExecutionBoundaryError(lastErr), normalized, retryModel, opts)
 	}
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
@@ -283,6 +289,9 @@ func (m *Manager) executeStreamWithoutAdmission(ctx context.Context, providers [
 		}
 		lastErr = errStream
 		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errStream, attempt, normalized, retryModel, maxWait, homeRetryLimit, defaultRequestRetry, roundAttempted)
+		if shouldRetry && !m.HomeEnabled() {
+			wait, shouldRetry = m.overloadRetryWait(ctx, errStream, normalized, retryModel, wait, maxWait)
+		}
 		if !shouldRetry {
 			break
 		}
@@ -310,6 +319,7 @@ func (m *Manager) executeStreamWithoutAdmission(ctx context.Context, providers [
 				return result, nil
 			}
 		}
+		lastErr = m.withPoolRetryAfter(ctx, lastErr, normalized, retryModel, opts)
 		var bootstrapErr *streamBootstrapError
 		if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
 			return streamErrorResult(bootstrapErr.Headers(), lastErr), nil
@@ -499,7 +509,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	var lastErr error
 	var upstreamErr error
 	for {
-		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials || (!homeMode && m.overloadRoundSpent(ctx, retryRound, providers, routeModel) && lastErr != nil) {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
 			}
@@ -713,7 +723,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	var lastErr error
 	var upstreamErr error
 	for {
-		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials || (!homeMode && m.overloadRoundSpent(ctx, retryRound, providers, routeModel) && lastErr != nil) {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
 			}
@@ -938,7 +948,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	var roundTiming homeRetryRoundTiming
 	for {
 		allowSameAuthRetry := homeMode && homeSameAuthRetryPending && lastHomeAuthID != "" && homeSameAuthRetries[lastHomeAuthID] == 0
-		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials && !allowSameAuthRetry {
+		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials && !allowSameAuthRetry || (!homeMode && m.overloadRoundSpent(ctx, retryRound, providers, routeModel) && lastErr != nil) {
 			if lastErr != nil {
 				preferredErr := preferredExecutionAttemptError(lastErr, upstreamErr)
 				if homeMode {

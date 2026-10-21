@@ -809,6 +809,22 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
 	m.mu.Unlock()
 }
 
+// retryCanceledRefresh schedules a refresh that a canceled request gave up on.
+func (m *Manager) retryCanceledRefresh(id string, now time.Time) {
+	m.mu.Lock()
+	if current := m.auths[id]; current != nil {
+		if current.NextRefreshAfter.IsZero() || current.NextRefreshAfter.Before(now) {
+			current.NextRefreshAfter = now.Add(time.Second)
+		}
+		m.auths[id] = current
+		if m.scheduler != nil {
+			m.scheduler.upsertAuth(current.Clone())
+		}
+	}
+	m.mu.Unlock()
+	m.queueRefreshReschedule(id)
+}
+
 func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAccessToken string, registrationEpoch uint64) (*Auth, error) {
 	if m == nil {
 		return nil, errors.New("auth manager is nil")
@@ -837,6 +853,10 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		m.markRejectedAccessToken(id, failedAccessToken)
 	}
 	if errLock := lock.mu.LockContext(ctx); errLock != nil {
+		if failedAccessToken != "" {
+			// tmx: the token is already marked rejected; keep it on the refresh schedule.
+			m.retryCanceledRefresh(id, time.Now())
+		}
 		return nil, errLock
 	}
 	defer lock.mu.Unlock()
@@ -875,18 +895,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	now := time.Now()
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
-		m.mu.Lock()
-		if current := m.auths[id]; current != nil {
-			if current.NextRefreshAfter.IsZero() || current.NextRefreshAfter.Before(now) {
-				current.NextRefreshAfter = now.Add(time.Second)
-			}
-			m.auths[id] = current
-			if m.scheduler != nil {
-				m.scheduler.upsertAuth(current.Clone())
-			}
-		}
-		m.mu.Unlock()
-		m.queueRefreshReschedule(id)
+		m.retryCanceledRefresh(id, now)
 		return nil, err
 	}
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)

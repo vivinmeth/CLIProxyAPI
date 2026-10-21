@@ -658,7 +658,7 @@ func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byt
 	if errMsg != nil && errMsg.Addon != nil {
 		headers := []byte(`{}`)
 		hasHeaders := false
-		for key, values := range errMsg.Addon {
+		for key, values := range handlers.ErrorEnvelopeHeaders(errMsg) {
 			if len(values) == 0 {
 				continue
 			}

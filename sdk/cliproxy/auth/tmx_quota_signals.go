@@ -128,10 +128,21 @@ func (m *Manager) ApplyQuotaObservation(authID, provider string, windows []Quota
 		if validQuotaSignalValue(w.Status) {
 			fields[prefix+"Status"] = w.Status
 		}
+		// Passive signals are stored under canonical header keys; a model slug with a "-" spells
+		// differently raw, which would keep two readings of one window.
+		for key, value := range fields {
+			if canonical := http.CanonicalHeaderKey(key); canonical != key {
+				delete(fields, key)
+				fields[canonical] = value
+			}
+		}
 		// Each field is compared independently so a newer 5h reading doesn't block
 		// filling an older, still-current 7d window.
 		for key := range fields {
-			if _, exists := a.Quota.Signals[http.CanonicalHeaderKey(key)]; exists && !w.ObservedAt.After(a.Quota.SignalObservedTime(key)) {
+			if _, exists := a.Quota.Signals[key]; exists && !w.ObservedAt.After(a.Quota.SignalObservedTime(key)) {
+				delete(fields, key)
+			} else if a.Quota.signalClearedSince(key, w.ObservedAt) {
+				// Read before a reset credit cleared this window.
 				delete(fields, key)
 			}
 		}

@@ -124,22 +124,7 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		writeDirectErrorResponse(c, status, msg)
 		return
 	}
-	if msg != nil && msg.Error != nil {
-		for _, value := range coreauth.SafeResponseHeaders(msg.Error).Values("Retry-After") {
-			c.Writer.Header().Add("Retry-After", value)
-		}
-	}
-	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.CurrentConfig()) {
-		for key, values := range msg.Addon {
-			if len(values) == 0 || IsCPAReservedResponseHeader(key) {
-				continue
-			}
-			c.Writer.Header().Del(key)
-			for _, value := range values {
-				c.Writer.Header().Add(key, value)
-			}
-		}
-	}
+	h.WriteErrorResponseHeaders(c.Writer.Header(), msg)
 
 	errText := http.StatusText(status)
 	if msg != nil && msg.Error != nil {

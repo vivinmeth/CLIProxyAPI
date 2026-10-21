@@ -53,16 +53,35 @@ func parseCodexWebsocketErrorWithCooling(payload []byte, modelLevelCooling bool)
 		msg:              string(out),
 		credentialScoped: isUsageLimit && !modelLevelCooling,
 	}
-	if retryAfter := parseCodexRetryAfter(status, out, time.Now()); retryAfter != nil {
-		statusError.retryAfter = retryAfter
-	} else if isCodexWebsocketConnectionLimitError(payload) {
-		retryAfter := time.Duration(0)
-		statusError.retryAfter = &retryAfter
+	now := time.Now()
+	statusError.retryAfter = parseCodexRetryAfter(status, out, now)
+	if isCodexWebsocketConnectionLimitError(payload) {
+		// The connection cap is not an account throttle: retry at once on a fresh connection.
+		if statusError.retryAfter == nil {
+			retryAfter := time.Duration(0)
+			statusError.retryAfter = &retryAfter
+		}
+	} else {
+		// tmx: the envelope's headers count like an HTTP refusal's (codexHTTPRetryAfter).
+		statusError.retryAfter = codexHTTPRetryAfter(status, headers, out, statusError.retryAfter, now)
 	}
 	return statusErrWithHeaders{
 		statusErr: statusError,
-		headers:   headers,
+		headers:   codexWebsocketErrorHeaders(headers),
 	}, true
+}
+
+// codexWebsocketErrorHeaders keeps an error envelope's retry/quota headers, as for an HTTP
+// refusal, plus its request id for tracing.
+func codexWebsocketErrorHeaders(headers http.Header) http.Header {
+	kept := helps.CodexErrorResponseHeaders(headers)
+	if id := headers.Get("X-Request-Id"); id != "" {
+		if kept == nil {
+			kept = make(http.Header)
+		}
+		kept.Set("X-Request-Id", id)
+	}
+	return kept
 }
 
 func clearCodexReasoningReplayOnWebsocketError(ctx context.Context, scope codexReasoningReplayScope, payload []byte) error {

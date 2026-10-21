@@ -883,6 +883,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 	}
+	m.noteOverload(ctx, result) // tmx
 	modelKey := canonicalModelKey(result.Model)
 
 	var authSnapshot *Auth

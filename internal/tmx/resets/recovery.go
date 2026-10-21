@@ -39,7 +39,9 @@ func recoveryOf(provider string, before, after []Window, afterRead bool, clears 
 				rec.CredentialQuota = false
 			}
 		}
-		rec.ModelQuota = provider == "claude" && slices.Contains(scope, claudeModelWindow)
+		if provider == "claude" && slices.Contains(scope, claudeModelWindow) {
+			rec.ModelWindows = []string{claudeModelWindow}
+		}
 		return rec
 	}
 
@@ -74,7 +76,9 @@ func recoveryOf(provider string, before, after []Window, afterRead bool, clears 
 			rec.CredentialQuota = false
 		}
 	}
-	rec.ModelQuota = provider == "claude" && slices.Contains(rec.Windows, claudeModelWindow)
+	if provider == "claude" && slices.Contains(rec.Windows, claudeModelWindow) {
+		rec.ModelWindows = []string{claudeModelWindow}
+	}
 	return rec
 }
 
