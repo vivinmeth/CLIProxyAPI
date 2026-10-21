@@ -113,13 +113,13 @@ func TestParseCodex(t *testing.T) {
 
 // fakeBackend answers provider calls from a script.
 type fakeBackend struct {
-	mu       sync.Mutex
-	auths    []*coreauth.Auth
-	handle   func(method, url string, body []byte) (int, string, error)
-	calls    []string
-	bodies   []string
-	cooldown []string
-	signals  []string
+	mu         sync.Mutex
+	auths      []*coreauth.Auth
+	handle     func(method, url string, body []byte) (int, string, error)
+	calls      []string
+	bodies     []string
+	recoveries []coreauth.QuotaRecovery
+	clear      func(id string, r coreauth.QuotaRecovery) error
 }
 
 func (f *fakeBackend) TmxAuths() []*coreauth.Auth { return f.auths }
@@ -133,13 +133,16 @@ func (f *fakeBackend) TmxSend(_ context.Context, _ *coreauth.Auth, method, url s
 	code, resp, err := f.handle(method, url, body)
 	return code, []byte(resp), err
 }
-func (f *fakeBackend) TmxResetCooldown(_ context.Context, id string) error {
-	f.cooldown = append(f.cooldown, id)
+func (f *fakeBackend) TmxClearRecoveredQuota(_ context.Context, id string, r coreauth.QuotaRecovery) error {
+	f.mu.Lock()
+	f.calls = append(f.calls, "CLEAR "+id)
+	f.recoveries = append(f.recoveries, r)
+	clear := f.clear
+	f.mu.Unlock()
+	if clear != nil {
+		return clear(id, r)
+	}
 	return nil
-}
-func (f *fakeBackend) TmxClearQuotaSignals(id string) bool {
-	f.signals = append(f.signals, id)
-	return true
 }
 
 func codexAuth() *coreauth.Auth {
@@ -181,8 +184,8 @@ func TestCodexRedeemIsDeterministicAndConfirmed(t *testing.T) {
 	if r.State != "settled" || r.Outcome != OutcomeReset || !r.Confirmed || r.Warning != "" {
 		t.Fatalf("redemption %+v", r)
 	}
-	if len(f.cooldown) != 1 || len(f.signals) != 1 {
-		t.Fatalf("cooldown/signals not cleared: %v %v", f.cooldown, f.signals)
+	if len(f.recoveries) != 1 || !f.recoveries[0].CredentialQuota || strings.Join(f.recoveries[0].Windows, ",") != "7d" {
+		t.Fatalf("a confirmed full reset must release the credential quota and the 7d window: %+v", f.recoveries)
 	}
 	var sent map[string]string
 	_ = json.Unmarshal([]byte(f.bodies[0]), &sent)
@@ -219,7 +222,7 @@ func TestClaudeUnknownOutcomeStaysPendingAndRetriesSameID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Redemption.State != "pending" || res.Redemption.Outcome != OutcomeUnknown || len(f.cooldown) != 0 {
+	if res.Redemption.State != "pending" || res.Redemption.Outcome != OutcomeUnknown || len(f.recoveries) != 0 {
 		t.Fatalf("unknown outcome must stay pending without touching cooldown: %+v", res.Redemption)
 	}
 	if res.Account == nil || res.Account.Pending == nil {

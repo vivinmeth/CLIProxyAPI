@@ -9,8 +9,9 @@
 // Spending is safe to retry: every claim is written to <schema>.reset_redemptions with its request
 // id before it is sent. Codex ids are a UUIDv5 of account:credit, so any retry from anywhere is the
 // same claim; a Claude id is reused while the claim has no definite answer (24 h). One redeem per
-// account at a time. After a reset the proxy's cooldown is cleared and its passive quota signals
-// dropped so reset-soonest re-ranks the account, then the account is re-read to confirm.
+// account at a time. After a reset the account is re-read, and only what verifiably recovered is
+// released in the proxy: the quota cooldowns and passive quota signals of the recovered windows
+// (recovery.go). Auth, transient and unrelated model blocks stay.
 package resets
 
 import (
@@ -87,8 +88,9 @@ func (e *BlockedError) Error() string { return "credit cannot be used now: " + e
 type Backend interface {
 	TmxAuths() []*coreauth.Auth
 	TmxSend(ctx context.Context, auth *coreauth.Auth, method, url string, headers map[string]string, body []byte) (int, []byte, error)
-	TmxResetCooldown(ctx context.Context, authID string) error
-	TmxClearQuotaSignals(authID string) bool
+	// TmxClearRecoveredQuota releases what a redeemed credit restored (quota cooldowns and the
+	// passive quota signals of the recovered windows) and nothing else.
+	TmxClearRecoveredQuota(ctx context.Context, authID string, r coreauth.QuotaRecovery) error
 }
 
 // Account is one account's reset-credit state.
@@ -114,6 +116,7 @@ type Redemption struct {
 	Label       string     `json:"label"`
 	CreditID    string     `json:"credit_id"`
 	CreditTitle string     `json:"credit_title"`
+	Clears      []string   `json:"clears"` // windows the credit clears, as listed when claimed; null on claims journaled before it was recorded
 	RequestID   string     `json:"-"`
 	State       string     `json:"state"` // pending (no definite answer; retry reuses the id) | settled
 	Outcome     string     `json:"outcome"`
@@ -497,7 +500,7 @@ func (s *Service) Redeem(ctx context.Context, authID, creditID, actor string) (*
 	}
 	before := s.read(ctx, auth, provider)
 	s.store(before)
-	clears := []string(nil)
+	var clears []string
 	title := ""
 	if prior == nil {
 		if before.Error != "" {
@@ -517,7 +520,7 @@ func (s *Service) Redeem(ctx context.Context, authID, creditID, actor string) (*
 		}
 		clears, title = credit.Clears, credit.Title
 	} else {
-		title = prior.CreditTitle
+		title, clears = prior.CreditTitle, prior.Clears
 	}
 
 	org := ""
@@ -538,7 +541,7 @@ func (s *Service) Redeem(ctx context.Context, authID, creditID, actor string) (*
 			requestID = uuid.NewSHA1(codexRedeemNamespace, []byte(account+":"+creditID)).String()
 		}
 		r = &Redemption{CreatedAt: s.now().UTC(), AuthID: authID, Provider: provider, Label: labelOf(auth),
-			CreditID: creditID, CreditTitle: title, RequestID: requestID, State: "pending",
+			CreditID: creditID, CreditTitle: title, Clears: clears, RequestID: requestID, State: "pending",
 			Before: before.Windows, After: []Window{}, Actor: actor}
 		if err = s.journal.insert(ctx, r); err != nil {
 			return nil, fmt.Errorf("journaling claim: %w", err)
@@ -564,16 +567,19 @@ func (s *Service) Redeem(ctx context.Context, authID, creditID, actor string) (*
 	}
 	res := &Result{}
 	if settles(outcome) {
-		if errReset := s.backend.TmxResetCooldown(ctx, authID); errReset != nil {
-			log.WithError(errReset).Warn("tmx resets: cooldown reset after redeem")
-			r.Warning = "cooldown_not_cleared"
-		}
-		s.backend.TmxClearQuotaSignals(authID)
+		// Verify first, then release only what recovered.
 		after := s.read(context.Background(), auth, provider)
 		s.store(after)
+		var afterWindows []Window
 		if after.Error == "" {
+			afterWindows = after.Windows
 			r.After = after.Windows
 			r.Confirmed = confirmed(r.Before, after.Windows, clears)
+		}
+		recovery := recoveryOf(provider, r.Before, afterWindows, after.Error == "", clears)
+		if errClear := s.backend.TmxClearRecoveredQuota(context.Background(), authID, recovery); errClear != nil {
+			log.WithError(errClear).Warn("tmx resets: cooldown release after redeem")
+			r.Warning = "cooldown_not_cleared"
 		}
 		if !r.Confirmed && r.Warning == "" {
 			r.Warning = "unconfirmed"

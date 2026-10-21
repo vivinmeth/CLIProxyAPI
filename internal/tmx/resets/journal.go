@@ -146,6 +146,9 @@ func newPGJournal(ctx context.Context, db *sql.DB, schema string) (*pgJournal, e
 			after        JSONB,
 			actor        TEXT NOT NULL DEFAULT ''
 		)`,
+		// The credit's scope (windows it clears), so a retried claim releases only those. Older
+		// rows keep NULL: unknown scope.
+		`ALTER TABLE ` + j.table + ` ADD COLUMN IF NOT EXISTS clears JSONB`,
 		`CREATE INDEX IF NOT EXISTS reset_redemptions_auth_credit ON ` + j.table + ` (auth_id, credit_id, created_at)`,
 		`CREATE INDEX IF NOT EXISTS reset_redemptions_created ON ` + j.table + ` (created_at)`,
 	} {
@@ -157,14 +160,14 @@ func newPGJournal(ctx context.Context, db *sql.DB, schema string) (*pgJournal, e
 }
 
 const pgColumns = `id, created_at, settled_at, auth_id, provider, label, credit_id, credit_title,
-	request_id, state, outcome, confirmed, warning, before, after, actor`
+	request_id, state, outcome, confirmed, warning, before, after, actor, clears`
 
 func scanRedemption(row interface{ Scan(...any) error }) (Redemption, error) {
 	var r Redemption
 	var settled sql.NullTime
-	var before, after []byte
+	var before, after, clears []byte
 	err := row.Scan(&r.ID, &r.CreatedAt, &settled, &r.AuthID, &r.Provider, &r.Label, &r.CreditID,
-		&r.CreditTitle, &r.RequestID, &r.State, &r.Outcome, &r.Confirmed, &r.Warning, &before, &after, &r.Actor)
+		&r.CreditTitle, &r.RequestID, &r.State, &r.Outcome, &r.Confirmed, &r.Warning, &before, &after, &r.Actor, &clears)
 	if err != nil {
 		return r, err
 	}
@@ -179,6 +182,9 @@ func scanRedemption(row interface{ Scan(...any) error }) (Redemption, error) {
 	}
 	if len(after) > 0 {
 		_ = json.Unmarshal(after, &r.After)
+	}
+	if len(clears) > 0 {
+		_ = json.Unmarshal(clears, &r.Clears)
 	}
 	return r, nil
 }
@@ -262,11 +268,15 @@ func jsonWindows(ws []Window) []byte {
 }
 
 func (j *pgJournal) insert(ctx context.Context, r *Redemption) error {
+	var clears []byte
+	if r.Clears != nil {
+		clears, _ = json.Marshal(r.Clears)
+	}
 	return j.db.QueryRowContext(ctx, `INSERT INTO `+j.table+` (created_at, auth_id, provider, label,
-		credit_id, credit_title, request_id, state, outcome, before, after, actor)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+		credit_id, credit_title, request_id, state, outcome, before, after, actor, clears)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
 		r.CreatedAt, r.AuthID, r.Provider, r.Label, r.CreditID, r.CreditTitle, r.RequestID, r.State,
-		r.Outcome, jsonWindows(r.Before), jsonWindows(r.After), r.Actor).Scan(&r.ID)
+		r.Outcome, jsonWindows(r.Before), jsonWindows(r.After), r.Actor, clears).Scan(&r.ID)
 }
 
 func (j *pgJournal) settle(ctx context.Context, r *Redemption) error {
