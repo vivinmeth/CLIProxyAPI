@@ -69,7 +69,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	defer func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), s.currentConfig().ShutdownDrainTimeout()+30*time.Second)
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), max(s.currentConfig().ShutdownDrainTimeout(), 5*time.Second))
 		defer shutdownCancel()
 		if errShutdown := s.Shutdown(shutdownCtx); errShutdown != nil {
 			log.Errorf("service shutdown returned error: %v", errShutdown)
@@ -279,8 +279,11 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			ctx = context.Background()
 		}
 
+		ctx, shutdownCancel, drainCtx, drainCancel := s.tmxShutdownWindow(ctx)
+		defer shutdownCancel()
+		defer drainCancel()
 		if s.server != nil {
-			if errStop := s.server.Stop(ctx); errStop != nil {
+			if errStop := s.server.Stop(drainCtx); errStop != nil {
 				log.Errorf("error stopping API server: %v", errStop)
 				if shutdownErr == nil {
 					shutdownErr = errStop
@@ -288,7 +291,11 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
-		s.sessionBindings.Close()
+		s.sessionBindings.CloseContext(ctx)
+		if errUsage := usage.DefaultManager().StopAndWait(ctx); errUsage != nil {
+			log.WithError(errUsage).Warn("tmx: usage drain window elapsed")
+		}
+		s.flushTMXWorkers(ctx)
 
 		s.homeMu.Lock()
 		runCancel := s.runCancel

@@ -35,6 +35,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/safemode"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/store"
 	tmxarchive "github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/archive"
+	tmxquota "github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/quota"
 	tmxrequestlog "github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tui"
@@ -687,8 +688,11 @@ func main() {
 	tmxRequestLog := tmxrequestlog.StartFromEnv(context.Background())
 	tmxArchive := tmxarchive.StartFromEnv(context.Background())
 	defer func() {
-		tmxArchive.Close()
-		tmxRequestLog.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tmxquota.Default().CloseContext(ctx)
+		_ = tmxArchive.CloseContext(ctx)
+		_ = tmxRequestLog.CloseContext(ctx)
 	}()
 
 	// Register built-in access providers before constructing services.

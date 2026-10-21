@@ -16,6 +16,7 @@ import (
 type tmxDrain struct {
 	mu       sync.Mutex
 	draining bool
+	closed   bool
 	active   int
 	done     chan struct{}
 	conns    map[net.Conn]struct{}
@@ -25,15 +26,16 @@ func (s *Server) tmxDrainMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		s.drain.mu.Lock()
 		draining := s.drain.draining
-		if c.Request.URL.Path == "/healthz" || draining {
+		if draining {
 			s.drain.mu.Unlock()
-			status, code := "serving", http.StatusOK
-			if draining {
-				status, code = "draining", http.StatusServiceUnavailable
+			if c.Request.Method == http.MethodHead {
+				c.AbortWithStatus(http.StatusServiceUnavailable)
+			} else {
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"status": "draining"})
 			}
-			c.AbortWithStatusJSON(code, gin.H{"status": status})
 			return
 		}
+
 		s.drain.active++
 		writer := &tmxDrainWriter{ResponseWriter: c.Writer, drain: &s.drain}
 		c.Writer = writer
@@ -86,6 +88,11 @@ func (w *tmxDrainWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	conn, rw, err := w.ResponseWriter.Hijack()
 	if err == nil {
 		w.drain.mu.Lock()
+		if w.drain.closed {
+			w.drain.mu.Unlock()
+			_ = conn.Close()
+			return nil, nil, net.ErrClosed
+		}
 		if w.drain.conns == nil {
 			w.drain.conns = make(map[net.Conn]struct{})
 		}
@@ -98,6 +105,7 @@ func (w *tmxDrainWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (d *tmxDrain) closeHijacked() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.closed = true
 	for conn := range d.conns {
 		_ = conn.Close()
 		delete(d.conns, conn)

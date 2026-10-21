@@ -417,6 +417,9 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	if s.keepAliveEnabled {
 		select {

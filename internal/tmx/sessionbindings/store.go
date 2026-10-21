@@ -184,3 +184,16 @@ func (w *Worker) Close() {
 	}
 	w.once.Do(func() { close(w.stop); <-w.done })
 }
+
+// CloseContext bounds the final binding save by the service shutdown window.
+func (w *Worker) CloseContext(ctx context.Context) {
+	if w == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() { w.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}

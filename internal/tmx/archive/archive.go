@@ -52,6 +52,8 @@ type Archive struct {
 	failed        atomic.Int64
 	wg            sync.WaitGroup
 	closeOnce     sync.Once
+	closeWaitOnce sync.Once
+	closeDone     chan struct{}
 	closing       atomic.Bool
 	queueMu       sync.RWMutex
 }

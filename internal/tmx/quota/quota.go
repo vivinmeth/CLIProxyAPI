@@ -174,12 +174,16 @@ type account struct {
 
 // Service collects and stores quota snapshots.
 type Service struct {
-	db        *sql.DB
-	table     string
-	fetch     Fetcher
-	pollEvery time.Duration
-	slowEvery time.Duration
-	now       func() time.Time
+	loopCtx    context.Context
+	loopCancel context.CancelFunc
+	loopDone   chan struct{}
+	closeOnce  sync.Once
+	db         *sql.DB
+	table      string
+	fetch      Fetcher
+	pollEvery  time.Duration
+	slowEvery  time.Duration
+	now        func() time.Time
 
 	mu       sync.Mutex
 	accounts map[string]*account
@@ -215,6 +219,8 @@ func Start(db *sql.DB, schema string, fetch Fetcher) *Service {
 		return nil
 	}
 	current = s
+	s.loopCtx, s.loopCancel = context.WithCancel(context.Background())
+	s.loopDone = make(chan struct{})
 	go s.loop()
 	log.Infof("tmx quota: recording to %s (poll every %s)", s.table, s.pollEvery)
 	return s
@@ -307,11 +313,16 @@ func (s *Service) accountLocked(authID string) *account {
 }
 
 func (s *Service) loop() {
+	defer close(s.loopDone)
 	ticker := time.NewTicker(tickEvery)
 	defer ticker.Stop()
 	for {
-		s.tick(context.Background())
-		<-ticker.C
+		s.tick(s.loopCtx)
+		select {
+		case <-s.loopCtx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
