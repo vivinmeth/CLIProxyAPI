@@ -34,8 +34,12 @@ type ThreadIngest struct {
 	// ParentKind says how: delegate | subagent | fork | launch.
 	ParentID   string `json:"parent_id,omitempty"`
 	ParentKind string `json:"parent_kind,omitempty"`
-	Provider   string `json:"provider,omitempty"`
-	Model      string `json:"model,omitempty"`
+	// CreatedBy says who started the thread (user | agent | schedule …) and CreationSource where
+	// (web, cli, a tool): "threads I started" needs it, a missing parent doesn't imply the user.
+	CreatedBy      string `json:"created_by,omitempty"`
+	CreationSource string `json:"creation_source,omitempty"`
+	Provider       string `json:"provider,omitempty"`
+	Model          string `json:"model,omitempty"`
 	// Sessions are the harness sessions the thread ran, keyed like imported sessions
 	// (harness + the session's external id).
 	Sessions     []ThreadSession     `json:"sessions,omitempty"`
@@ -122,6 +126,9 @@ func (a *Archive) IngestThreads(ctx context.Context, in ThreadBatch) (*ThreadBat
 		}
 		if len(t.Metadata) > 0 && !json.Valid(t.Metadata) {
 			return nil, fmt.Errorf("thread %q: metadata is not valid JSON", t.ExternalID)
+		}
+		if strings.TrimSpace(t.ParentID) == t.ExternalID {
+			return nil, fmt.Errorf("thread %q: a thread can't be its own parent", t.ExternalID)
 		}
 		for j, s := range t.Sessions {
 			if strings.TrimSpace(s.SessionID) == "" {

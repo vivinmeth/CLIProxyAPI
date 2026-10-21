@@ -28,12 +28,16 @@ var threadSchemaSQL = []string{
 		deleted_at   TIMESTAMPTZ,
 		settled_at   TIMESTAMPTZ,
 		parent_id    TEXT,                       -- the thread that started this one (<source>:<id>)
-		parent_kind  TEXT NOT NULL DEFAULT '',   -- delegate | subagent | fork | launch
+				parent_kind  TEXT NOT NULL DEFAULT '',   -- delegate | subagent | fork | launch
+		created_by   TEXT NOT NULL DEFAULT '',   -- user | agent | schedule …
+		creation_source TEXT NOT NULL DEFAULT '',
 		provider     TEXT NOT NULL DEFAULT '',
 		model        TEXT NOT NULL DEFAULT '',
 		metadata     JSONB NOT NULL DEFAULT '{}',
 		extracted_at TIMESTAMPTZ NOT NULL DEFAULT now()
 	)`,
+	`ALTER TABLE threads ADD COLUMN IF NOT EXISTS created_by TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE threads ADD COLUMN IF NOT EXISTS creation_source TEXT NOT NULL DEFAULT ''`,
 	`CREATE INDEX IF NOT EXISTS threads_parent_idx ON threads (parent_id) WHERE parent_id IS NOT NULL`,
 	`CREATE INDEX IF NOT EXISTS threads_created_idx ON threads (created_at DESC)`,
 	`CREATE TABLE IF NOT EXISTS thread_sessions (
@@ -87,9 +91,10 @@ var threadViewsSQL = []string{
 	FROM sessions s JOIN sessions p ON p.kind = 'imported' AND p.harness = s.harness
 		AND p.external_id = split_part(s.external_id, ':', 1)
 	WHERE s.kind = 'imported' AND position(':' in s.external_id) > 0`,
-	// Which thread each extracted session belongs to: sessions the thread lists (by harness +
-	// external id, or by id alone when the harness is ''), their subagent sessions, and the
-	// proxied twins of both.
+	// Every (session, thread) membership: sessions a thread lists (by harness + external id, or
+	// by id alone when the harness is ''), their subagent sessions, and the proxied twins of
+	// both. A session can belong to several threads (a delegate's session listed by the parent
+	// too); thread_usage counts each session once per thread tree.
 	`CREATE VIEW session_threads AS
 	WITH direct AS (
 		SELECT s.id AS session_id, ts.thread_id, ts.role
@@ -99,44 +104,57 @@ var threadViewsSQL = []string{
 		SELECT st.session_id, d.thread_id, 'subagent'::text AS role
 		FROM session_tree st JOIN direct d ON d.session_id = st.parent_session_id
 	)
-	SELECT DISTINCT ON (session_id) session_id, thread_id, role
+	SELECT DISTINCT ON (session_id, thread_id) session_id, thread_id, role
 	FROM (SELECT * FROM direct UNION ALL SELECT * FROM sub) x
-	ORDER BY session_id, (role = 'subagent'), thread_id`,
+	ORDER BY session_id, thread_id, (role = 'subagent')`,
 	// Skills used: Skill tool calls (Claude Code, OpenCode), slash commands (Claude Code
-	// <command-name>), and skill files read (Codex / OpenCode load SKILL.md). Trigger phrases in
-	// prose are a search away (items, kind = 'text', role = 'user').
+	// <command-name>), and skill files read (Codex / OpenCode load SKILL.md: a read tool or a
+	// shell command, not an edit; the skill is the directory holding SKILL.md, nested ones like
+	// skills/.system/imagegen included). Proxied twins of imported sessions are left out (the same
+	// calls would count twice). Trigger phrases in prose are a search away (items, kind = 'text',
+	// role = 'user').
 	`CREATE VIEW skill_invocations AS
-	SELECT i.session_id, i.seq, i.idx, i.ts, 'tool'::text AS via,
-		COALESCE(NULLIF(i.data->>'skill', ''), NULLIF(i.data->>'name', ''), i.name) AS skill
-	FROM items i WHERE i.kind = 'tool_call' AND lower(i.name) = 'skill'
-	UNION ALL
-	SELECT i.session_id, i.seq, i.idx, i.ts, 'command',
-		substring(i.text from '<command-name>/?([^<]+)</command-name>')
-	FROM items i WHERE i.kind = 'text' AND i.role = 'user' AND i.text LIKE '%<command-name>%'
-	UNION ALL
-	SELECT i.session_id, i.seq, i.idx, i.ts, 'file',
-		substring(COALESCE(i.data->>'filePath', i.data->>'file_path', i.data->>'path', i.data::text)
-			from '/skills/([^/"]+)/SKILL\.md')
-	FROM items i WHERE i.kind = 'tool_call' AND i.data::text LIKE '%/skills/%SKILL.md%'`,
+	SELECT x.* FROM (
+		SELECT i.session_id, i.seq, i.idx, i.ts, 'tool'::text AS via,
+			COALESCE(NULLIF(i.data->>'skill', ''), NULLIF(i.data->>'name', ''), i.name) AS skill
+		FROM items i WHERE i.kind = 'tool_call' AND lower(i.name) = 'skill'
+		UNION ALL
+		SELECT i.session_id, i.seq, i.idx, i.ts, 'command',
+			substring(i.text from '<command-name>/?([^<]+)</command-name>')
+		FROM items i WHERE i.kind = 'text' AND i.role = 'user' AND i.text LIKE '%<command-name>%'
+		UNION ALL
+		SELECT i.session_id, i.seq, i.idx, i.ts, 'file',
+			substring(i.data::text from '/skills/(?:[^"]*/)?([^/"]+)/SKILL\.md')
+		FROM items i WHERE i.kind = 'tool_call' AND i.data::text LIKE '%/skills/%SKILL.md%'
+			AND lower(i.name) NOT IN ('write', 'edit', 'multiedit', 'apply_patch', 'str_replace_based_edit_tool',
+				'create_file', 'write_file', 'edit_file', 'patch')
+	) x JOIN sessions s ON s.id = x.session_id
+	WHERE s.shadowed_by IS NULL AND x.skill IS NOT NULL AND x.skill <> ''`,
 }
 
 // threadUsageSQL needs session_usage (requests mirror).
 var threadUsageSQL = []string{
 	// Cost of a thread and everything it started (delegates, subagent threads) through the
 	// sessions they ran.
+	// UNION (not UNION ALL) ends the recursion even if parent links form a cycle; each session
+	// counts once per tree however many of its threads list it.
 	`CREATE VIEW thread_usage AS
 	WITH RECURSIVE tree AS (
 		SELECT id AS root_id, id AS thread_id FROM threads
-		UNION ALL
+		UNION
 		SELECT tree.root_id, c.id FROM threads c JOIN tree ON c.parent_id = tree.thread_id
+	), tree_sessions AS (
+		SELECT DISTINCT tree.root_id, st.session_id
+		FROM tree JOIN session_threads st ON st.thread_id = tree.thread_id
 	)
-	SELECT tree.root_id AS thread_id, count(DISTINCT tree.thread_id) AS threads,
-		count(DISTINCT st.session_id) AS sessions, COALESCE(sum(u.requests), 0) AS requests,
-		COALESCE(sum(u.prompt_tokens), 0) AS prompt_tokens, COALESCE(sum(u.output_tokens), 0) AS output_tokens,
-		sum(u.cost_usd) AS cost_usd, COALESCE(sum(u.unpriced_requests), 0) AS unpriced_requests
-	FROM tree LEFT JOIN session_threads st ON st.thread_id = tree.thread_id
-		LEFT JOIN session_usage u ON u.session_id = st.session_id
-	GROUP BY tree.root_id`,
+	SELECT t.root_id AS thread_id, t.threads, count(ts.session_id) AS sessions,
+		COALESCE(sum(u.requests), 0) AS requests, COALESCE(sum(u.prompt_tokens), 0) AS prompt_tokens,
+		COALESCE(sum(u.output_tokens), 0) AS output_tokens, sum(u.cost_usd) AS cost_usd,
+		COALESCE(sum(u.unpriced_requests), 0) AS unpriced_requests
+	FROM (SELECT root_id, count(*) AS threads FROM tree GROUP BY root_id) t
+		LEFT JOIN tree_sessions ts ON ts.root_id = t.root_id
+		LEFT JOIN session_usage u ON u.session_id = ts.session_id
+	GROUP BY t.root_id, t.threads`,
 }
 
 // extractThread rewrites one thread from its archive record (or removes it when gone).
@@ -170,11 +188,13 @@ func (an *analytics) extractThread(ctx context.Context, id string) error {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO threads (id, source, external_id, machine, project, cwd, title,
-		branch, created_at, updated_at, archived_at, deleted_at, settled_at, parent_id, parent_kind, provider, model,
-		metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+		branch, created_at, updated_at, archived_at, deleted_at, settled_at, parent_id, parent_kind, created_by,
+		creation_source, provider, model, metadata)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
 		id, source, ext, cleanText(machine), cleanText(t.Project), cleanText(t.CWD), cleanText(t.Title),
 		cleanText(t.Branch), t.CreatedAt, t.UpdatedAt, t.ArchivedAt, t.DeletedAt, t.SettledAt, parent,
-		cleanText(t.ParentKind), cleanText(t.Provider), cleanText(t.Model), jsonOrEmpty(t.Metadata)); err != nil {
+		cleanText(t.ParentKind), cleanText(t.CreatedBy), cleanText(t.CreationSource), cleanText(t.Provider),
+		cleanText(t.Model), jsonOrEmpty(t.Metadata)); err != nil {
 		return fmt.Errorf("thread row: %w", err)
 	}
 	var sess, prs, reqs, turns [][]any
