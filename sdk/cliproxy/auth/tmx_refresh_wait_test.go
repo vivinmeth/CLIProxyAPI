@@ -100,3 +100,92 @@ func TestRefreshLockWaitIsCancelable(t *testing.T) {
 		t.Fatal("canceled waiter rotated token")
 	}
 }
+
+// registerRefreshWaitAuth registers one claude auth serving test-model and returns its executor,
+// whose refreshes signal started and block until release is closed.
+func registerRefreshWaitAuth(t *testing.T, id, token string) (*Manager, *unauthorizedRefreshExecutor, chan struct{}, chan struct{}) {
+	t.Helper()
+	m := NewManager(nil, &ResetSoonestSelector{}, nil)
+	started, release := make(chan struct{}, 4), make(chan struct{})
+	e := &unauthorizedRefreshExecutor{id: "claude", tokenInvalid: map[string]struct{}{"old": {}}, onRefresh: func() { started <- struct{}{}; <-release }}
+	m.RegisterExecutor(e)
+	if _, err := m.Register(context.Background(), &Auth{ID: id, Provider: "claude", Status: StatusActive, Metadata: map[string]any{"access_token": token, "refresh_token": "rotation", "expired": time.Now().Add(time.Hour).Format(time.RFC3339)}}); err != nil {
+		t.Fatal(err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+	return m, e, started, release
+}
+
+func withRefreshWaitBudgetFor(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := refreshWaitBudget
+	refreshWaitBudget = d
+	t.Cleanup(func() { refreshWaitBudget = prev })
+}
+
+func TestRefreshWaitIgnoresRefreshOfQuotaCooledAuth(t *testing.T) {
+	withQuotaCooldownEnabled(t)
+	const id = "refresh-wait-quota"
+	m, _, started, release := registerRefreshWaitAuth(t, id, "valid")
+	defer close(release)
+	retryAfter := time.Hour
+	m.MarkResult(context.Background(), Result{AuthID: id, Provider: "claude", Model: "test-model", RetryAfter: &retryAfter, Error: &Error{HTTPStatus: 429, Message: "rate limited"}})
+	// A scheduled background refresh of the cooled account is slow.
+	go func() { _, _ = m.refreshAuthForRequestAtEpoch(context.Background(), id, "", 0) }()
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := m.Execute(ctx, []string{"claude"}, executor.Request{Model: "test-model"}, executor.Options{})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("request waited %v on a refresh that cannot lift a quota cooldown", elapsed)
+	}
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || !isAuthUnavailableError(err) {
+		t.Fatalf("want the pool's cooldown error, got %v", err)
+	}
+}
+
+func TestRefreshWaitTimeoutKeepsPoolError(t *testing.T) {
+	withRefreshWaitBudgetFor(t, 100*time.Millisecond)
+	const id = "refresh-wait-timeout"
+	m, _, started, release := registerRefreshWaitAuth(t, id, "old")
+	defer close(release)
+	// A 401 rejected the token; its refresh hangs on the token endpoint.
+	go func() { _, _ = m.refreshAuthForRequest(context.Background(), id, "old") }()
+	<-started
+
+	_, err := m.Execute(context.Background(), []string{"claude"}, executor.Request{Model: "test-model"}, executor.Options{})
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || !isAuthUnavailableError(err) {
+		t.Fatalf("an expired refresh wait must return the pool's error, got %v", err)
+	}
+}
+
+func TestRefreshWaitBudgetIsSharedPerRequest(t *testing.T) {
+	withRefreshWaitBudgetFor(t, 100*time.Millisecond)
+	var held, free tmxRefreshMutex
+	held.Lock()
+	defer held.Unlock()
+	ctx := withRefreshWaitBudget(context.Background())
+	if err := held.LockContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("contended lock: %v", err)
+	}
+	start := time.Now()
+	if err := held.LockContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("contended lock after budget: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("a spent budget still waited %v", elapsed)
+	}
+	// The same budget also bounds the in-flight refresh wait.
+	if waitCtx, done := refreshWaitContext(ctx); waitCtx.Err() == nil {
+		done()
+		t.Fatal("refresh wait got a fresh budget")
+	}
+	if err := free.LockContext(ctx); err != nil {
+		t.Fatalf("an uncontended lock needs no budget: %v", err)
+	}
+	free.Unlock()
+}
+
