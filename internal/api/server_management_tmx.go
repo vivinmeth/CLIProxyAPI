@@ -296,6 +296,10 @@ func registerTMXArchiveRoutes(v8 *gin.RouterGroup) {
 	g.GET("/sessions", tmxArchive(tmxSessionList))
 	g.GET("/sessions/*id", tmxArchive(tmxSessionGet))
 	g.DELETE("/sessions/*id", tmxArchive(tmxSessionDelete))
+	g.PUT("/threads", tmxArchive(tmxThreadIngest))
+	g.GET("/threads", tmxArchive(tmxThreadList))
+	g.GET("/threads/*id", tmxArchive(tmxThreadGet))
+	g.DELETE("/threads/*id", tmxArchive(tmxThreadDelete))
 	g.POST("/usage/rebuild", tmxArchive(tmxUsageRebuild))
 	g.POST("/usage/backfill-cache-ttl", tmxArchive(tmxUsageCacheTTL))
 	g.GET("/conversation", tmxArchive(tmxConversation))
@@ -458,6 +462,66 @@ func tmxSessionIngest(c *gin.Context, a *archive.Archive) {
 		return
 	}
 	c.JSON(http.StatusOK, res)
+}
+
+// tmxThreadIngest: PUT /tmx/archive/threads — upsert a batch of orchestrator threads
+// (archive-ingest.md → Threads).
+func tmxThreadIngest(c *gin.Context, a *archive.Archive) {
+	var in archive.ThreadBatch
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	res, err := a.IngestThreads(c.Request.Context(), in)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+func tmxThreadList(c *gin.Context, a *archive.Archive) {
+	since := time.Unix(0, 0)
+	if raw := strings.TrimSpace(c.Query("since")); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "since must be unix seconds"})
+			return
+		}
+		since = time.Unix(n, 0)
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	items, err := a.ListThreads(c.Request.Context(), c.Query("source"), c.Query("machine"), since, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
+func tmxThreadGet(c *gin.Context, a *archive.Archive) {
+	out, err := a.GetThread(c.Request.Context(), strings.TrimPrefix(c.Param("id"), "/"))
+	switch {
+	case errors.Is(err, archive.ErrThreadNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+	case err != nil:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	default:
+		c.JSON(http.StatusOK, out)
+	}
+}
+
+func tmxThreadDelete(c *gin.Context, a *archive.Archive) {
+	id := strings.TrimPrefix(c.Param("id"), "/")
+	err := a.DeleteThread(c.Request.Context(), id)
+	switch {
+	case errors.Is(err, archive.ErrThreadNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+	case err != nil:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	default:
+		c.JSON(http.StatusOK, gin.H{"thread_id": id, "deleted": true})
+	}
 }
 
 func tmxSessionList(c *gin.Context, a *archive.Archive) {

@@ -239,12 +239,7 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 			an.reqMirror = nil
 		}
 	}
-	if an.reqMirror != nil {
-		if err = an.ensureViews(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
+	return an.ensureViews(ctx)
 }
 
 // ensureViews (re)creates the views over requests, in one transaction so readers never see them
@@ -255,7 +250,17 @@ func (an *analytics) ensureViews(ctx context.Context) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	for _, stmt := range analyticsViewsSQL {
+	// Dependents first: thread_usage reads session_usage.
+	stmts := append([]string{`DROP VIEW IF EXISTS thread_usage, skill_invocations, session_threads, session_tree`},
+		threadSchemaSQL...)
+	if an.reqMirror != nil {
+		stmts = append(stmts, analyticsViewsSQL...)
+	}
+	stmts = append(stmts, threadViewsSQL...)
+	if an.reqMirror != nil {
+		stmts = append(stmts, threadUsageSQL...)
+	}
+	for _, stmt := range stmts {
 		if _, err = tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("analytics views: %w", err)
 		}
@@ -412,6 +417,7 @@ func (an *analytics) step() (bool, error) {
 	requestsTruncated := false
 	imported := map[string]bool{}
 	proxy := map[string]bool{}
+	threads := map[string]bool{}
 	byRef := map[string][]journalEntry{}
 	for _, e := range entries {
 		switch e.kind {
@@ -425,6 +431,8 @@ func (an *analytics) step() (bool, error) {
 			requestIDs = append(requestIDs, e.ref)
 		case "requests_truncate":
 			requestsTruncated = true
+		case "thread":
+			threads[e.ref] = true
 		}
 		byRef[e.kind+"\x00"+e.ref] = append(byRef[e.kind+"\x00"+e.ref], e)
 	}
@@ -459,6 +467,11 @@ func (an *analytics) step() (bool, error) {
 			for _, k := range keys {
 				proxy[k] = true
 			}
+		}
+	}
+	for id := range threads {
+		if errT := an.extractThread(ctx, id); errT != nil {
+			fail("thread", id, errT)
 		}
 	}
 	importedIDs := make([]string, 0, len(imported))
@@ -1170,6 +1183,7 @@ func (an *analytics) proxyMessages(ctx context.Context, e proxyExchange) ([]msgR
 type BackfillResult struct {
 	Sessions    int64 `json:"sessions"`
 	Proxy       int64 `json:"proxy_sessions"`
+	Threads     int64 `json:"threads"`
 	Exchanges   int64 `json:"exchanges"`
 	RequestRows int   `json:"request_rows"` // tmx.requests rows copied (copies of deleted rows are removed)
 	Replayed    int   `json:"replayed"`     // failed entries + sessions deleted from the archive
@@ -1261,6 +1275,13 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 	for _, g := range ghosts {
 		replay = append(replay, [2]string{"session", g})
 	}
+	threadGhosts, err := an.threadGhosts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, g := range threadGhosts {
+		replay = append(replay, [2]string{"thread", g})
+	}
 	for _, r := range replay {
 		if _, err = a.db.ExecContext(ctx, `INSERT INTO `+journalTable+` (kind, ref) VALUES ($1, $2)`, r[0], r[1]); err != nil {
 			return nil, err
@@ -1285,6 +1306,11 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 		return nil, err
 	}
 	res.Proxy, _ = tag.RowsAffected()
+	tag, err = a.db.ExecContext(ctx, `INSERT INTO `+journalTable+` (kind, ref) SELECT 'thread', id FROM `+schema+`.threads`)
+	if err != nil {
+		return nil, err
+	}
+	res.Threads, _ = tag.RowsAffected()
 	// Under the worker lock: a row mirrored by step() during the scan must not be judged absent.
 	an.mu.Lock()
 	res.RequestRows, err = an.reconcileAllRequests(ctx)
