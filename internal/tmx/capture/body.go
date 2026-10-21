@@ -12,7 +12,7 @@ import (
 )
 
 const DefaultLiveMaxBytes int64 = 512 << 20
-const DefaultExchangeMaxBytes int64 = 8 << 20
+const DefaultExchangeMaxBytes int64 = 32 << 20
 
 type captureLimits struct {
 	max, exchange int64
@@ -61,9 +61,8 @@ func Dropped() int64   { return captureDrops.Load() }
 
 // Body owns a bounded memory capture or a spool file. Ownership moves to Exchange;
 // Release must run after archiving or dropping it. Writes never affect client delivery.
-// Group shares the per-exchange memory threshold across body and timing sources.
+// Group shares drop accounting across body and timing sources. Thresholds apply per body.
 type Group struct {
-	bytes    atomic.Int64
 	dropOnce sync.Once
 }
 
@@ -90,18 +89,12 @@ func (b *Body) Write(p []byte) (int, error) {
 	n := int64(len(p)) + 24
 	if b.file == nil {
 		used := b.reserved
-		if b.group != nil {
-			used = b.group.bytes.Load()
-		}
 		if used+n > currentLimits().exchange || !reserve(n) {
 			if err := b.spill(); err != nil {
 				return 0, b.fail(err)
 			}
 		} else {
 			b.reserved += n
-			if b.group != nil {
-				b.group.bytes.Add(n)
-			}
 			b.parts = append(b.parts, bytes.Clone(p))
 			b.size += int64(len(p))
 			return len(p), nil
@@ -131,9 +124,6 @@ func (b *Body) spill() error {
 	}
 	b.parts = nil
 	liveBytes.Add(-b.reserved)
-	if b.group != nil {
-		b.group.bytes.Add(-b.reserved)
-	}
 	b.reserved = 0
 	return nil
 }
@@ -234,9 +224,6 @@ func (b *Body) Release() {
 		}
 		b.parts = nil
 		liveBytes.Add(-b.reserved)
-		if b.group != nil {
-			b.group.bytes.Add(-b.reserved)
-		}
 		b.reserved = 0
 	})
 }

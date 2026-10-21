@@ -1297,4 +1297,4 @@ plugins:
 # Full-traffic capture spills to the archive spool before exceeding these byte limits.
 archive:
   live-capture-max-bytes: 536870912 # 512 MiB shared across live and queued captures
-  live-capture-exchange-max-bytes: 8388608 # 8 MiB per exchange; larger bodies stream to disk
+  live-capture-exchange-max-bytes: 33554432 # 32 MiB per body; larger bodies stream to disk (key retained for compatibility)

@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestBodySpillsBeforeGlobalOrExchangeBudget(t *testing.T) {
+func TestBodyThresholdIsPerBodyAndGlobalBudgetIsShared(t *testing.T) {
 	baseline := LiveBytes()
 	Configure(1024, 512, t.TempDir())
 	defer Configure(0, 0, "")
@@ -26,20 +26,20 @@ func TestBodySpillsBeforeGlobalOrExchangeBudget(t *testing.T) {
 	if _, err := second.Write(payload); err != nil {
 		t.Fatal(err)
 	}
-	if !second.Spilled() {
-		t.Fatal("shared exchange threshold not enforced")
+	if second.Spilled() {
+		t.Fatal("independent small body lost in-memory dedup due to shared threshold")
 	}
 	// A different exchange must spill rather than exceed the global reservation.
 	third := &Body{}
 	defer third.Release()
-	Configure(400, 4096, currentLimits().spool)
+	Configure(800, 4096, currentLimits().spool)
 	if _, err := third.Write(payload); err != nil {
 		t.Fatal(err)
 	}
 	if !third.Spilled() {
 		t.Fatal("global budget not enforced")
 	}
-	if LiveBytes() > 400+baseline {
+	if LiveBytes() > 800+baseline {
 		t.Fatalf("budget exceeded: %d", LiveBytes())
 	}
 	for _, body := range []*Body{first, second, third} {
