@@ -2,9 +2,11 @@ package middleware
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -171,5 +173,30 @@ func TestTMXSpilledRequestPreservesTrailingSessionIdentity(t *testing.T) {
 	defer exchange.Release()
 	if !exchange.Bodies["request"].Spilled() || exchange.ClientSessionID != "12345678-1234-4123-8123-123456789abc" || exchange.SessionID == "" || exchange.RequestModel != "opus" || !exchange.RequestStreaming {
 		t.Fatalf("spooled request metadata lost: %+v", exchange)
+	}
+}
+
+func TestTMXCaptureHandlerPanicReleasesMemoryAndSpill(t *testing.T) {
+	for _, threshold := range []int64{1, 1024} {
+		t.Run(fmt.Sprint(threshold), func(t *testing.T) {
+			dir := t.TempDir()
+			capture.Configure(4096, threshold, dir)
+			defer capture.Configure(0, 0, "")
+			capture.SetSink(func(ex *capture.Exchange) { ex.Release(); t.Error("panic handler submitted capture") })
+			defer capture.SetSink(nil)
+			before := capture.LiveBytes()
+			r := gin.New()
+			r.Use(gin.CustomRecovery(func(c *gin.Context, _ any) { c.AbortWithStatus(500) }), RequestLoggingMiddleware(&spyRequestLogger{}))
+			r.POST("/v1/messages", func(c *gin.Context) { _, _ = c.Writer.Write([]byte("partial response")); panic("synthetic panic") })
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"opus"}`)))
+			if capture.LiveBytes() != before {
+				t.Fatalf("leaked bytes=%d", capture.LiveBytes()-before)
+			}
+			files, _ := filepath.Glob(filepath.Join(dir, "live", "capture-*"))
+			if len(files) != 0 {
+				t.Fatalf("spill leaked: %v", files)
+			}
+		})
 	}
 }

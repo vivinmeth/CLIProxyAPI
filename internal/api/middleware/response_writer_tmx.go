@@ -68,6 +68,17 @@ func (w *ResponseWriterWrapper) tmxTee(data []byte) {
 	w.tmx.chunkCount++
 }
 
+// tmxDiscard returns reservations if a handler panics before Finalize transfers
+// ownership. Successful submission detaches w.tmx so the archive keeps its bodies.
+func (w *ResponseWriterWrapper) tmxDiscard() {
+	if w.tmx == nil {
+		return
+	}
+	w.tmx.body.Release()
+	w.tmx.chunks.Release()
+	w.tmx = nil
+}
+
 // tmxSubmit hands the finished exchange to the archive. It runs at the start of Finalize, while
 // the gin context and every spooled source are still available, and copies what it needs.
 func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
@@ -96,6 +107,12 @@ func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
 		ResponseHeaders: w.cloneHeaders(),
 		APIResponseAt:   w.extractAPIResponseTimestamp(c),
 	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			ex.Release()
+		}
+	}()
 	if c.Request != nil {
 		ex.SessionID = logging.GetClientRequestMetadata(c.Request.Context()).SessionID
 	}
@@ -161,5 +178,7 @@ func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
 		ex.Release()
 		return
 	}
+	w.tmx = nil
+	transferred = true
 	capture.Submit(ex)
 }
