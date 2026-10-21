@@ -39,7 +39,11 @@ func overQuotaThreshold(a *Auth, now time.Time, model string, v tmxAdmissionView
 	if a == nil {
 		return false
 	}
+	// A reading past its TTL still counts while its own window hasn't reset: utilization only
+	// grows within a window, so a last-known exhausted account stays behind those with headroom
+	// (it remains a last-resort probe) until a fresh reading replaces it.
 	signals := a.Quota.FreshSignals(now)
+	known := a.Quota.Signals
 	type window struct {
 		used, reset, after string
 		scale, threshold   float64
@@ -48,14 +52,14 @@ func overQuotaThreshold(a *Auth, now time.Time, model string, v tmxAdmissionView
 		{"Anthropic-Ratelimit-Unified-5h-Utilization", "Anthropic-Ratelimit-Unified-5h-Reset", "", 1, v.five},
 		{"Anthropic-Ratelimit-Unified-7d-Utilization", claudeWeeklyResetSignal, "", 1, v.seven},
 	}
-	for _, name := range claudeWeeklyResetNames(signals, model) {
+	for _, name := range claudeWeeklyResetNames(known, model) {
 		if name == claudeWeeklyResetSignal {
 			continue
 		}
 		windows = append(windows, window{strings.TrimSuffix(name, "Reset") + "Utilization", name, "", 1, v.seven})
 	}
 	for _, slot := range []string{"Primary", "Secondary"} {
-		minutes, ok := parseQuotaInt(quotaSignalValue(signals, "X-Codex-"+slot+"-Window-Minutes"))
+		minutes, ok := parseQuotaInt(quotaSignalValue(known, "X-Codex-"+slot+"-Window-Minutes"))
 		if !ok {
 			continue
 		}
@@ -77,7 +81,11 @@ func overQuotaThreshold(a *Auth, now time.Time, model string, v tmxAdmissionView
 		if hasReset && !reset.After(now) {
 			continue
 		}
-		used, err := strconv.ParseFloat(quotaSignalValue(signals, w.used), 64)
+		value := quotaSignalValue(signals, w.used)
+		if value == "" && hasReset {
+			value = quotaSignalValue(known, w.used)
+		}
+		used, err := strconv.ParseFloat(value, 64)
 		if err == nil && used/w.scale >= w.threshold {
 			return true
 		}
