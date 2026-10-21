@@ -6,6 +6,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -177,7 +178,7 @@ func (m *Manager) overloadMaxWait() time.Duration {
 // the wait no longer fits the request's overload-max-wait. It returns the wait (jitter included,
 // already charged to the request) and the ceiling to pass to waitForCooldown with it.
 func (m *Manager) overloadRetryWait(ctx context.Context, err error, providers []string, model string, wait, maxWait time.Duration) (time.Duration, time.Duration, bool) {
-	if statusCodeFromError(err) != statusOverloaded {
+	if !isOverloadError(err) {
 		return wait, maxWait, true
 	}
 	budget, _ := ctx.Value(overloadBudgetKey{}).(*overloadBudget)
@@ -211,6 +212,19 @@ func (m *Manager) overloadRetryWait(ctx context.Context, err error, providers []
 	wait = jitteredCooldownWait(wait, ceiling)
 	budget.waited += wait
 	return wait, wait, true
+}
+
+// isOverloadError reports whether err is a 529, or a local refusal (every credential cooling
+// down, no auth available) whose last upstream cause was one: concurrent requests that find the
+// overloaded credential still cooling wait on the same overload, and charge the same budget.
+func isOverloadError(err error) bool {
+	for depth := 0; err != nil && depth < 8; depth++ {
+		if coder, ok := err.(interface{ StatusCode() int }); ok && coder.StatusCode() == statusOverloaded {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }
 
 // overloadRetryAfter gives a 529 that ends a request the route's remaining overload backoff as

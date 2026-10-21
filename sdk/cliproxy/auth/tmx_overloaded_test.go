@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -181,4 +182,63 @@ func TestOverloadWaitBoundedByOverloadMaxWait(t *testing.T) {
 			}
 		})
 	}
+}
+
+// hintedOverload is a 529 carrying the provider's Retry-After.
+type hintedOverload struct{ retryAfter time.Duration }
+
+func (e hintedOverload) Error() string              { return "overloaded" }
+func (e hintedOverload) StatusCode() int            { return statusOverloaded }
+func (e hintedOverload) RetryAfter() *time.Duration { return &e.retryAfter }
+
+type hintedOverloadExecutor struct{ statusPoolExecutor }
+
+func (e *hintedOverloadExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.calls.Add(1)
+	return cliproxyexecutor.Response{}, hintedOverload{retryAfter: 2 * time.Second}
+}
+
+// Parallel clients that find the one overloaded credential still cooling get a local refusal
+// whose cause is the 529; that wait counts against the same overload budget (load test B1:
+// 20 clients on one account took up to 8.9 s with only 529s charged).
+func TestOverloadBudgetCoversConcurrentCooldownRefusals(t *testing.T) {
+	withQuotaCooldownEnabled(t)
+	m := NewManager(nil, &ResetSoonestSelector{}, nil)
+	m.SetRetryConfig(3, 30*time.Second, 0)
+	e := &hintedOverloadExecutor{}
+	m.RegisterExecutor(e)
+	id := "overload-concurrent-" + t.Name()
+	if _, err := m.Register(context.Background(), &Auth{ID: id, Provider: "claude", Status: StatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: "claude-opus-5"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+
+	const clients = 20
+	type outcome struct {
+		elapsed    time.Duration
+		err        error
+		retryAfter string
+	}
+	results := make(chan outcome, clients)
+	for i := 0; i < clients; i++ {
+		go func() {
+			start := time.Now()
+			_, err := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "claude-opus-5"}, cliproxyexecutor.Options{})
+			results <- outcome{time.Since(start), err, SafeResponseHeaders(err).Get("Retry-After")}
+		}()
+	}
+	for i := 0; i < clients; i++ {
+		r := <-results
+		if r.err == nil {
+			t.Fatal("an overloaded credential must fail")
+		}
+		if r.elapsed >= defaultOverloadMaxWait+time.Second {
+			t.Errorf("client waited %v (%v), want < %v", r.elapsed, r.err, defaultOverloadMaxWait+time.Second)
+		}
+		if seconds, errParse := strconv.Atoi(r.retryAfter); errParse != nil || seconds < 1 || seconds > 3 {
+			t.Errorf("Retry-After = %q (%v), want 1..3", r.retryAfter, r.err)
+		}
+	}
+	t.Logf("upstream calls for %d clients: %d", clients, e.calls.Load())
 }
