@@ -12,10 +12,10 @@ func TestTMXOpsConfigDefaultsAndCanonicalRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ShutdownDrainTimeout() != 90*time.Second || cfg.Routing.SessionAffinityPersist != nil {
+	if cfg.ShutdownWebsocketGrace() != 10*time.Second || cfg.ShutdownDrainTimeout() != 90*time.Second || cfg.Routing.SessionAffinityPersist != nil {
 		t.Fatalf("defaults: %+v", cfg.Server)
 	}
-	raw := []byte("config-version: 8\nserver:\n  host: localhost\n  shutdown-drain-timeout: 0\nrouting:\n  session-affinity-persist: false\narchive:\n  live-capture-max-bytes: 1234\n  live-capture-exchange-max-bytes: 567\n")
+	raw := []byte("config-version: 8\nserver:\n  host: localhost\n  shutdown-drain-timeout: 0\n  shutdown-websocket-grace: 3\nrouting:\n  session-affinity-persist: false\narchive:\n  live-capture-max-bytes: 1234\n  live-capture-exchange-max-bytes: 567\n")
 	cfg, err = ParseConfigBytes(raw)
 	if err != nil {
 		t.Fatal(err)
@@ -38,7 +38,7 @@ func TestTMXOpsConfigDefaultsAndCanonicalRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fresh.ShutdownDrainTimeout() != 0 || fresh.Archive.LiveCaptureExchangeMaxBytes != 567 || fresh.Routing.SessionAffinityPersist == nil || *fresh.Routing.SessionAffinityPersist {
+	if fresh.ShutdownWebsocketGrace() != 3*time.Second || fresh.ShutdownDrainTimeout() != 0 || fresh.Archive.LiveCaptureExchangeMaxBytes != 567 || fresh.Routing.SessionAffinityPersist == nil || *fresh.Routing.SessionAffinityPersist {
 		t.Fatalf("round trip: %s", saved)
 	}
 	example, err := os.ReadFile("../../config.example.yaml")

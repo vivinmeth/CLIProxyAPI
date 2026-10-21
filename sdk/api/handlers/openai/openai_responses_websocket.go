@@ -17,6 +17,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/capture"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/drainws"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -273,6 +274,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		return
 	}
 	writer := newResponsesWebsocketWriter(conn)
+	drainSession := drainws.Register(c.Request.Context(), func() {
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseServiceRestart, "server restarting"), time.Now().Add(time.Second))
+		_ = conn.Close()
+	})
+	defer drainSession.End()
 	passthroughSessionID := uuid.NewString()
 	socketCtx, cancelSocket := context.WithCancelCause(c.Request.Context())
 	defer cancelSocket(nil)
@@ -421,6 +427,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	}
 
 	for {
+		drainSession.End()
 		var msgType int
 		var payload []byte
 		var errReadMessage error
@@ -456,6 +463,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		// 	websocketPayloadEventType(payload),
 		// 	websocketPayloadPreview(payload),
 		// )
+		if !drainSession.Begin() {
+			return
+		}
 		wsTimelineLog.BeginRequest()
 		wsTimelineLog.Append("request", payload, time.Now())
 

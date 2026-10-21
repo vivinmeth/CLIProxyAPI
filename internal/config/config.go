@@ -208,7 +208,8 @@ type Config struct {
 
 // ServerConfig controls the bounded shutdown window. Nil uses 90 seconds; zero closes immediately.
 type ServerConfig struct {
-	ShutdownDrainTimeout *int `yaml:"shutdown-drain-timeout,omitempty" json:"shutdown-drain-timeout,omitempty"`
+	ShutdownWebsocketGrace *int `yaml:"shutdown-websocket-grace,omitempty" json:"shutdown-websocket-grace,omitempty"`
+	ShutdownDrainTimeout   *int `yaml:"shutdown-drain-timeout,omitempty" json:"shutdown-drain-timeout,omitempty"`
 }
 
 func (c *Config) ShutdownDrainTimeout() time.Duration {
@@ -219,6 +220,14 @@ func (c *Config) ShutdownDrainTimeout() time.Duration {
 		return 0
 	}
 	return time.Duration(*c.Server.ShutdownDrainTimeout) * time.Second
+}
+
+// ShutdownWebsocketGrace bounds active WebSocket responses separately from HTTP.
+func (c *Config) ShutdownWebsocketGrace() time.Duration {
+	if c == nil || c.Server.ShutdownWebsocketGrace == nil {
+		return 10 * time.Second
+	}
+	return time.Duration(max(0, *c.Server.ShutdownWebsocketGrace)) * time.Second
 }
 
 // ArchiveConfig bounds fork capture allocations before they happen. Hot reload is supported.

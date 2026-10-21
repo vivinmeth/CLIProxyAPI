@@ -430,8 +430,9 @@ func (s *Server) Stop(ctx context.Context) error {
 
 	s.cfgMu.RLock()
 	timeout := s.cfg.ShutdownDrainTimeout()
+	websocketGrace := s.cfg.ShutdownWebsocketGrace()
 	s.cfgMu.RUnlock()
-	s.drain.wait(ctx, timeout)
+	s.drain.wait(ctx, timeout, websocketGrace)
 	s.drain.closeHijacked()
 	s.listenerMu.Lock()
 	muxHTTP := s.muxHTTPListener

@@ -3,11 +3,16 @@ package api
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
+	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/drainws"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,7 +64,14 @@ func TestTMXDrainCompletesStreamAndRejectsNewRequests(t *testing.T) {
 		if errGet != nil {
 			t.Fatal(errGet)
 		}
+		var payload struct {
+			Error struct{ Type, Code, Message string }
+		}
+		errDecode := json.NewDecoder(res.Body).Decode(&payload)
 		_ = res.Body.Close()
+		if res.Header.Get("Retry-After") != "5" || errDecode != nil || payload.Error.Type != "server_error" || payload.Error.Code != "server_draining" {
+			t.Fatalf("drain response headers=%v payload=%+v err=%v", res.Header, payload, errDecode)
+		}
 		if res.StatusCode != 503 {
 			t.Fatalf("%s = %d", path, res.StatusCode)
 		}
@@ -177,4 +189,105 @@ func TestTMXDrainZeroClosesActiveStreamImmediately(t *testing.T) {
 		t.Fatal("immediate close did not interrupt stream")
 	}
 	<-exited
+}
+
+func TestTMXDrainWebsocketIdleAndActiveGrace(t *testing.T) {
+	for _, mode := range []string{"idle", "complete", "deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			s := &Server{cfg: &config.Config{}}
+			r := gin.New()
+			r.Use(s.tmxDrainMiddleware())
+			started, release, ended := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			r.GET("/ws", func(c *gin.Context) {
+				defer close(ended)
+				upgrader := websocket.Upgrader{}
+				conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+				if err != nil {
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				session := drainws.Register(c.Request.Context(), func() {
+					_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseServiceRestart, "restart"), time.Now().Add(time.Second))
+					_ = conn.Close()
+				})
+				if mode != "idle" {
+					if !session.Begin() {
+						return
+					}
+				}
+				defer session.End()
+				close(started)
+				if mode == "complete" {
+					<-release
+					_ = conn.WriteMessage(websocket.TextMessage, []byte("complete"))
+					return
+				}
+				_, _, _ = conn.ReadMessage()
+			})
+			ts := httptest.NewServer(r)
+			defer ts.Close()
+			conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/ws", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			<-started
+			finished := make(chan struct{})
+			grace := time.Second
+			if mode == "deadline" {
+				grace = 20 * time.Millisecond
+			}
+			go func() { s.drain.wait(context.Background(), 90*time.Second, grace); close(finished) }()
+			if mode == "complete" {
+				for {
+					s.drain.mu.Lock()
+					draining := s.drain.draining
+					s.drain.mu.Unlock()
+					if draining {
+						break
+					}
+					runtime.Gosched()
+				}
+				select {
+				case <-finished:
+					t.Fatal("active response closed before completion")
+				default:
+				}
+				close(release)
+				_, body, err := conn.ReadMessage()
+				if err != nil || string(body) != "complete" {
+					t.Fatalf("response=%s err=%v", body, err)
+				}
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			_, _, err = conn.ReadMessage()
+			var closeErr *websocket.CloseError
+			if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+				t.Fatalf("wanted restart close frame: %v", err)
+			}
+			select {
+			case <-finished:
+			case <-time.After(time.Second):
+				t.Fatal("WS held full HTTP drain")
+			}
+			<-ended
+		})
+	}
+}
+
+func TestTMXDrainRejectionContract(t *testing.T) {
+	s := &Server{}
+	s.drain.wait(context.Background(), 0, 0)
+	r := gin.New()
+	r.Use(s.tmxDrainMiddleware())
+	r.GET("/v1/responses", func(c *gin.Context) { c.Status(200) })
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/responses", nil))
+	var payload struct {
+		Error struct{ Type, Code, Message string }
+	}
+	err := json.Unmarshal(rec.Body.Bytes(), &payload)
+	if rec.Code != 503 || rec.Header().Get("Retry-After") != "5" || err != nil || payload.Error.Type != "server_error" || payload.Error.Code != "server_draining" || payload.Error.Message == "" {
+		t.Fatalf("drain response status=%d headers=%v body=%s err=%v", rec.Code, rec.Header(), rec.Body.String(), err)
+	}
 }

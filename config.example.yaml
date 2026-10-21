@@ -25,6 +25,8 @@ server:
   # Shutdown budget in seconds for HTTP/SSE/WebSocket drain plus worker flushes.
   # Reserve up to 5 seconds for final persistence; 0 closes connections immediately.
   shutdown-drain-timeout: 90
+  # Active WebSocket responses get this shorter grace; idle sockets close at drain start.
+  shutdown-websocket-grace: 10
 
   # Server host/interface to bind to. Default is empty ("") to bind all interfaces (IPv4 + IPv6).
   # Use "127.0.0.1" or "localhost" to restrict access to local machine only.
