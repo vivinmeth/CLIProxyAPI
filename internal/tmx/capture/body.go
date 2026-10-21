@@ -37,6 +37,7 @@ func Configure(max, exchange int64, spool string) {
 	if spool == "" {
 		spool = "/CLIProxyAPI/archive-spool"
 	}
+	SweepSpills(spool)
 	limits.Store(&captureLimits{max, exchange, spool})
 }
 func currentLimits() *captureLimits {

@@ -20,6 +20,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/minio/minio-go/v7"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/capture"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -67,6 +68,7 @@ type BlobStore struct {
 }
 
 func newBlobStore(db *sql.DB, schema string, r2 *minio.Client, bucket, env, spool string) (*BlobStore, error) {
+	capture.SweepSpills(spool)
 	if err := os.MkdirAll(spool, 0o750); err != nil {
 		return nil, fmt.Errorf("spool dir: %w", err)
 	}

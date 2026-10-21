@@ -524,7 +524,10 @@ func (a *Archive) Stats() map[string]any {
 	if errCost != nil {
 		log.WithError(errCost).Debug("tmx archive: cost estimate failed")
 	}
+	spillFiles, spillBytes := capture.LiveSpillStats(a.blobs.spool)
 	return map[string]any{
+		"live_spill_files":     spillFiles,
+		"live_spill_bytes":     spillBytes,
 		"r2_cost_estimate":     cost,
 		"env":                  a.env,
 		"capture":              capture.Enabled(),
