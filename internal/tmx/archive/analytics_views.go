@@ -5,8 +5,8 @@ package archive
 // requestlog/prices.go), and per-session totals. Recreated on start so they follow the code.
 
 var analyticsViewsSQL = []string{
-	`DROP VIEW IF EXISTS session_usage, request_costs, request_sessions`,
-	`DROP TABLE IF EXISTS model_prices`, // v2's own price table; costs are now stored per row
+	`DROP VIEW IF EXISTS session_usage, request_costs, request_sessions CASCADE`, // dependents are recreated after
+	`DROP TABLE IF EXISTS model_prices`,                                          // v2's own price table; costs are now stored per row
 	// Which extracted session (and message) a usage row belongs to. Imported rows: import_ref
 	// "<harness>:<session>#<message>". Proxied rows: the captured exchange (trace_id), else the
 	// client session id. canonical_session_id prefers the imported transcript over its proxied twin.

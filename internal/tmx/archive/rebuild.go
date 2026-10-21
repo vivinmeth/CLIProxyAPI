@@ -90,7 +90,9 @@ func (a *Archive) RebuildUsage(ctx context.Context, harness string, dryRun bool)
 		it := bySession[id]
 		var since *time.Time
 		if it.via != nil && *it.via {
-			since = a.proxiedSince(ctx, store, it.in.ExternalID)
+			if since, err = a.proxiedSince(ctx, store, it.in.ExternalID); err != nil {
+				return res, fmt.Errorf("session %s: %w", id, err)
+			}
 		}
 		built := usageRows(it.in, it.key, it.via, since)
 		if err = store.UpsertImported(ctx, built); err != nil {
@@ -136,7 +138,11 @@ func (a *Archive) Reshadow(ctx context.Context) (int64, error) {
 	}
 	for _, p := range proxied {
 		ids = append(ids, p.id)
-		if t := a.proxiedSince(ctx, store, p.ext); t != nil {
+		t, errS := a.proxiedSince(ctx, store, p.ext)
+		if errS != nil {
+			return 0, fmt.Errorf("session %s: %w", p.id, errS)
+		}
+		if t != nil {
 			since = append(since, t.UTC().Format(time.RFC3339Nano))
 		} else {
 			since = append(since, "NULL")

@@ -576,9 +576,10 @@ func installRequestTriggers(ctx context.Context, db *sql.DB, table string) error
 				BEGIN
 			-- Bulk updates (the request log's pricing pass) journal one full reconcile, not a row
 			-- each: hundreds of thousands of entries would hold live usage back.
+						-- One entry per statement (never skipped because one is pending: a reconcile already
+			-- running would miss this statement's rows); a step collapses them into one reconcile.
 			IF TG_OP = 'TRUNCATE' OR (TG_OP = 'UPDATE' AND current_setting('tmx.analytics_bulk', true) = 'on') THEN
-				INSERT INTO ` + journalTable + ` (kind, ref) SELECT 'requests_truncate', '*'
-					WHERE NOT EXISTS (SELECT 1 FROM ` + journalTable + ` WHERE kind = 'requests_truncate' AND attempts = 0);
+				INSERT INTO ` + journalTable + ` (kind, ref) VALUES ('requests_truncate', '*');
 			ELSIF TG_OP = 'DELETE' THEN
 				INSERT INTO ` + journalTable + ` (kind, ref) SELECT 'request', id::text FROM old_rows;
 			ELSE

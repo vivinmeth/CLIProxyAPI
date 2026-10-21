@@ -128,7 +128,7 @@ func usageRefsWithout(in SessionIngest, sessionKey string) []string {
 // proxiedSince is when the proxy first served this session (nil when it never did): the earliest
 // captured exchange carrying the client's session id, or proxied usage row under it or under the
 // canonical ids the proxy gave it (exchanges map one to the other).
-func (a *Archive) proxiedSince(ctx context.Context, store *requestlog.Store, externalID string) *time.Time {
+func (a *Archive) proxiedSince(ctx context.Context, store *requestlog.Store, externalID string) (*time.Time, error) {
 	ids := []string{externalID}
 	// Subagents are imported as "<parent>:<agent>" but reach the proxy under the parent's session
 	// id, so the parent's proxied traffic counts for them.
@@ -147,31 +147,39 @@ func (a *Archive) proxiedSince(ctx context.Context, store *requestlog.Store, ext
 			first = &v
 		}
 	}
+	// Errors are returned, never read as "not proxied": that would count proxied traffic twice.
 	var canonical []string
-	if rows, err := a.db.QueryContext(ctx, `SELECT session_id, min(ts) FROM `+schema+`.exchanges
+	rows, err := a.db.QueryContext(ctx, `SELECT session_id, min(ts) FROM `+schema+`.exchanges
 		WHERE client_session_id = ANY($1::text[]) OR session_id = ANY($1::text[]) GROUP BY session_id`,
-		pgTextArray(ids)); err == nil {
-		for rows.Next() {
-			var sid string
-			var ts sql.NullTime
-			if rows.Scan(&sid, &ts) == nil {
-				consider(ts)
-				if sid != "" {
-					canonical = append(canonical, sid)
-				}
-			}
+		pgTextArray(ids))
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var sid string
+		var ts sql.NullTime
+		if err = rows.Scan(&sid, &ts); err != nil {
+			_ = rows.Close()
+			return nil, err
 		}
-		_ = rows.Close()
+		consider(ts)
+		if sid != "" {
+			canonical = append(canonical, sid)
+		}
+	}
+	if err = closeRows(rows); err != nil {
+		return nil, err
 	}
 	if store != nil {
 		var reqFirst sql.NullTime
-		if store.DB().QueryRowContext(ctx, `SELECT min(ts) FROM `+store.Schema()+`.requests
+		if err = store.DB().QueryRowContext(ctx, `SELECT min(ts) FROM `+store.Schema()+`.requests
 			WHERE source = $1 AND session_id = ANY($2::text[])`, requestlog.SourceProxy,
-			pgTextArray(append(ids, canonical...))).Scan(&reqFirst) == nil {
-			consider(reqFirst)
+			pgTextArray(append(ids, canonical...))).Scan(&reqFirst); err != nil {
+			return nil, err
 		}
+		consider(reqFirst)
 	}
-	return first
+	return first, nil
 }
 
 // writeUsage upserts the session's usage rows, drops rows of messages that no longer carry usage

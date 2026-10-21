@@ -294,6 +294,7 @@ func (s *Store) run() {
 		case row, ok := <-s.queue:
 			if !ok {
 				flush()
+				w.persistAt(time.Time{}) // whatever is still pending survives the restart
 				return
 			}
 			batch = append(batch, row)
@@ -314,7 +315,9 @@ type writer struct {
 	pending   []Row
 	nextRetry time.Time
 	delay     time.Duration
-	spooled   bool // the spool file holds pending rows
+	spooled   bool      // the spool file holds pending rows
+	dirty     bool      // pending changed since the spool was last written
+	lastSpool time.Time // throttles spool rewrites during an outage
 }
 
 // write prices and inserts batch (after anything still pending). Rows are only dropped when the
@@ -340,12 +343,10 @@ func (w *writer) write(batch []Row) {
 	before := len(w.pending)
 	defer func() {
 		s.pendingRows.Store(int64(len(w.pending)))
-		switch {
-		case len(w.pending) > 0 && (len(batch) > 0 || len(w.pending) != before || !w.spooled):
-			w.persist()
-		case len(w.pending) == 0 && w.spooled:
-			w.persist() // removes the file
+		if len(batch) > 0 || len(w.pending) != before {
+			w.dirty = true
 		}
+		w.persistAt(time.Now())
 	}()
 	if len(w.pending) == 0 || time.Now().Before(w.nextRetry) {
 		return
@@ -388,15 +389,17 @@ func (w *writer) write(batch []Row) {
 	w.pending, w.delay, w.nextRetry = nil, 0, time.Time{}
 }
 
-// isDataError: the database refused the row itself (data exception, integrity or syntax class);
-// retrying it would fail again. Everything else is treated as transient.
+// isDataError: the database refused the row's content (data exception or integrity violation:
+// invalid text, out of range, constraint); retrying it would fail again. Everything else —
+// including schema / permission errors (class 42), which are fixed by fixing the database — is
+// kept and retried.
 func isDataError(err error) bool {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || len(pgErr.Code) < 2 {
 		return false
 	}
 	switch pgErr.Code[:2] {
-	case "22", "23", "42":
+	case "22", "23":
 		return true
 	}
 	return false
@@ -429,14 +432,25 @@ func spoolPath() string {
 	return filepath.Join(os.TempDir(), spoolFileName)
 }
 
-// persist mirrors the pending rows to the spool file (atomically), or removes it when none are
-// left; readSpool loads it at the next start.
-func (w *writer) persist() {
+// spoolEvery: while rows are pending the spool is rewritten at most this often (a crash loses at
+// most this much of an outage's traffic; a long outage isn't rewritten on every flush).
+const spoolEvery = 10 * time.Second
+
+// persistAt mirrors the pending rows to the spool file (atomically) when they changed and the
+// last write is spoolEvery old (now zero = write regardless), or removes the file once nothing
+// is pending; readSpool loads it at the next start. A failed write stays dirty and is retried.
+func (w *writer) persistAt(now time.Time) {
 	path := spoolPath()
 	if len(w.pending) == 0 {
-		if err := os.Remove(path); err == nil || os.IsNotExist(err) {
-			w.spooled = false
+		if !w.spooled && !w.dirty {
+			return
 		}
+		if err := os.Remove(path); err == nil || os.IsNotExist(err) {
+			w.spooled, w.dirty = false, false
+		}
+		return
+	}
+	if !w.dirty || (!now.IsZero() && now.Sub(w.lastSpool) < spoolEvery) {
 		return
 	}
 	var b bytes.Buffer
@@ -453,7 +467,7 @@ func (w *writer) persist() {
 		log.WithError(err).Warnf("tmx request log: can't spool %d pending rows", len(w.pending))
 		return
 	}
-	w.spooled = true
+	w.spooled, w.dirty, w.lastSpool = true, false, now
 }
 
 func readSpool() []Row {
