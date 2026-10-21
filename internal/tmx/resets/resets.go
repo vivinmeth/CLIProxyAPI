@@ -272,6 +272,14 @@ func httpError(code int, err error) string {
 
 // read fetches one account's credits from its provider.
 func (s *Service) read(ctx context.Context, auth *coreauth.Auth, provider string) Account {
+	return s.readUsage(ctx, auth, provider, false)
+}
+
+func (s *Service) readUsage(ctx context.Context, auth *coreauth.Auth, provider string, fresh bool) Account {
+	readUsage := quota.ReadUsage
+	if fresh {
+		readUsage = quota.ReadUsageFresh
+	}
 	now := s.now().UTC()
 	a := Account{AuthID: auth.ID, AuthIndex: auth.EnsureIndex(), Provider: provider, Label: labelOf(auth),
 		CheckedAt: &now, Status: Status{Windows: []Window{}, Credits: []Credit{}}}
@@ -279,7 +287,7 @@ func (s *Service) read(ctx context.Context, auth *coreauth.Auth, provider string
 	defer cancel()
 	switch provider {
 	case "claude":
-		code, body, err := quota.ReadUsage(ctx, auth, func(readCtx context.Context) (int, []byte, error) {
+		code, body, err := readUsage(ctx, auth, func(readCtx context.Context) (int, []byte, error) {
 			return s.backend.TmxSend(readCtx, auth, "GET", claudeStatusURL, claudeHeaders(), nil)
 		})
 		if err != nil || code < 200 || code >= 300 {
@@ -294,7 +302,7 @@ func (s *Service) read(ctx context.Context, auth *coreauth.Auth, provider string
 		a.Status = st
 	case "codex":
 		h := codexHeaders(auth)
-		code, body, err := quota.ReadUsage(ctx, auth, func(readCtx context.Context) (int, []byte, error) {
+		code, body, err := readUsage(ctx, auth, func(readCtx context.Context) (int, []byte, error) {
 			return s.backend.TmxSend(readCtx, auth, "GET", codexUsageURL, h, nil)
 		})
 		if err != nil || code < 200 || code >= 300 {
@@ -573,7 +581,7 @@ func (s *Service) Redeem(ctx context.Context, authID, creditID, actor string) (*
 	res := &Result{}
 	if settles(outcome) {
 		// Verify first, then release only what recovered.
-		after := s.read(context.Background(), auth, provider)
+		after := s.readUsage(context.Background(), auth, provider, true)
 		s.store(after)
 		var afterWindows []Window
 		if after.Error == "" {

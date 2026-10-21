@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/quota"
 	"strings"
 	"sync"
 	"testing"
@@ -346,4 +348,62 @@ func TestConfirmed(t *testing.T) {
 func jsonNum(f float64) string {
 	b, _ := json.Marshal(f)
 	return string(b)
+}
+
+func TestRedeemVerificationDoesNotJoinPreRedeemUsage(t *testing.T) {
+	a := codexAuth()
+	a.ID = "redeem-with-poll"
+	started, release, oldDone, verified := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
+	used := 80
+	usage := func(n int) string {
+		return fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":%d,"limit_window_seconds":604800,"reset_at":1793102375}},"rate_limit_reset_credits":{"applicable_available_count":1}}`, n)
+	}
+	f := &fakeBackend{auths: []*coreauth.Auth{a}}
+	f.handle = func(method, url string, _ []byte) (int, string, error) {
+		switch {
+		case strings.HasSuffix(url, "/wham/usage"):
+			if used == 0 {
+				close(verified)
+			}
+			return 200, usage(used), nil
+		case strings.HasSuffix(url, "/rate-limit-reset-credits"):
+			return 200, codexCreditsBody, nil
+		case strings.HasSuffix(url, "/consume"):
+			go func() {
+				defer close(oldDone)
+				_, _, _ = quota.ReadUsage(context.Background(), a, func(context.Context) (int, []byte, error) {
+					close(started)
+					<-release
+					return 200, []byte(usage(80)), nil
+				})
+			}()
+			<-started
+			used = 0
+			return 200, `{"code":"reset"}`, nil
+		}
+		return 500, "", nil
+	}
+	done := make(chan *Result, 1)
+	errs := make(chan error, 1)
+	go func() {
+		res, err := newTestService(f).Redeem(context.Background(), a.ID, "c1", "test")
+		done <- res
+		errs <- err
+	}()
+	select {
+	case <-verified:
+	case <-time.After(time.Second):
+		close(release)
+		<-oldDone
+		<-done
+		<-errs
+		t.Fatal("verification joined the pre-redeem usage read")
+	}
+	res := <-done
+	err := <-errs
+	close(release)
+	<-oldDone
+	if err != nil || res == nil || !res.Redemption.Confirmed {
+		t.Fatalf("post-redeem verification: %+v %v", res, err)
+	}
 }

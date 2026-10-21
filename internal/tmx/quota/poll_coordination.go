@@ -13,6 +13,8 @@ import (
 
 var usageReads singleflight.Group
 
+const usageReadTimeout = 30 * time.Second
+
 type usageReply struct {
 	status int
 	body   []byte
@@ -24,7 +26,9 @@ type usageReply struct {
 func ReadUsage(ctx context.Context, auth *coreauth.Auth, fetch func(context.Context) (int, []byte, error)) (int, []byte, error) {
 	key := strings.ToLower(auth.Provider) + "\x00" + auth.ID + "\x00" + strconv.FormatUint(auth.RegistrationEpoch, 10)
 	done := usageReads.DoChan(key, func() (any, error) {
-		status, body, err := fetch(ctx)
+		readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageReadTimeout)
+		defer cancel()
+		status, body, err := fetch(readCtx)
 		return usageReply{status: status, body: body}, err
 	})
 	select {
@@ -37,6 +41,14 @@ func ReadUsage(ctx context.Context, auth *coreauth.Auth, fetch func(context.Cont
 		reply := result.Val.(usageReply)
 		return reply.status, append([]byte(nil), reply.body...), result.Err
 	}
+}
+
+// ReadUsageFresh never joins or publishes a shared read. Verification after a
+// mutation must observe a request started after that mutation completed.
+func ReadUsageFresh(ctx context.Context, _ *coreauth.Auth, fetch func(context.Context) (int, []byte, error)) (int, []byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, usageReadTimeout)
+	defer cancel()
+	return fetch(ctx)
 }
 
 // Positive, stable jitter separates scheduled polls without affecting PollNow's

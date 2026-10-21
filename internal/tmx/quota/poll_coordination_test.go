@@ -151,3 +151,66 @@ func (c *joinedReadContext) Done() <-chan struct{} {
 	c.once.Do(func() { close(c.seen) })
 	return c.Context.Done()
 }
+
+func TestSharedUsageReadSurvivesLeaderCancellation(t *testing.T) {
+	a := &coreauth.Auth{ID: "cancel-leader", Provider: "claude"}
+	started, release := make(chan struct{}), make(chan struct{})
+	leaderCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, _, err := ReadUsage(leaderCtx, a, func(ctx context.Context) (int, []byte, error) {
+			if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > time.Minute {
+				t.Error("shared fetch has no bounded timeout")
+			}
+			close(started)
+			select {
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			case <-release:
+				return 200, []byte("fresh"), nil
+			}
+		})
+		leaderDone <- err
+	}()
+	<-started
+	joined := &joinedReadContext{Context: context.Background(), seen: make(chan struct{})}
+	followerDone := make(chan error, 1)
+	go func() {
+		_, body, err := ReadUsage(joined, a, func(context.Context) (int, []byte, error) { t.Error("follower fetched"); return 500, nil, nil })
+		if err == nil && string(body) != "fresh" {
+			t.Error("wrong reply")
+		}
+		followerDone <- err
+	}()
+	<-joined.seen
+	cancel()
+	if err := <-leaderDone; err != context.Canceled {
+		t.Errorf("leader = %v", err)
+	}
+	close(release)
+	if err := <-followerDone; err != nil {
+		t.Errorf("leader cancellation failed follower: %v", err)
+	}
+}
+
+func TestFreshUsageReadNeverJoinsPreRedeemRead(t *testing.T) {
+	a := &coreauth.Auth{ID: "fresh-after-redeem", Provider: "codex"}
+	started, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = ReadUsage(context.Background(), a, func(context.Context) (int, []byte, error) {
+			close(started)
+			<-release
+			return 200, []byte("before"), nil
+		})
+	}()
+	<-started
+	defer func() { close(release); <-done }()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	code, body, err := ReadUsageFresh(ctx, a, func(context.Context) (int, []byte, error) { return 200, []byte("after"), nil })
+	if err != nil || code != 200 || string(body) != "after" {
+		t.Fatalf("fresh read = %d %s %v", code, body, err)
+	}
+}
