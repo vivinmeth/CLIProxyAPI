@@ -395,7 +395,10 @@ func (m *Manager) finishRefreshJob(job *authRefreshJob, retryAt time.Time, queue
 }
 
 type authRefreshLock struct {
-	mu sync.Mutex
+	mu      sync.Mutex
+	stateMu sync.Mutex
+	pending int
+	done    chan struct{}
 }
 
 func authOuterAccessToken(auth *Auth) string {
@@ -822,15 +825,16 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if id == "" {
 		return nil, errors.New("auth id is empty")
 	}
-	if failedAccessToken != "" {
-		m.markRejectedAccessToken(id, failedAccessToken)
-	}
-
 	lockValue, _ := m.refreshLocks.LoadOrStore(id, &authRefreshLock{})
 	lock, _ := lockValue.(*authRefreshLock)
 	if lock == nil {
 		lock = &authRefreshLock{}
 		m.refreshLocks.Store(id, lock)
+	}
+	finish := lock.begin()
+	defer finish()
+	if failedAccessToken != "" {
+		m.markRejectedAccessToken(id, failedAccessToken)
 	}
 	lock.mu.Lock()
 	defer lock.mu.Unlock()

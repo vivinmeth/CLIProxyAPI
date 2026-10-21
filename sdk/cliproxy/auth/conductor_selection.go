@@ -1822,6 +1822,14 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 }
 
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	result, err := retryDuringRefresh(m, ctx, []string{provider}, opts, tried, func(ctx context.Context) (refreshSelection, error) {
+		a, e, err := m.pickNextLegacyUncoordinated(ctx, provider, model, opts, tried)
+		return refreshSelection{auth: a, executor: e}, err
+	})
+	return result.auth, result.executor, err
+}
+
+func (m *Manager) pickNextLegacyUncoordinated(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		return auth, exec, err
@@ -2092,6 +2100,14 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	result, err := retryDuringRefresh(m, ctx, []string{provider}, opts, tried, func(ctx context.Context) (refreshSelection, error) {
+		a, e, err := m.pickNextUncoordinated(ctx, provider, model, opts, tried)
+		return refreshSelection{auth: a, executor: e}, err
+	})
+	return result.auth, result.executor, err
+}
+
+func (m *Manager) pickNextUncoordinated(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	opts.EnsureMetadata()
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
@@ -2153,6 +2169,14 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 }
 
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	result, err := retryDuringRefresh(m, ctx, providers, opts, tried, func(ctx context.Context) (refreshSelection, error) {
+		a, e, p, err := m.pickNextMixedLegacyUncoordinated(ctx, providers, model, opts, tried)
+		return refreshSelection{auth: a, executor: e, provider: p}, err
+	})
+	return result.auth, result.executor, result.provider, err
+}
+
+func (m *Manager) pickNextMixedLegacyUncoordinated(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
@@ -2278,6 +2302,14 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	result, err := retryDuringRefresh(m, ctx, providers, opts, tried, func(ctx context.Context) (refreshSelection, error) {
+		a, e, p, err := m.pickNextMixedUncoordinated(ctx, providers, model, opts, tried)
+		return refreshSelection{auth: a, executor: e, provider: p}, err
+	})
+	return result.auth, result.executor, result.provider, err
+}
+
+func (m *Manager) pickNextMixedUncoordinated(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	opts.EnsureMetadata()
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
