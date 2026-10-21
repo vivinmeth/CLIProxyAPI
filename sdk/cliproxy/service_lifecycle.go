@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/sessionbindings"
 	"os"
 	"time"
 
@@ -101,6 +103,20 @@ func (s *Service) Run(ctx context.Context) error {
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(ctx, interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+	}
+
+	if !homeEnabled && s.coreManager != nil {
+		if store := requestlog.Default(); store != nil {
+			enabled := func() bool {
+				cfg := s.currentConfig()
+				return cfg != nil && cfg.Routing.SessionAffinity && (cfg.Routing.SessionAffinityPersist == nil || *cfg.Routing.SessionAffinityPersist)
+			}
+			var errBindings error
+			s.sessionBindings, errBindings = sessionbindings.Start(context.Background(), store.DB(), store.Schema(), s.coreManager, enabled)
+			if errBindings != nil {
+				log.WithError(errBindings).Warn("tmx: session persistence disabled")
+			}
+		}
 	}
 
 	if !homeEnabled {
@@ -271,6 +287,8 @@ func (s *Service) Shutdown(ctx context.Context) error {
 				}
 			}
 		}
+
+		s.sessionBindings.Close()
 
 		s.homeMu.Lock()
 		runCancel := s.runCancel
