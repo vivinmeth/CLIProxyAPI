@@ -29,7 +29,7 @@ func openTestAnalytics(t *testing.T) (*Archive, *analytics) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, stmt := range []string{"TRUNCATE sessions CASCADE", "TRUNCATE threads CASCADE", "TRUNCATE exchanges",
+	for _, stmt := range []string{"TRUNCATE sessions CASCADE", "TRUNCATE threads CASCADE", "TRUNCATE commits CASCADE", "TRUNCATE exchanges",
 		"TRUNCATE requests", "TRUNCATE state", "TRUNCATE failed"} {
 		if _, err = an.db.Exec(stmt); err != nil {
 			t.Fatal(err)

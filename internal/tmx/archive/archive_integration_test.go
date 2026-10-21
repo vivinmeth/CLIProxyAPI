@@ -32,7 +32,7 @@ func openTestArchive(t *testing.T) (*Archive, *requestlog.Store) {
 	for _, stmt := range []string{
 		"DELETE FROM " + schema + ".session_sources", "DELETE FROM " + schema + ".session_messages",
 		"DELETE FROM " + schema + ".sessions", "DELETE FROM " + schema + ".exchanges",
-		"DELETE FROM " + schema + ".blobs", "DELETE FROM " + schema + ".threads",
+		"DELETE FROM " + schema + ".blobs", "DELETE FROM " + schema + ".threads", "DELETE FROM " + schema + ".commits",
 	} {
 		if _, err = a.db.Exec(stmt); err != nil {
 			t.Fatal(err)

@@ -70,6 +70,10 @@ type ThreadPullRequest struct {
 	LinkedAt   *time.Time `json:"linked_at,omitempty"`
 	MergedAt   *time.Time `json:"merged_at,omitempty"`
 	ClosedAt   *time.Time `json:"closed_at,omitempty"`
+	// Size of the change (the PR's diff).
+	Additions    int64 `json:"additions,omitempty"`
+	Deletions    int64 `json:"deletions,omitempty"`
+	ChangedFiles int64 `json:"changed_files,omitempty"`
 }
 
 // ThreadRequest is one question / approval the thread raised.

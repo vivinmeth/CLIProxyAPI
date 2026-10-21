@@ -62,6 +62,9 @@ var threadSchemaSQL = []string{
 		closed_at  TIMESTAMPTZ,
 		PRIMARY KEY (thread_id, url)
 	)`,
+	`ALTER TABLE thread_pull_requests ADD COLUMN IF NOT EXISTS additions BIGINT NOT NULL DEFAULT 0`,
+	`ALTER TABLE thread_pull_requests ADD COLUMN IF NOT EXISTS deletions BIGINT NOT NULL DEFAULT 0`,
+	`ALTER TABLE thread_pull_requests ADD COLUMN IF NOT EXISTS changed_files BIGINT NOT NULL DEFAULT 0`,
 	`CREATE TABLE IF NOT EXISTS thread_requests (
 		thread_id   TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
 		seq         INTEGER NOT NULL,
@@ -231,7 +234,7 @@ func (an *analytics) extractThread(ctx context.Context, id string) error {
 		}
 		seenPR[p.URL] = true
 		prs = append(prs, []any{id, cleanText(p.URL), cleanText(p.Repository), p.Number, cleanText(p.Title),
-			cleanText(strings.ToLower(p.State)), p.LinkedAt, p.MergedAt, p.ClosedAt})
+			cleanText(strings.ToLower(p.State)), p.LinkedAt, p.MergedAt, p.ClosedAt, p.Additions, p.Deletions, p.ChangedFiles})
 	}
 	for i, r := range t.Requests {
 		reqs = append(reqs, []any{id, i, cleanText(r.Kind), cleanText(r.Status), r.CreatedAt, r.ResolvedAt})
@@ -245,7 +248,8 @@ func (an *analytics) extractThread(ctx context.Context, id string) error {
 		rows  [][]any
 	}{
 		{"thread_sessions", []string{"thread_id", "harness", "session_id", "role", "provider", "model"}, sess},
-		{"thread_pull_requests", []string{"thread_id", "url", "repository", "number", "title", "state", "linked_at", "merged_at", "closed_at"}, prs},
+		{"thread_pull_requests", []string{"thread_id", "url", "repository", "number", "title", "state", "linked_at",
+			"merged_at", "closed_at", "additions", "deletions", "changed_files"}, prs},
 		{"thread_requests", []string{"thread_id", "seq", "kind", "status", "created_at", "resolved_at"}, reqs},
 		{"thread_turns", []string{"thread_id", "seq", "requested_at", "completed_at", "status", "provider", "model"}, turns},
 	} {

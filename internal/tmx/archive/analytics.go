@@ -253,14 +253,17 @@ func (an *analytics) ensureViews(ctx context.Context) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	// Dependents first: thread_usage reads session_usage.
-	stmts := append([]string{`DROP VIEW IF EXISTS thread_usage, skill_invocations, session_threads, session_tree`},
-		threadSchemaSQL...)
+	stmts := append([]string{`DROP VIEW IF EXISTS tasks, commit_tasks, session_tasks, thread_roots, thread_usage,
+		skill_invocations, session_threads, session_tree`}, threadSchemaSQL...)
+	stmts = append(stmts, commitSchemaSQL...)
 	if an.reqMirror != nil {
 		stmts = append(stmts, analyticsViewsSQL...)
 	}
 	stmts = append(stmts, threadViewsSQL...)
+	stmts = append(stmts, taskViewsSQL...)
 	if an.reqMirror != nil {
 		stmts = append(stmts, threadUsageSQL...)
+		stmts = append(stmts, tasksSQL...)
 	}
 	for _, stmt := range stmts {
 		if _, err = tx.ExecContext(ctx, stmt); err != nil {
@@ -421,6 +424,7 @@ func (an *analytics) step() (bool, error) {
 	imported := map[string]bool{}
 	proxy := map[string]bool{}
 	threads := map[string]bool{}
+	commits := map[string]bool{}
 	byRef := map[string][]journalEntry{}
 	for _, e := range entries {
 		switch e.kind {
@@ -436,6 +440,8 @@ func (an *analytics) step() (bool, error) {
 			requestsTruncated = true
 		case "thread":
 			threads[e.ref] = true
+		case "commit":
+			commits[e.ref] = true
 		}
 		byRef[e.kind+"\x00"+e.ref] = append(byRef[e.kind+"\x00"+e.ref], e)
 	}
@@ -477,6 +483,11 @@ func (an *analytics) step() (bool, error) {
 			fail("thread", id, errT)
 		}
 	}
+	for id := range commits {
+		if errC := an.extractCommit(ctx, id); errC != nil {
+			fail("commit", id, errC)
+		}
+	}
 	importedIDs := make([]string, 0, len(imported))
 	for id := range imported {
 		importedIDs = append(importedIDs, id)
@@ -505,10 +516,10 @@ func (an *analytics) step() (bool, error) {
 		errE, bad := failedIDs[e.id]
 		if !bad {
 			done = append(done, fmt.Sprint(e.id))
-			if e.kind == "session" || e.kind == "proxy" || e.kind == "thread" {
+			if e.kind == "session" || e.kind == "proxy" || e.kind == "thread" || e.kind == "commit" {
 				cleared[e.kind] = append(cleared[e.kind], e.ref)
 			}
-			if e.kind != "thread" {
+			if e.kind != "thread" && e.kind != "commit" {
 				an.linksDirty.Store(true)
 			}
 			continue
@@ -1198,6 +1209,7 @@ type BackfillResult struct {
 	Sessions    int64 `json:"sessions"`
 	Proxy       int64 `json:"proxy_sessions"`
 	Threads     int64 `json:"threads"`
+	Commits     int64 `json:"commits"`
 	Exchanges   int64 `json:"exchanges"`
 	RequestRows int   `json:"request_rows"` // tmx.requests rows copied (copies of deleted rows are removed)
 	Replayed    int   `json:"replayed"`     // failed entries + sessions deleted from the archive
@@ -1296,6 +1308,13 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 	for _, g := range threadGhosts {
 		replay = append(replay, [2]string{"thread", g})
 	}
+	commitGhosts, err := an.commitGhosts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, g := range commitGhosts {
+		replay = append(replay, [2]string{"commit", g})
+	}
 	for _, r := range replay {
 		if _, err = a.db.ExecContext(ctx, `INSERT INTO `+journalTable+` (kind, ref) VALUES ($1, $2)`, r[0], r[1]); err != nil {
 			return nil, err
@@ -1325,6 +1344,11 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 		return nil, err
 	}
 	res.Threads, _ = tag.RowsAffected()
+	tag, err = a.db.ExecContext(ctx, `INSERT INTO `+journalTable+` (kind, ref) SELECT 'commit', id FROM `+schema+`.commits`)
+	if err != nil {
+		return nil, err
+	}
+	res.Commits, _ = tag.RowsAffected()
 	// Under the worker lock: a row mirrored by step() during the scan must not be judged absent.
 	an.mu.Lock()
 	res.RequestRows, err = an.reconcileAllRequests(ctx)

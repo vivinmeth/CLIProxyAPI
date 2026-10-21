@@ -338,6 +338,9 @@ func registerTMXArchiveRoutes(v8 *gin.RouterGroup) {
 	g.GET("/sessions", tmxArchive(tmxSessionList))
 	g.GET("/sessions/*id", tmxArchive(tmxSessionGet))
 	g.DELETE("/sessions/*id", tmxArchive(tmxSessionDelete))
+	g.PUT("/commits", tmxArchive(tmxCommitIngest))
+	g.GET("/commits", tmxArchive(tmxCommitList))
+	g.DELETE("/commits/*id", tmxArchive(tmxCommitDelete))
 	g.PUT("/threads", tmxArchive(tmxThreadIngest))
 	g.GET("/threads", tmxArchive(tmxThreadList))
 	g.GET("/threads/*id", tmxArchive(tmxThreadGet))
@@ -504,6 +507,54 @@ func tmxSessionIngest(c *gin.Context, a *archive.Archive) {
 		return
 	}
 	c.JSON(http.StatusOK, res)
+}
+
+// tmxCommitIngest: PUT /tmx/archive/commits — upsert a batch of git commits with the sessions /
+// threads that made them (archive-ingest.md → Commits).
+func tmxCommitIngest(c *gin.Context, a *archive.Archive) {
+	var in archive.CommitBatch
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	res, err := a.IngestCommits(c.Request.Context(), in)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+func tmxCommitList(c *gin.Context, a *archive.Archive) {
+	since := time.Unix(0, 0)
+	if raw := strings.TrimSpace(c.Query("since")); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "since must be unix seconds"})
+			return
+		}
+		since = time.Unix(n, 0)
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	items, err := a.ListCommits(c.Request.Context(), c.Query("repo"), c.Query("machine"), since, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
+func tmxCommitDelete(c *gin.Context, a *archive.Archive) {
+	id := strings.TrimPrefix(c.Param("id"), "/")
+	err := a.DeleteCommit(c.Request.Context(), id)
+	switch {
+	case errors.Is(err, archive.ErrCommitNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+	case err != nil:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	default:
+		c.JSON(http.StatusOK, gin.H{"commit_id": id, "deleted": true})
+	}
 }
 
 // tmxThreadIngest: PUT /tmx/archive/threads — upsert a batch of orchestrator threads

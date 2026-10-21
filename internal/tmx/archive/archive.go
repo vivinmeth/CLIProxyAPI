@@ -268,6 +268,16 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 			updated_at  TIMESTAMPTZ,
 			ingested_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		// Git commits (commits.go): the record as sent.
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.commits (
+			id           TEXT PRIMARY KEY,           -- <repo>@<sha>
+			repo         TEXT NOT NULL,
+			sha          TEXT NOT NULL,
+			machine      TEXT NOT NULL DEFAULT '',
+			doc          JSONB NOT NULL,             -- CommitIngest
+			committed_at TIMESTAMPTZ,
+			ingested_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
 		// Changes for the analytics worker (analytics.go), written with the change itself.
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.analytics_journal (
 			id         BIGSERIAL PRIMARY KEY,
