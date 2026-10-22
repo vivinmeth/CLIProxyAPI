@@ -7,7 +7,8 @@
 //   - long-context tiers: a prompt above the tier size is charged the tier's rates in full;
 //   - Anthropic 1-hour cache writes cost 2x the input rate (5-minute writes are the catalog's
 //     cache_write, 1.25x);
-//   - speed / service tier multipliers the catalog doesn't carry (see tierMultiplier).
+//   - speed / service tier multipliers the catalog doesn't carry (see tierMultiplier);
+//   - Meta's own list prices for the Muse models (metaPrices), over whatever the catalog says.
 package pricing
 
 import (
@@ -32,6 +33,32 @@ type Model struct {
 	// LongThreshold > 0: prompts above it are charged Long for the whole request.
 	LongThreshold int64 `json:"long_threshold,omitempty"`
 	Long          *Rate `json:"long,omitempty"`
+	// Source names where the rate came from when it isn't models.dev.
+	Source string `json:"source,omitempty"`
+}
+
+// metaPrices are Meta's pay-as-you-go API prices (USD per 1M tokens) from
+// dev.meta.ai/docs/pricing-rate-limits, checked 2026-10-22: no long-context premium, no separate
+// cache-write price (writes are charged as input). muse-wonder-full-1.0 and the Wonder contributor
+// variant have no API price and stay unpriced.
+var metaPrices = map[string]Rate{
+	"muse-wonder-1.0":            {Input: 4.00, Output: 20.00, CacheRead: 0.20, CacheWrite: 4.00},
+	"muse-spark-1.3":             {Input: 1.25, Output: 4.25, CacheRead: 0.15, CacheWrite: 1.25},
+	"muse-spark-1.2":             {Input: 1.25, Output: 4.25, CacheRead: 0.15, CacheWrite: 1.25},
+	"muse-spark-1.1":             {Input: 1.25, Output: 4.25, CacheRead: 0.15, CacheWrite: 1.25},
+	"muse-spark-1.3-contributor": {Input: 0.10, Output: 0.20, CacheRead: 0.002, CacheWrite: 0.10},
+	"muse-spark-1.2-contributor": {Input: 0.10, Output: 0.20, CacheRead: 0.002, CacheWrite: 0.10},
+}
+
+const metaPriceSource = "meta.ai"
+
+func addMetaPrices(cat Catalog) {
+	if cat["meta"] == nil {
+		cat["meta"] = map[string]Model{}
+	}
+	for id, r := range metaPrices {
+		cat["meta"][id] = Model{Rate: r, Source: metaPriceSource}
+	}
 }
 
 // Catalog: provider id -> lower-case model id -> prices. Only priced models are kept.
@@ -98,6 +125,7 @@ func ParseModelsDev(raw []byte) (Catalog, error) {
 	if len(cat) == 0 {
 		return nil, fmt.Errorf("price catalog is empty")
 	}
+	addMetaPrices(cat)
 	return cat, nil
 }
 
@@ -176,6 +204,11 @@ func (c Catalog) Resolve(provider, model string) (catProvider, catModel string, 
 				return p, id, mod, true
 			}
 		}
+	}
+	// Meta's own rows only take Meta's prices: a reseller listing a model Meta sells no API access
+	// to (muse-wonder-full-1.0) must not price subscription traffic.
+	if CatalogProvider(provider) == "meta" {
+		return "", "", Model{}, false
 	}
 	// Elsewhere only when every catalog entry for the id agrees on the price: resellers price the
 	// same id differently, and picking one of them would be arbitrary.
@@ -268,6 +301,9 @@ func (c Catalog) Price(u Usage) (Cost, bool) {
 		Output:     float64(u.Output) * r.Output / 1e6 * mult,
 		PricedAs:   note,
 		Source:     "models.dev",
+	}
+	if m.Source != "" {
+		cost.Source = m.Source
 	}
 	cost.Total = cost.Input + cost.CacheRead + cost.CacheWrite + cost.Output
 	if math.IsNaN(cost.Total) || math.IsInf(cost.Total, 0) {

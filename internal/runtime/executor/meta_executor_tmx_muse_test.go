@@ -7,8 +7,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -69,4 +71,59 @@ func TestMetaExecutor_MusePassesSubscriptionUsage(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Every Meta stream and non-stream answer turns subscription_usage into the credential's
+// X-Meta-Subscription-* quota signals (internal/tmx/quota reads them), whatever the client.
+func TestMetaExecutor_SubscriptionUsageBecomesQuotaSignals(t *testing.T) {
+	const usageData = `{"subscription":{"tier":"1234567890123456","weekly":{"resets_at":1792368000,"used_percent":3},"window":{"resets_at":1792272519,"used_percent":12,"window_duration_mins":300}},"type":"response.subscription_usage"}`
+	upstream := "event: response.subscription_usage\ndata: " + usageData + "\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"muse-spark-1.3\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, upstream)
+	}))
+	defer server.Close()
+	exec := NewMetaExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Provider: "meta", Attributes: map[string]string{"api_key": "k", "base_url": server.URL}}
+	want := map[string]string{
+		"X-Meta-Subscription-Window-Used-Percent":   "12",
+		"X-Meta-Subscription-Window-Reset-At":       "1792272519",
+		"X-Meta-Subscription-Window-Window-Minutes": "300",
+		"X-Meta-Subscription-Weekly-Used-Percent":   "3",
+		"X-Meta-Subscription-Weekly-Reset-At":       "1792368000",
+	}
+	check := func(t *testing.T, ctx context.Context) {
+		t.Helper()
+		got := logging.GetResponseHeaders(ctx)
+		for k, v := range want {
+			if got.Get(k) != v {
+				t.Fatalf("%s = %q, want %q (all: %v)", k, got.Get(k), v, got)
+			}
+		}
+		var q cliproxyauth.QuotaState
+		if !q.ObserveResponseHeadersForProvider("meta", got, time.Now()) || len(q.Signals) != len(want) {
+			t.Fatalf("meta quota observation kept %v", q.Signals)
+		}
+	}
+	payload := []byte(`{"model":"muse-spark-1.3","input":"hi"}`)
+	t.Run("stream", func(t *testing.T) {
+		ctx := logging.WithResponseHeadersHolder(context.Background())
+		res, err := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "muse-spark-1.3", Payload: payload},
+			cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range res.Chunks {
+		}
+		check(t, ctx)
+	})
+	t.Run("non-stream", func(t *testing.T) {
+		ctx := logging.WithResponseHeadersHolder(context.Background())
+		if _, err := exec.Execute(ctx, auth, cliproxyexecutor.Request{Model: "muse-spark-1.3", Payload: payload},
+			cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")}); err != nil {
+			t.Fatal(err)
+		}
+		check(t, ctx)
+	})
 }

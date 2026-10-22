@@ -89,7 +89,7 @@ type Row struct {
 	CostOutput     *float64   `json:"cost_output"`
 	CostUSD        *float64   `json:"cost_usd"`
 	PricedAs       string     `json:"priced_as"`
-	PriceSource    *string    `json:"price_source"` // models.dev | local | unpriced; NULL = not priced yet
+	PriceSource    *string    `json:"price_source"` // models.dev | meta.ai | local | unpriced; NULL = not priced yet
 	PricedAt       *time.Time `json:"priced_at"`    // fetch time of the catalog snapshot used
 	// Billing says what the cost was: subscription (API-equivalent, paid by a plan), api_key
 	// (real spend), local (free, own hardware), free (a free tier); "" when unknown.
