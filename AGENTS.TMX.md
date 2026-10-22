@@ -40,6 +40,12 @@ but are **parked**. Don't work there; see `../wiki/parked-fork-clones.md`.)
   items and mirrors `tmx.requests` + `exchanges`. Routes `/tmx/analytics/{status,backfill,search}`;
   `/tmx/archive/conversation` reads from it when the session is extracted. Integration tests need
   `TMX_ANALYTICS_TEST_DSN` (a second throwaway database). Details: `../wiki/analytics.md`.
+- **PR ingest + review verdicts** (`internal/tmx/archive/pullrequests.go`, `analytics_prs.go`,
+  `review.go`; routes in `internal/api/server_management_tmx_review.go`): GitHub PRs stored raw
+  (blobs) + versioned in `tmx_archive.pull_request*`, extracted to analytics `prs` / `pr_*`. The
+  analytics schema **`review`** is primary data (append-only, written by role `agents_rw` and
+  `/tmx/review/*`): never drop it, and never give review tables foreign keys into / views over
+  public objects (rebuilds truncate and recreate those). Tests: `review_test.go`.
 - **Reset credits** (`internal/tmx/resets/`): list/redeem Codex + Claude banked resets,
   `GET /tmx/resets`, `POST /tmx/resets/poll`, `GET /tmx/resets/history`, `POST /tmx/resets/redeem`
   (fleet contract `../wiki/reset-credits-api.md`; verdicts in `verdict.go`; routes + contract test in
