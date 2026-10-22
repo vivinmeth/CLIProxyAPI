@@ -9,13 +9,18 @@
 //     /api/oauth/profile every 6 h for the plan label.
 //
 // A snapshot row is written when a window's reading changes, and at least every 30 minutes as a
-// heartbeat, so history shows both burn rate and "nothing happened". Codex accounts are polled at
+// heartbeat, so history shows both burn rate and "nothing happened". A snapshot the database can't
+// take (it is down) goes to a durable on-disk spool and reaches the table later with its original
+// ts; a window counts as written only once its row is in the table. Codex accounts are polled at
 // chatgpt.com/backend-api/wham/usage (plan from the same payload); Codex API-key accounts are skipped.
 package quota
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -23,8 +28,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/durability"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/spool"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -191,6 +200,8 @@ type Service struct {
 	pollEvery  time.Duration
 	slowEvery  time.Duration
 	now        func() time.Time
+	spool      *spool.Spool // snapshots the database couldn't take; nil when it can't be opened
+	dropped    atomic.Int64 // snapshots lost without a spool (counted in Durability)
 
 	mu       sync.Mutex
 	accounts map[string]*account
@@ -226,6 +237,7 @@ func Start(db *sql.DB, schema string, fetch Fetcher, observers ...RoutingObserve
 		return nil
 	}
 	current = s
+	durability.Register("quota", s.Durability)
 	s.loopCtx, s.loopCancel = context.WithCancel(context.Background())
 	s.loopDone = make(chan struct{})
 	go s.loop()
@@ -265,6 +277,9 @@ func newService(ctx context.Context, db *sql.DB, schema string, fetch Fetcher, o
 		)`,
 		`CREATE INDEX IF NOT EXISTS quota_snapshots_auth_window_ts ON ` + s.table + ` (auth_id, "window", ts)`,
 		`CREATE INDEX IF NOT EXISTS quota_snapshots_ts ON ` + s.table + ` (ts)`,
+		// snap_key: set by the writer, makes a replayed (spooled) snapshot idempotent.
+		`ALTER TABLE ` + s.table + ` ADD COLUMN IF NOT EXISTS snap_key TEXT`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS quota_snapshots_snap_key ON ` + s.table + ` (snap_key) WHERE snap_key IS NOT NULL`,
 	} {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return nil, fmt.Errorf("quota schema: %w", err)
@@ -274,6 +289,17 @@ func newService(ctx context.Context, db *sql.DB, schema string, fetch Fetcher, o
 		return nil, err
 	}
 	s.seedRouting()
+	name := "quota"
+	if schema != "tmx" {
+		name += "-" + schema
+	}
+	sp, err := spool.OpenFirstFree(spool.Dir(name), spool.Options{Name: name, Deliver: s.deliverSpooled,
+		MaxBytes: spool.MaxBytesFromEnv("quota", spoolMaxBytes)})
+	if err != nil {
+		log.WithError(err).Error("tmx quota: NO DURABLE SPOOL, snapshots the database can't take will be dropped")
+	} else {
+		s.spool = sp
+	}
 	return s, nil
 }
 
@@ -497,12 +523,11 @@ func (s *Service) poll(ctx context.Context, spec providerSpec, auth *coreauth.Au
 }
 
 // record updates current state and writes a snapshot for windows that changed or are due a
-// heartbeat. Older readings never overwrite newer ones.
+// heartbeat. Older readings never overwrite newer ones. A window is marked written only once its
+// row is in the table: a snapshot the database can't take now is spooled to disk (and marked
+// written when the replay lands it), one it refuses for its content is dead-lettered.
 func (s *Service) record(ctx context.Context, authID string, windows []Window, source string, at time.Time) {
-	type pending struct {
-		w Window
-	}
-	var toWrite []pending
+	var toWrite []snapshotRecord
 	s.mu.Lock()
 	a := s.accountLocked(authID)
 	label, provider, plan := a.Label, a.Provider, a.Plan
@@ -518,17 +543,142 @@ func (s *Service) record(ctx context.Context, authID string, windows []Window, s
 		if ok && !changed(last, w) && at.Sub(last.writtAt) < heartbeatEvery {
 			continue
 		}
-		a.written[w.Window] = written{used: w.UsedPct, resets: w.ResetsAt, status: w.Status, writtAt: at}
-		toWrite = append(toWrite, pending{w: w})
+		toWrite = append(toWrite, snapshotRecord{Key: newSnapKey(), TS: at, AuthID: authID, Provider: provider,
+			Label: label, Plan: plan, Window: w.Window, UsedPct: w.UsedPct, ResetsAt: w.ResetsAt, Status: w.Status,
+			Source: source})
 	}
 	s.mu.Unlock()
-	for _, p := range toWrite {
-		if _, err := s.db.ExecContext(ctx, `INSERT INTO `+s.table+` (ts, auth_id, provider, label, plan,
-			"window", used_pct, resets_at, status, source) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-			at, authID, provider, label, plan, p.w.Window, p.w.UsedPct, p.w.ResetsAt, p.w.Status, source); err != nil {
-			log.WithError(err).Warn("tmx quota: snapshot write failed")
+	for _, rec := range toWrite {
+		if s.spool != nil && s.spool.Failing() {
+			s.spoolSnapshot(rec) // the database is known to be down: don't wait on it
+			continue
+		}
+		err := s.insertSnapshot(ctx, rec)
+		switch {
+		case err == nil:
+			s.markWritten(rec)
+			if s.spool != nil {
+				s.spool.Recovered()
+			}
+		case isDataError(err):
+			log.WithError(err).Warnf("tmx quota: snapshot refused (%s %s), dead-lettered", authID, rec.Window)
+			s.deadletter(rec, err)
+		default:
+			log.WithError(err).Warn("tmx quota: snapshot write failed; spooled to disk for retry")
+			if s.spool != nil {
+				s.spool.NoteError(err)
+			}
+			s.spoolSnapshot(rec)
 		}
 	}
+}
+
+// spoolMaxBytes: default cap of the quota spool (TMX_SPOOL_QUOTA_MAX_MB).
+const spoolMaxBytes = 256 << 20
+
+// snapshotRecord is one quota_snapshots row as written and as spooled.
+type snapshotRecord struct {
+	Key      string     `json:"key"`
+	TS       time.Time  `json:"ts"`
+	AuthID   string     `json:"auth_id"`
+	Provider string     `json:"provider"`
+	Label    string     `json:"label"`
+	Plan     string     `json:"plan"`
+	Window   string     `json:"window"`
+	UsedPct  *float64   `json:"used_pct"`
+	ResetsAt *time.Time `json:"resets_at"`
+	Status   string     `json:"status"`
+	Source   string     `json:"source"`
+}
+
+func newSnapKey() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// insertSnapshot writes one snapshot; a replay of one that already committed inserts nothing.
+func (s *Service) insertSnapshot(ctx context.Context, r snapshotRecord) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO `+s.table+` (ts, auth_id, provider, label, plan,
+		"window", used_pct, resets_at, status, source, snap_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		ON CONFLICT (snap_key) WHERE snap_key IS NOT NULL DO NOTHING`,
+		r.TS, r.AuthID, r.Provider, r.Label, r.Plan, r.Window, r.UsedPct, r.ResetsAt, r.Status, r.Source, r.Key)
+	return err
+}
+
+// markWritten records r as the window's last written reading unless a newer one already is.
+func (s *Service) markWritten(r snapshotRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := s.accountLocked(r.AuthID)
+	if last, ok := a.written[r.Window]; ok && last.writtAt.After(r.TS) {
+		return
+	}
+	a.written[r.Window] = written{used: r.UsedPct, resets: r.ResetsAt, status: r.Status, writtAt: r.TS}
+}
+
+func (s *Service) spoolSnapshot(r snapshotRecord) {
+	payload, _ := json.Marshal(r)
+	if s.spool == nil {
+		if s.dropped.Add(1)%20 == 1 {
+			log.Errorf("tmx quota: SNAPSHOT DROPPED, no spool to keep it (%d dropped since start)", s.dropped.Load())
+		}
+		return
+	}
+	_ = s.spool.Append(payload) // a failed append is counted (and logged) by the spool
+}
+
+func (s *Service) deadletter(r snapshotRecord, err error) {
+	payload, _ := json.Marshal(r)
+	if s.spool == nil {
+		s.dropped.Add(1)
+		return
+	}
+	_ = s.spool.Deadletter(payload, err.Error())
+}
+
+// deliverSpooled is the spool's replay sink.
+func (s *Service) deliverSpooled(ctx context.Context, items []spool.Item) (int, error) {
+	for i, it := range items {
+		raw, err := it.Bytes()
+		if err != nil {
+			return i, err
+		}
+		var r snapshotRecord
+		if err = json.Unmarshal(raw, &r); err != nil {
+			return i, spool.Permanent(fmt.Errorf("undecodable spooled snapshot: %w", err))
+		}
+		if err = s.insertSnapshot(ctx, r); err != nil {
+			if isDataError(err) {
+				return i, spool.Permanent(err)
+			}
+			return i, err
+		}
+		s.markWritten(r)
+	}
+	return len(items), nil
+}
+
+// isDataError: the database refused the row's content (data exception or integrity violation);
+// retrying it would fail again.
+func isDataError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || len(pgErr.Code) < 2 {
+		return false
+	}
+	return pgErr.Code[:2] == "22" || pgErr.Code[:2] == "23"
+}
+
+// Durability is the quota writer's entry in GET /tmx/durability.
+func (s *Service) Durability() durability.Stats {
+	var d durability.Stats
+	if s.spool != nil {
+		d = s.spool.Stats()
+	}
+	d.Dropped += s.dropped.Load()
+	return d
 }
 
 func changed(last written, w Window) bool {

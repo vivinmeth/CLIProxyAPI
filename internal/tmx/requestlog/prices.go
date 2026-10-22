@@ -4,7 +4,8 @@ package requestlog
 // the catalog snapshot loaded at that moment, and keeps that cost: a later price change or a model
 // leaving the catalog never rewrites history. Snapshots of the models.dev catalog are kept in
 // <schema>.price_catalogs (fetched daily; the latest is loaded at start), so pricing works offline
-// and every row's priced_at names the snapshot that priced it.
+// and every row's priced_at names the snapshot that priced it. Snapshots are never deleted; a
+// fetch identical to the latest stored one (same source and catalog) is not stored again.
 //
 // Rows written while no catalog is loaded stay NULL (price_source IS NULL) and are priced by the
 // hourly pass; rows of models the catalog doesn't know are "unpriced" and retried once a day.
@@ -29,13 +30,13 @@ const (
 	pricesCatalogURL = "https://models.dev/api.json"
 	pricesFetchEvery = 24 * time.Hour
 	pricesPassEvery  = time.Hour
-	pricesKeep       = 30 // snapshots kept
 	pricesBatch      = 2000
 )
 
 type priceSnapshot struct {
 	cat       pricing.Catalog
-	fetchedAt time.Time
+	fetchedAt time.Time // the stored snapshot's key (rows' priced_at)
+	checkedAt time.Time // last time models.dev confirmed it (in memory; fetchedAt after a restart)
 }
 
 // priceRow fills r's cost columns from snap (nil snap leaves the row pending).
@@ -75,7 +76,7 @@ func (s *Store) pricesLoop() {
 	}
 	retryUnpriced := true
 	for {
-		if snap := s.priceSnap(); !pricesFetchOff() && (snap == nil || time.Since(snap.fetchedAt) >= pricesFetchEvery) {
+		if snap := s.priceSnap(); !pricesFetchOff() && (snap == nil || time.Since(snap.checkedAt) >= pricesFetchEvery) {
 			if fresh, err := s.fetchSnapshot(ctx); err != nil {
 				log.WithError(err).Warn("tmx request log: price catalog unavailable; keeping the current one")
 			} else {
@@ -118,10 +119,11 @@ func (s *Store) loadSnapshot(ctx context.Context) (*priceSnapshot, error) {
 	if err = json.Unmarshal(body, &cat); err != nil {
 		return nil, err
 	}
-	return &priceSnapshot{cat: cat, fetchedAt: at.UTC()}, nil
+	return &priceSnapshot{cat: cat, fetchedAt: at.UTC(), checkedAt: at.UTC()}, nil
 }
 
-// fetchSnapshot downloads the catalog, stores it as a new snapshot and returns it.
+// fetchSnapshot downloads the catalog and returns it, stored as a new snapshot unless it is
+// identical to the latest stored one (then that snapshot is returned, so priced_at keeps naming it).
 func (s *Store) fetchSnapshot(ctx context.Context) (*priceSnapshot, error) {
 	url := pricesCatalogURL
 	if v := strings.TrimSpace(os.Getenv("TMX_PRICES_CATALOG_URL")); v != "" {
@@ -153,14 +155,23 @@ func (s *Store) fetchSnapshot(ctx context.Context) (*priceSnapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	at := time.Now().UTC().Truncate(time.Microsecond)
+	now := time.Now().UTC()
+	var latest time.Time
+	var same bool
+	err = s.db.QueryRowContext(ctx, `SELECT fetched_at, source = $1 AND catalog = $2::jsonb FROM `+s.schema+`.price_catalogs
+		ORDER BY fetched_at DESC LIMIT 1`, url, string(body)).Scan(&latest, &same)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if err == nil && same {
+		return &priceSnapshot{cat: cat, fetchedAt: latest.UTC(), checkedAt: now}, nil
+	}
+	at := now.Truncate(time.Microsecond)
 	if _, err = s.db.ExecContext(ctx, `INSERT INTO `+s.schema+`.price_catalogs (fetched_at, source, catalog)
 		VALUES ($1, $2, $3)`, at, url, string(body)); err != nil {
 		return nil, err
 	}
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM `+s.schema+`.price_catalogs WHERE fetched_at NOT IN (
-		SELECT fetched_at FROM `+s.schema+`.price_catalogs ORDER BY fetched_at DESC LIMIT $1)`, pricesKeep)
-	return &priceSnapshot{cat: cat, fetchedAt: at}, nil
+	return &priceSnapshot{cat: cat, fetchedAt: at, checkedAt: now}, nil
 }
 
 // pricePending prices rows that have no price yet (and, when retryUnpriced, rows whose model the
@@ -287,7 +298,7 @@ func textArray(v []string) string {
 // SetPriceCatalogForTest installs a catalog snapshot (tests; set TMX_PRICES=off before Open so
 // the loop doesn't fetch one).
 func (s *Store) SetPriceCatalogForTest(cat pricing.Catalog, at time.Time) {
-	s.prices.Store(&priceSnapshot{cat: cat, fetchedAt: at.UTC()})
+	s.prices.Store(&priceSnapshot{cat: cat, fetchedAt: at.UTC(), checkedAt: at.UTC()})
 }
 
 // PricePending runs one pricing pass now (rows without a price; with retryUnpriced also rows

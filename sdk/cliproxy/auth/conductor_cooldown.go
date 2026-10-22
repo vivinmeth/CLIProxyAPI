@@ -587,6 +587,7 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	auth.Generation++
 	auth.UpdatedAt = now
 	snapshot = auth.Clone()
+	m.tmxReportCooldownsLocked(auth, now) // tmx
 	if trackCooldownState {
 		cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
 		cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
@@ -900,6 +901,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			releaseMutation()
 			m.hook.OnResult(ctx, result)
 			m.publishErrorEvent(result, nil)
+			tmxReportFailure(result, nil) // tmx
 			return
 		}
 		if modelKey == "" && strings.TrimSpace(result.RouteModel) != "" {
@@ -1325,6 +1327,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 		_ = m.persistLocked(ctx, auth)
 		authSnapshot = auth.Clone()
+		m.tmxReportCooldownsLocked(auth, now) // tmx
 		if trackCooldownState {
 			cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
 			cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
@@ -1371,6 +1374,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+	tmxReportFailure(result, authSnapshot) // tmx
 	m.updateSessionAffinity(result)
 }
 

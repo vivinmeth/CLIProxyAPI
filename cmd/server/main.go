@@ -35,6 +35,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/safemode"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/store"
 	tmxarchive "github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/archive"
+	tmxpool "github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/pool"
 	tmxquota "github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/quota"
 	tmxrequestlog "github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
@@ -691,6 +692,7 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = tmxquota.Default().CloseContext(ctx)
+		_ = tmxpool.DefaultRecorder().CloseContext(ctx)
 		_ = tmxArchive.CloseContext(ctx)
 		_ = tmxRequestLog.CloseContext(ctx)
 	}()

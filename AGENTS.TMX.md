@@ -40,6 +40,12 @@ but are **parked**. Don't work there; see `../wiki/parked-fork-clones.md`.)
   items and mirrors `tmx.requests` + `exchanges`. Routes `/tmx/analytics/{status,backfill,search}`;
   `/tmx/archive/conversation` reads from it when the session is extracted. Integration tests need
   `TMX_ANALYTICS_TEST_DSN` (a second throwaway database). Details: `../wiki/analytics.md`.
+- **PR ingest + review verdicts** (`internal/tmx/archive/pullrequests.go`, `analytics_prs.go`,
+  `review.go`; routes in `internal/api/server_management_tmx_review.go`): GitHub PRs stored raw
+  (blobs) + versioned in `tmx_archive.pull_request*`, extracted to analytics `prs` / `pr_*`. The
+  analytics schema **`review`** is primary data (append-only, written by role `agents_rw` and
+  `/tmx/review/*`): never drop it, and never give review tables foreign keys into / views over
+  public objects (rebuilds truncate and recreate those). Tests: `review_test.go`.
 - **Reset credits** (`internal/tmx/resets/`): list/redeem Codex + Claude banked resets,
   `GET /tmx/resets`, `POST /tmx/resets/poll`, `GET /tmx/resets/history`, `POST /tmx/resets/redeem`
   (fleet contract `../wiki/reset-credits-api.md`; verdicts in `verdict.go`; routes + contract test in
@@ -53,6 +59,16 @@ but are **parked**. Don't work there; see `../wiki/parked-fork-clones.md`.)
   `response.subscription_usage` passed to Muse clients (`meta_executor_stream.go` +
   `isMuseClient` on the Responses SSE framer), harness `muse-code` (`ClientID` on
   `logging.ClientRequestMetadata`, set in `sdk/api/handlers/handlers.go`). Details: `../wiki/muse-code.md`.
+- **Cooldown history** (`internal/tmx/cooldowns/`): append-only `tmx.cooldown_events` (windows as
+  start/update/end sharing a `cooldown_id`, plus 429 / usage-limit / auth-error / 529 events), a
+  backstop trigger on `cliproxy.cooldown_store`, `GET /tmx/cooldowns/{history,stats}`. Upstream
+  hooks: `sdk/cliproxy/auth/tmx_cooldown_events.go` + `// tmx` lines in `conductor_cooldown.go`,
+  start in `service_lifecycle.go`. Integration tests need `TMX_COOLDOWNS_TEST_DSN`.
+- **Durable spool** (`internal/tmx/spool/`, registry `internal/tmx/durability/`): writers that
+  can't reach Postgres (request log, quota snapshots, archive capture) append to an fsynced
+  on-disk spool under `<archive spool volume>/durable/<writer>` and replay with backoff; refused
+  items go to `deadletter/` (never deleted). Counters: `GET /v8/management/tmx/durability`. New
+  writers register with `durability.Register(name, fn)`. Details: `../wiki/durability-spool.md`.
 - Put new fork-only code under `internal/tmx/` and keep upstream-file edits to small hooks.
 
 ## Git

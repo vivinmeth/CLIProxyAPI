@@ -14,7 +14,9 @@ func (s *Service) CloseContext(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return s.FlushPassiveContext(ctx)
+	err := s.FlushPassiveContext(ctx)
+	s.spool.Close() // spooled snapshots are replayed by the next start
+	return err
 }
 
 // FlushPassiveContext checkpoints current per-window observations without stopping polling.

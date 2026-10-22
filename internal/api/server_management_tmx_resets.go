@@ -27,6 +27,7 @@ func registerTMXResetRoutes(v8 *gin.RouterGroup, backend resets.Backend) {
 	v8.GET("/tmx/resets", tmxResetsList)
 	v8.POST("/tmx/resets/poll", tmxResetsPoll)
 	v8.GET("/tmx/resets/history", tmxResetsHistory)
+	v8.GET("/tmx/resets/balance-history", tmxResetsBalanceHistory)
 	v8.POST("/tmx/resets/redeem", tmxResetsRedeem)
 }
 
@@ -137,6 +138,43 @@ func tmxResetsHistory(c *gin.Context) {
 		next = items[len(items)-1].ID
 	}
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "items": items, "next_before_id": next})
+}
+
+// tmxResetsBalanceHistory: GET /tmx/resets/balance-history?from&to&auth_id&provider&source&after_id&limit
+// — every stored read of an account's banked credits, oldest first. from/to are unix seconds
+// (default the last 24 hours); limit ≤ 10000 (default 1000). Pass next_after_id back as after_id
+// for the following page; 0 on the last page.
+func tmxResetsBalanceHistory(c *gin.Context) {
+	svc := resets.Default()
+	if svc == nil {
+		c.JSON(http.StatusOK, gin.H{"enabled": false, "items": []any{}, "next_after_id": 0})
+		return
+	}
+	from, to, ok := tmxRange(c)
+	if !ok {
+		return
+	}
+	q := resets.BalanceQuery{From: from, To: to, AuthID: strings.TrimSpace(c.Query("auth_id")),
+		Provider: strings.ToLower(strings.TrimSpace(c.Query("provider"))), Source: strings.TrimSpace(c.Query("source"))}
+	if raw := strings.TrimSpace(c.Query("after_id")); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid after_id"})
+			return
+		}
+		q.AfterID = n
+	}
+	q.Limit, _ = strconv.Atoi(c.DefaultQuery("limit", "1000"))
+	items, next, err := svc.BalanceHistory(c.Request.Context(), q)
+	if errors.Is(err, resets.ErrNoBalanceHistory) {
+		c.JSON(http.StatusOK, gin.H{"enabled": false, "items": []any{}, "next_after_id": 0})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "items": items, "next_after_id": next, "stats": svc.BalanceStats()})
 }
 
 // redeemActor: optional caller label (e.g. "fleet-ui:vivin"), printable and bounded, plus the

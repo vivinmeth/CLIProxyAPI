@@ -3,6 +3,7 @@ package api
 // tokenmaxx fork: management routes for the persistent request log (internal/tmx/requestlog).
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/archive"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/pool"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/probes"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/quota"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -22,26 +24,11 @@ const tmxMaxSummaryRange = 400 * 24 * time.Hour
 
 func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher, mgr *auth.Manager) {
 	v8.GET("/tmx/pool", func(c *gin.Context) {
-		var auths []*auth.Auth
-
-		var counts map[string]int
-		var counter pool.InFlightCounter
-		if mgr != nil {
-			auths = mgr.List()
-			counts = mgr.BoundSessionCounts()
-			counter = mgr
-		} else if fetcher != nil {
-			auths = fetcher.TmxAuths()
-		}
-		if adapter, ok := fetcher.(pool.InFlightCounter); ok && mgr == nil {
-			counter = adapter
-		}
-		var accounts []quota.Account
-		if svc := quota.Default(); svc != nil {
-			accounts = svc.Accounts()
-		}
-		c.JSON(http.StatusOK, pool.Build(c.Request.Context(), auths, counts, accounts, counter, c.Query("model")))
+		c.JSON(http.StatusOK, tmxPoolBuild(c.Request.Context(), fetcher, mgr, c.Query("model")))
 	})
+	v8.GET("/tmx/pool/history", tmxPoolHistory)
+	// Health-check / discovery probes counted instead of written as error logs (internal/tmx/probes).
+	v8.GET("/tmx/probes", func(c *gin.Context) { c.JSON(http.StatusOK, probes.Snapshot()) })
 	v8.GET("/tmx/requests/summary", tmxRequestSummary)
 	v8.GET("/tmx/requests", tmxRequestList)
 	v8.GET("/tmx/requests/rollup", tmxRequestRollup)
@@ -49,16 +36,77 @@ func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher, mgr
 	v8.GET("/tmx/requests/key-machines", tmxKeyMachinesList)
 	v8.POST("/tmx/requests/key-machines", tmxKeyMachinesSet)
 	registerTMXArchiveRoutes(v8)
+	registerTMXReviewRoutes(v8)
+	registerTMXDurabilityRoutes(v8) // server_management_tmx_durability.go
 	if store := requestlog.Default(); store != nil {
 		var observers []quota.RoutingObserver
 		if mgr != nil {
 			observers = append(observers, mgr)
 		}
 		quota.Start(store.DB(), store.Schema(), fetcher, observers...)
+		if mgr != nil || fetcher != nil {
+			pool.StartRecorder(store.DB(), store.Schema(), func(ctx context.Context) pool.Snapshot {
+				return tmxPoolBuild(ctx, fetcher, mgr, "")
+			})
+		}
 	}
 	v8.GET("/tmx/quota/current", tmxQuotaCurrent)
 	v8.GET("/tmx/quota/history", tmxQuotaHistory)
 	v8.POST("/tmx/quota/poll", tmxQuotaPoll)
+}
+
+// tmxPoolBuild is the /tmx/pool projection (also what the pool history recorder stores).
+func tmxPoolBuild(ctx context.Context, fetcher quota.Fetcher, mgr *auth.Manager, model string) pool.Snapshot {
+	var auths []*auth.Auth
+	var counts map[string]int
+	var counter pool.InFlightCounter
+	if mgr != nil {
+		auths = mgr.List()
+		counts = mgr.BoundSessionCounts()
+		counter = mgr
+	} else if fetcher != nil {
+		auths = fetcher.TmxAuths()
+	}
+	if adapter, ok := fetcher.(pool.InFlightCounter); ok && mgr == nil {
+		counter = adapter
+	}
+	var accounts []quota.Account
+	if svc := quota.Default(); svc != nil {
+		accounts = svc.Accounts()
+	}
+	return pool.Build(ctx, auths, counts, accounts, counter, model)
+}
+
+// tmxPoolHistory: GET /tmx/pool/history?from&to&auth_id&after_id&limit — stored pool snapshots
+// (one row per credential per snapshot), oldest first. from/to are unix seconds (default the last
+// 24 hours); auth_id is the masked id /tmx/pool shows; limit ≤ 10000 (default 1000). Pass
+// next_after_id back as after_id for the following page; 0 on the last page.
+func tmxPoolHistory(c *gin.Context) {
+	rec := pool.DefaultRecorder()
+	if rec == nil {
+		c.JSON(http.StatusOK, gin.H{"enabled": false, "items": []any{}, "next_after_id": 0})
+		return
+	}
+	from, to, ok := tmxRange(c)
+	if !ok {
+		return
+	}
+	q := pool.HistoryQuery{From: from, To: to, AuthID: strings.TrimSpace(c.Query("auth_id"))}
+	if raw := strings.TrimSpace(c.Query("after_id")); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid after_id"})
+			return
+		}
+		q.AfterID = n
+	}
+	q.Limit, _ = strconv.Atoi(c.DefaultQuery("limit", "1000"))
+	items, next, err := rec.History(c.Request.Context(), q)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "items": items, "next_after_id": next, "stats": rec.Stats()})
 }
 
 // tmxQuotaCurrent: GET /tmx/quota/current — latest reading of every window of every account.
@@ -383,6 +431,7 @@ func registerTMXArchiveRoutes(v8 *gin.RouterGroup) {
 	g.GET("/conversation", tmxArchive(tmxConversation))
 	g.GET("/exchanges", tmxArchive(tmxExchangeList))
 	g.GET("/exchanges/:trace", tmxArchive(tmxExchangeGet))
+	registerTMXArchiveIngestRoutes(g) // prompts, attachments, appended session files
 
 	// Derived query layer (archive/analytics.go): its own Postgres, fed from the archive.
 	an := v8.Group("/tmx/analytics")

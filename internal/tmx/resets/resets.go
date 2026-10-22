@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,14 +34,15 @@ import (
 )
 
 const (
-	cacheTTL       = 5 * time.Minute
-	refreshMinGap  = 30 * time.Second
-	readTimeout    = 15 * time.Second
-	codexTimeout   = 20 * time.Second
-	claudeTimeout  = 25 * time.Second
-	pendingReuse   = 24 * time.Hour
-	readParallel   = 4
-	historyDefault = 20
+	cacheTTL        = 5 * time.Minute
+	refreshMinGap   = 30 * time.Second
+	readTimeout     = 15 * time.Second
+	codexTimeout    = 20 * time.Second
+	claudeTimeout   = 25 * time.Second
+	pendingReuse    = 24 * time.Hour
+	readParallel    = 4
+	historyDefault  = 20
+	defaultPollMins = 60
 
 	claudeStatusURL  = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"
 	claudeProfileURL = "https://api.anthropic.com/api/oauth/profile"
@@ -135,9 +137,10 @@ type cached struct {
 
 // Service holds the credit inventory cache and the claim journal.
 type Service struct {
-	backend Backend
-	journal journal
-	now     func() time.Time
+	backend  Backend
+	journal  journal
+	balances *balanceLog // nil without a database
+	now      func() time.Time
 
 	mu    sync.Mutex
 	cache map[string]*cached
@@ -177,6 +180,7 @@ func Start(db *sql.DB, schema string, backend Backend) *Service {
 		return nil
 	}
 	var j journal = newMemJournal()
+	var balances *balanceLog
 	if db != nil {
 		pj, err := newPGJournal(context.Background(), db, schema)
 		if err != nil {
@@ -184,10 +188,41 @@ func Start(db *sql.DB, schema string, backend Backend) *Service {
 			return nil
 		}
 		j = pj
+		if balances, err = newBalanceLog(context.Background(), db, schema); err != nil {
+			log.WithError(err).Warn("tmx resets: balance history off")
+		}
 	}
 	current = New(backend, j)
+	current.balances = balances
+	if every := pollEvery(); every > 0 && balances != nil {
+		go current.pollLoop(every)
+	}
 	log.Info("tmx resets: ready")
 	return current
+}
+
+// pollEvery reads TMX_RESETS_POLL_MINUTES (default 60; 0 or "off" disables the background poll).
+func pollEvery() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("TMX_RESETS_POLL_MINUTES"))
+	if strings.EqualFold(raw, "off") {
+		return 0
+	}
+	if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+		return time.Duration(n) * time.Minute
+	}
+	return defaultPollMins * time.Minute
+}
+
+// pollLoop re-reads every account's credits (only those not read within the cache TTL) so the
+// balance history has a reading at least every interval even when nobody opens the list.
+func (s *Service) pollLoop(every time.Duration) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for range ticker.C {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		s.Accounts(ctx, false)
+		cancel()
+	}
 }
 
 // New builds a service (tests use it with a memory journal).
@@ -369,7 +404,7 @@ func (s *Service) Accounts(ctx context.Context, refresh bool) []Account {
 		go func(j job) {
 			defer func() { <-sem; wg.Done() }()
 			acct := s.read(ctx, j.auth, j.provider)
-			s.store(acct)
+			s.store(acct, SourcePoll)
 		}(j)
 	}
 	wg.Wait()
@@ -418,7 +453,7 @@ func (s *Service) PollNow(ctx context.Context, authID string) (*Account, bool, e
 	throttled := c != nil && s.now().Sub(c.readAt) < refreshMinGap
 	s.mu.Unlock()
 	if !throttled {
-		s.store(s.read(ctx, auth, provider))
+		s.store(s.read(ctx, auth, provider), SourceManual)
 	}
 	pending, errPending := s.journal.unsettled(ctx, s.now().Add(-pendingReuse))
 	if errPending != nil {
@@ -434,8 +469,10 @@ func (s *Service) PollNow(ctx context.Context, authID string) (*Account, bool, e
 	return &acct, throttled, nil
 }
 
-// store caches a reading, keeping the previous credits when the new read failed outright.
-func (s *Service) store(acct Account) {
+// store records a reading in the balance history and caches it, keeping the previous credits
+// when the new read failed outright.
+func (s *Service) store(acct Account, source string) {
+	s.recordBalance(acct, source)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if prev := s.cache[acct.AuthID]; prev != nil && acct.Error != "" && len(acct.Windows) == 0 && len(acct.Credits) == 0 {
@@ -512,7 +549,7 @@ func (s *Service) Redeem(ctx context.Context, authID, creditID, actor string) (*
 		return nil, fmt.Errorf("reading claim journal: %w", err)
 	}
 	before := s.read(ctx, auth, provider)
-	s.store(before)
+	s.store(before, SourceRedeem)
 	var clears []string
 	title := ""
 	if prior == nil {
@@ -582,7 +619,7 @@ func (s *Service) Redeem(ctx context.Context, authID, creditID, actor string) (*
 	if settles(outcome) {
 		// Verify first, then release only what recovered.
 		after := s.readUsage(context.Background(), auth, provider, true)
-		s.store(after)
+		s.store(after, SourceRedeem)
 		var afterWindows []Window
 		if after.Error == "" {
 			afterWindows = after.Windows

@@ -109,3 +109,26 @@ func TestRedeemActor(t *testing.T) {
 		t.Fatalf("not bounded: %d", len(got))
 	}
 }
+
+// Without the request-log database there is no balance history: enabled false, never an error.
+func TestTMXResetsBalanceHistoryWithoutDatabase(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resets.SetDefaultForTest(nil)
+	t.Cleanup(func() { resets.SetDefaultForTest(nil) })
+	r := gin.New()
+	registerTMXResetRoutes(r.Group("/v8/management"), resetsTestBackend{})
+	for path, want := range map[string]int{
+		"/v8/management/tmx/resets/balance-history":            200,
+		"/v8/management/tmx/resets/balance-history?from=x":     400,
+		"/v8/management/tmx/resets/balance-history?after_id=y": 400,
+	} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != want {
+			t.Fatalf("%s: %d %s", path, w.Code, w.Body.String())
+		}
+		if want == 200 && w.Body.String() != `{"enabled":false,"items":[],"next_after_id":0}` {
+			t.Fatalf("%s: %s", path, w.Body.String())
+		}
+	}
+}

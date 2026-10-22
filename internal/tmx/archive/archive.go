@@ -21,7 +21,9 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/capture"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/durability"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
+	tmxspool "github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/spool"
 	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	log "github.com/sirupsen/logrus"
 )
@@ -30,7 +32,7 @@ const (
 	schema             = "tmx_archive"
 	defaultBucket      = "tmx-bodies"
 	defaultSpool       = "/CLIProxyAPI/archive-spool"
-	queueBytesLimit    = 256 << 20 // in-flight exchange bytes before new captures are dropped
+	queueBytesLimit    = 256 << 20 // in-flight exchange bytes before new captures go to the disk spool
 	queueLengthLimit   = 4096
 	captureWorkerCount = 2
 )
@@ -48,8 +50,10 @@ type Archive struct {
 	queue         chan *capture.Exchange
 	queueBytes    atomic.Int64
 	captured      atomic.Int64
-	dropped       atomic.Int64
-	failed        atomic.Int64
+	dropped       atomic.Int64 // lost: no durable spool to keep them
+	failed        atomic.Int64 // live stores that failed (the exchange was spooled)
+	overflowed    atomic.Int64 // exchanges the queue couldn't take (spooled)
+	spool         *tmxspool.Spool
 	wg            sync.WaitGroup
 	closeOnce     sync.Once
 	closeWaitOnce sync.Once
@@ -74,6 +78,7 @@ func Default() *Archive { return current.Load() }
 //	TMX_ARCHIVE_BUCKET               default tmx-bodies
 //	TMX_ARCHIVE_SPOOL                local spool dir (default /CLIProxyAPI/archive-spool; mount a volume)
 //	TMX_ARCHIVE_CAPTURE=off          keep the ingest API but don't capture proxied traffic
+//	TMX_SPOOL_ARCHIVE_MAX_MB         cap of the durable spool (<spool>/durable/archive, durable.go)
 //
 // Without R2 credentials blobs stay in the spool (dev). Failures never block startup.
 func StartFromEnv(ctx context.Context) *Archive {
@@ -121,6 +126,8 @@ func StartFromEnv(ctx context.Context) *Archive {
 	}
 	a.startAnalytics(ctx)
 	current.Store(a)
+	durability.Register("archive", a.Durability)
+	durability.Register("capture", captureDurability)
 	go func() {
 		// Imported usage rows written when a whole session was shadowed get their direct turns back.
 		if n, errR := a.Reshadow(context.Background()); errR != nil {
@@ -169,6 +176,7 @@ func Open(ctx context.Context, dsn string, r2 *minio.Client, bucket, env, spool 
 		return nil, err
 	}
 	a := &Archive{db: db, blobs: blobs, env: env, queue: make(chan *capture.Exchange, queueLengthLimit)}
+	a.openSpool(spool)
 	for i := 0; i < captureWorkerCount; i++ {
 		a.wg.Add(1)
 		go a.worker()
@@ -281,6 +289,110 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 			committed_at TIMESTAMPTZ,
 			ingested_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		// Prompt history lines (prompts.go): the raw line is the blob line_hash. Append-only.
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.prompt_history (
+			id            TEXT PRIMARY KEY,          -- PromptKey(machine, harness, line_hash)
+			machine       TEXT NOT NULL,
+			harness       TEXT NOT NULL,
+			line_hash     TEXT NOT NULL,             -- sha256 of the raw line = its blob
+			ts            TIMESTAMPTZ,
+			project       TEXT NOT NULL DEFAULT '',
+			cwd           TEXT NOT NULL DEFAULT '',
+			session_id    TEXT NOT NULL DEFAULT '',  -- the harness's session id, when the line has one
+			session_key   TEXT NOT NULL DEFAULT '',  -- <harness>:<session_id> (sessions.id)
+			text_hash     TEXT NOT NULL DEFAULT '',  -- sha256 of the prompt text
+			text_bytes    BIGINT NOT NULL DEFAULT 0,
+			source_file   TEXT NOT NULL DEFAULT '',
+			line_no       BIGINT NOT NULL DEFAULT 0,
+			parse_warning TEXT NOT NULL DEFAULT '',
+			ingested_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (machine, harness, line_hash)
+		)`,
+		`CREATE INDEX IF NOT EXISTS prompt_history_ts_idx ON ` + schema + `.prompt_history (ts DESC)`,
+		`CREATE INDEX IF NOT EXISTS prompt_history_session_idx ON ` + schema + `.prompt_history (session_key) WHERE session_key <> ''`,
+		// Files kept next to transcripts (attachments.go). Append-only; no FK, so they outlive a
+		// session delete.
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.session_attachments (
+			id            TEXT PRIMARY KEY,          -- AttachmentKey(...)
+			harness       TEXT NOT NULL,
+			session_id    TEXT NOT NULL DEFAULT '',
+			session_key   TEXT NOT NULL DEFAULT '',
+			machine       TEXT NOT NULL DEFAULT '',
+			path          TEXT NOT NULL,
+			external_path TEXT NOT NULL DEFAULT '',
+			content_type  TEXT NOT NULL DEFAULT '',
+			size          BIGINT NOT NULL,
+			sha256        TEXT NOT NULL,             -- the blob
+			mtime         TIMESTAMPTZ,
+			metadata      JSONB NOT NULL DEFAULT '{}',
+			ingested_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS session_attachments_session_idx ON ` + schema + `.session_attachments (session_key, path)`,
+		`CREATE INDEX IF NOT EXISTS session_attachments_ingested_idx ON ` + schema + `.session_attachments (ingested_at DESC)`,
+		// Appended transcript chunks (files.go): the logical file is a generation's chunks in seq
+		// order. Append-only.
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.session_file_chunks (
+			session_id  TEXT NOT NULL,               -- <harness>:<external_id>
+			name        TEXT NOT NULL,               -- source name
+			generation  INTEGER NOT NULL,
+			seq         INTEGER NOT NULL,
+			"offset"    BIGINT NOT NULL,
+			length      BIGINT NOT NULL,
+			blob        TEXT NOT NULL,
+			file_sha256 TEXT NOT NULL,               -- sha256 of the file up to the end of this chunk
+			hash_state  BYTEA NOT NULL,              -- sha256 state at that point (extends without rereading)
+			origin      TEXT NOT NULL,               -- source | append | reset
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+			PRIMARY KEY (session_id, name, generation, seq)
+		)`,
+		// GitHub pull requests (pullrequests.go): the current state, and every state sent (append-only;
+		// the raw documents are blobs).
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.pull_requests (
+			id               TEXT PRIMARY KEY,       -- lower(owner/name)#number
+			repo             TEXT NOT NULL,          -- owner/name as GitHub spells it
+			number           BIGINT NOT NULL,
+			url              TEXT NOT NULL DEFAULT '',
+			title            TEXT NOT NULL DEFAULT '',
+			author           TEXT NOT NULL DEFAULT '',
+			state            TEXT NOT NULL DEFAULT '', -- GitHub: open | closed
+			draft            BOOLEAN NOT NULL DEFAULT FALSE,
+			outcome          TEXT NOT NULL DEFAULT '', -- open | merged | closed | reverted
+			reverted_by      TEXT NOT NULL DEFAULT '', -- owner/name#n or a commit sha
+			created_at       TIMESTAMPTZ,
+			updated_at       TIMESTAMPTZ,            -- GitHub's updated_at of the indexed version
+			merged_at        TIMESTAMPTZ,
+			closed_at        TIMESTAMPTZ,
+			merge_commit_sha TEXT NOT NULL DEFAULT '',
+			head_sha         TEXT NOT NULL DEFAULT '',
+			base_sha         TEXT NOT NULL DEFAULT '',
+			version          INTEGER NOT NULL,       -- the indexed version
+			machine          TEXT NOT NULL DEFAULT '',
+			ingested_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS pull_requests_updated_idx ON ` + schema + `.pull_requests (updated_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.pull_request_versions (
+			pr_id                TEXT NOT NULL,
+			version              INTEGER NOT NULL,
+			digest               TEXT NOT NULL,      -- of the blob hashes + outcome + reverted_by + metadata
+			pull_blob            TEXT NOT NULL,
+			reviews_blob         TEXT NOT NULL DEFAULT '',
+			review_comments_blob TEXT NOT NULL DEFAULT '',
+			issue_comments_blob  TEXT NOT NULL DEFAULT '',
+			commits_blob         TEXT NOT NULL DEFAULT '',
+			state                TEXT NOT NULL DEFAULT '',
+			outcome              TEXT NOT NULL DEFAULT '',
+			reverted_by          TEXT NOT NULL DEFAULT '',
+			merged_at            TIMESTAMPTZ,
+			closed_at            TIMESTAMPTZ,
+			head_sha             TEXT NOT NULL DEFAULT '',
+			gh_updated_at        TIMESTAMPTZ,
+			fetched_at           TIMESTAMPTZ,
+			metadata             JSONB NOT NULL DEFAULT '{}',
+			machine              TEXT NOT NULL DEFAULT '',
+			ingested_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+			PRIMARY KEY (pr_id, version),
+			UNIQUE (pr_id, digest)
+		)`,
 		// Changes for the analytics worker (analytics.go), written with the change itself.
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.analytics_journal (
 			id         BIGSERIAL PRIMARY KEY,
@@ -299,21 +411,20 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// enqueue is the capture sink. It never blocks: when the queue is over its byte or length limit
-// the exchange is dropped and counted.
+// enqueue is the capture sink. It never waits on the database: when the queue is over its byte
+// or length limit (or the archive is closing) the exchange is written to the durable spool
+// instead and stored by the replayer later.
 func (a *Archive) enqueue(ex *capture.Exchange) {
 	a.queueMu.RLock()
 	defer a.queueMu.RUnlock()
 	if a.closing.Load() {
-		ex.Release()
-		a.drop()
+		a.overflow(ex)
 		return
 	}
 	size := exchangeMemory(ex)
 	if a.queueBytes.Add(size) > queueBytesLimit {
 		a.queueBytes.Add(-size)
-		ex.Release()
-		a.drop()
+		a.overflow(ex)
 		return
 	}
 	finished := make(chan struct{})
@@ -324,15 +435,17 @@ func (a *Archive) enqueue(ex *capture.Exchange) {
 		a.pending.Delete(ex)
 		close(finished)
 		a.queueBytes.Add(-size)
-		ex.Release()
-		a.drop()
+		a.overflow(ex)
 	}
 }
 
-func (a *Archive) drop() {
-	if a.dropped.Add(1)%20 == 1 {
-		log.Warn("tmx archive: capture queue full, dropping exchanges")
+// overflow spools an exchange the queue can't take, then releases it.
+func (a *Archive) overflow(ex *capture.Exchange) {
+	if a.overflowed.Add(1)%20 == 1 {
+		log.Warn("tmx archive: capture queue full, spooling exchanges to disk")
 	}
+	a.spoolExchange(ex, "capture queue full")
+	ex.Release()
 }
 
 func (a *Archive) worker() {
@@ -340,12 +453,24 @@ func (a *Archive) worker() {
 	for ex := range a.queue {
 		size := exchangeMemory(ex)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		if err := a.storeExchange(ctx, ex); err != nil {
-			if a.failed.Add(1)%20 == 1 {
-				log.WithError(err).Warn("tmx archive: failed to store exchange")
+		switch {
+		case a.spool != nil && a.spool.Failing():
+			a.spoolExchange(ex, "archive store failing") // known to be down: don't wait on it
+		default:
+			if err := a.storeExchange(ctx, ex); err != nil {
+				if a.failed.Add(1)%20 == 1 {
+					log.WithError(err).Warn("tmx archive: failed to store exchange; spooled to disk for retry")
+				}
+				if a.spool != nil {
+					a.spool.NoteError(err)
+				}
+				a.spoolExchange(ex, err.Error())
+			} else {
+				a.captured.Add(1)
+				if a.spool != nil {
+					a.spool.Recovered()
+				}
 			}
-		} else {
-			a.captured.Add(1)
 		}
 		cancel()
 		ex.Release()
@@ -375,6 +500,13 @@ func redactHeaders(h map[string][]string) map[string][]string {
 }
 
 func (a *Archive) storeExchange(ctx context.Context, ex *capture.Exchange) error {
+	return a.storeExchangeWith(ctx, ex, rejectedRow)
+}
+
+// storeExchangeWith is storeExchange with the rejected-row source (a replayed exchange brings the
+// row computed before its credential headers were redacted).
+func (a *Archive) storeExchangeWith(ctx context.Context, ex *capture.Exchange,
+	rejected func(*capture.Exchange) (requestlog.Row, bool)) error {
 	requestPrefix := capturePrefix(ex, "request", ex.RequestBody, 1<<20)
 	clientSession := clientSessionID(ex.RequestHeaders, nil)
 	if clientSession == "" {
@@ -482,7 +614,7 @@ func (a *Archive) storeExchange(ctx context.Context, ex *capture.Exchange) error
 	if err == nil {
 		// Requests the proxy refused before trying any account never reach the usage plugin;
 		// record them here so they show up in the request log as "rejected".
-		if rej, ok := rejectedRow(ex); ok {
+		if rej, ok := rejected(ex); ok {
 			rej.TraceID, rej.RequestID = traceID, "rejected:"+traceID
 			requestlog.Default().Enqueue(rej)
 		}
@@ -542,8 +674,10 @@ func (a *Archive) Stats() map[string]any {
 		"live_capture_bytes":   capture.LiveBytes(),
 		"live_capture_dropped": capture.Dropped(),
 		"captured":             a.captured.Load(),
-		"dropped":              a.dropped.Load(),
+		"dropped":              a.Durability().Dropped,
 		"failed":               a.failed.Load(),
+		"overflowed":           a.overflowed.Load(),
+		"spooled_pending":      a.spool.Pending(),
 		"queued":               len(a.queue),
 		"queued_bytes":         a.queueBytes.Load(),
 		"blobs_stored":         a.blobs.stored.Load(),
@@ -571,6 +705,9 @@ func (a *Archive) Close() {
 		close(a.queue)
 		a.queueMu.Unlock()
 		a.wg.Wait()
+		a.queueMu.Lock() // wait out enqueues still spooling
+		a.queueMu.Unlock()
+		a.spool.Close() // what is still spooled is stored by the next start
 		if a.analytics != nil {
 			a.analytics.close()
 		}
