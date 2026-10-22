@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -159,5 +161,53 @@ func TestWriterKeepsRowsWhileDatabaseIsDown(t *testing.T) {
 	}
 	if _, errS := os.Stat(s.spoolFile); !os.IsNotExist(errS) {
 		t.Fatalf("spool file left behind: %v", errS)
+	}
+}
+
+// Catalog snapshots are never deleted; an unchanged fetch isn't stored again and keeps naming the
+// stored snapshot; the latest stored one is what a restart loads.
+func TestPriceCatalogsKeptAndDeduped(t *testing.T) {
+	s, schema := openPricedStore(t)
+	ctx := context.Background()
+	body := `{"anthropic":{"models":{"claude-opus-5-5":{"cost":{"input":4,"output":20}}}}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) }))
+	t.Cleanup(srv.Close)
+	t.Setenv("TMX_PRICES_CATALOG_URL", srv.URL)
+	count := func() int {
+		var n int
+		if err := s.db.QueryRow(`SELECT count(*) FROM ` + schema + `.price_catalogs`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	first, err := s.fetchSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.fetchSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := count(); n != 1 || !again.fetchedAt.Equal(first.fetchedAt) || !again.checkedAt.After(first.fetchedAt) {
+		t.Fatalf("identical fetch: rows=%d fetched %s vs %s checked %s", n, again.fetchedAt, first.fetchedAt, again.checkedAt)
+	}
+	// More distinct catalogs than the old 30-snapshot cap: every one is kept.
+	var last *priceSnapshot
+	for i := 0; i < 32; i++ {
+		body = fmt.Sprintf(`{"anthropic":{"models":{"claude-opus-5-5":{"cost":{"input":%d,"output":20}}}}}`, 5+i)
+		if last, err = s.fetchSnapshot(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := count(); n != 33 {
+		t.Fatalf("rows=%d, want 33 (nothing deleted)", n)
+	}
+	loaded, err := s.loadSnapshot(ctx)
+	if err != nil || loaded == nil || !loaded.fetchedAt.Equal(last.fetchedAt) {
+		t.Fatalf("loadSnapshot = %+v, %v; want fetched_at %s", loaded, err, last.fetchedAt)
+	}
+	c, ok := loaded.cat.Price(pricing.Usage{Provider: "claude", Model: "claude-opus-5-5", Uncached: 1_000_000})
+	if !ok || math.Abs(c.Total-36) > 1e-9 {
+		t.Fatalf("latest catalog price = %+v %v", c, ok)
 	}
 }
