@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/durability"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -145,6 +146,7 @@ func Open(ctx context.Context, db *sql.DB, schema string, manager Snapshotter) (
 	}
 	go s.write(pending)
 	go s.track(t, resumed)
+	durability.Register("cooldowns", s.durabilityStats)
 	return s, nil
 }
 
@@ -252,6 +254,42 @@ func (s *Store) Stats() map[string]int64 {
 		"open_windows":      s.openWindows.Load(),
 		"resume_errors":     s.resumeErrors.Load(),
 		"trigger_installed": trigger,
+	}
+}
+
+// deadletter keeps an event the database refused in deadletter/cooldowns.jsonl next to the spool
+// file (never deleted), so a rejected event is kept, not lost.
+func (s *Store) deadletter(ev Event, cause error) {
+	dir := filepath.Join(filepath.Dir(s.spoolFile), "deadletter")
+	line, err := json.Marshal(map[string]any{"at": time.Now().UTC(), "error": cause.Error(), "event": ev})
+	if err == nil {
+		err = os.MkdirAll(dir, 0o700)
+	}
+	if err == nil {
+		var f *os.File
+		if f, err = os.OpenFile(filepath.Join(dir, "cooldowns.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+			_, err = f.Write(append(line, '\n'))
+			if errC := f.Close(); err == nil {
+				err = errC
+			}
+		}
+	}
+	if err != nil {
+		s.dropped.Add(1)
+		log.WithError(err).Error("tmx cooldown history: could not keep a rejected event; DROPPED")
+	}
+}
+
+// durabilityStats maps Stats onto the shared durability counters (GET /tmx/durability). Pending
+// rows are mirrored to the spool file until written.
+func (s *Store) durabilityStats() durability.Stats {
+	st := s.Stats()
+	return durability.Stats{
+		Queued:         st["queued"],
+		SpooledPending: st["pending"],
+		Dropped:        st["dropped"],
+		Deadlettered:   st["rejected"],
+		SpoolDir:       filepath.Dir(s.spoolFile),
 	}
 }
 
@@ -382,6 +420,7 @@ func (s *Store) Close() {
 	}
 	s.stopOnce.Do(func() {
 		auth.SetCooldownObserver(nil)
+		durability.Register("cooldowns", nil)
 		s.queueMu.Lock()
 		s.closing = true
 		close(s.obs)
@@ -465,6 +504,7 @@ func (w *writer) write(batch []Event) {
 				s.written.Add(1)
 			case isDataError(errOne):
 				s.rejected.Add(1)
+				s.deadletter(chunk[0], errOne)
 				log.WithError(errOne).Warnf("tmx cooldown history: event rejected (%s %s)", chunk[0].Kind, chunk[0].AuthID)
 			default:
 				backoff(errOne)

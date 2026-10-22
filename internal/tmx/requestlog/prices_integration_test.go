@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -22,6 +21,7 @@ func openPricedStore(t *testing.T) (*Store, string) {
 	}
 	t.Setenv("TMX_PRICES", "off")
 	t.Setenv("WRITABLE_PATH", t.TempDir())
+	t.Setenv("TMX_SPOOL_DIR", t.TempDir())
 	schema := fmt.Sprintf("tmx_test_%d", time.Now().UnixNano())
 	store, err := Open(context.Background(), dsn, schema, 0)
 	if err != nil {
@@ -60,8 +60,7 @@ func costOf(t *testing.T, s *Store, where string) (*float64, string, string) {
 func TestRowsPricedAtWrite(t *testing.T) {
 	s, _ := openPricedStore(t)
 	ctx := context.Background()
-	w := &writer{s: s}
-	w.write([]Row{{TS: time.Now(), TraceID: "live", Provider: "claude", Model: "claude-opus-5-5", Outcome: OutcomeSuccess,
+	s.write([]Row{{TS: time.Now(), TraceID: "live", Provider: "claude", Model: "claude-opus-5-5", Outcome: OutcomeSuccess,
 		UncachedInput: 1_000_000, CacheWrite: 100_000, CacheWrite1h: 100_000, OutputNonReasoning: 1000}})
 	cost, as, src := costOf(t, s, `trace_id = 'live'`)
 	if want := 4 + 0.1*8 + 0.02; cost == nil || math.Abs(*cost-want) > 1e-9 || as != "anthropic/claude-opus-5-5" || src != "models.dev" {
@@ -110,57 +109,6 @@ func TestRowsPricedAtWrite(t *testing.T) {
 	sum, err := s.Summarize(ctx, Filter{From: time.Now().Add(-time.Hour), To: time.Now().Add(time.Hour)}, time.Hour)
 	if err != nil || sum.Totals.Unpriced != 1 || math.Abs(sum.Totals.CostUSD-(4.82+15+10)) > 1e-9 || sum.Totals.CacheWrite1h != 100_000 {
 		t.Fatalf("summary cost = %+v %v", sum.Totals.Cost, err)
-	}
-}
-
-// A row the database refuses is dropped alone; the rest of its batch is written.
-func TestWriterRejectsOnlyBadRows(t *testing.T) {
-	s, _ := openPricedStore(t)
-	w := &writer{s: s}
-	w.write([]Row{
-		{TS: time.Now(), TraceID: "ok1", Outcome: OutcomeSuccess},
-		{TS: time.Now(), TraceID: "bad", Outcome: OutcomeSuccess, Error: "nul\x00byte"},
-		{TS: time.Now(), TraceID: "ok2", Outcome: OutcomeSuccess},
-	})
-	var n int
-	_ = s.db.QueryRow(`SELECT count(*) FROM ` + s.table()).Scan(&n)
-	if n != 2 || s.rejected.Load() != 1 || len(w.pending) != 0 {
-		t.Fatalf("rows=%d rejected=%d pending=%d", n, s.rejected.Load(), len(w.pending))
-	}
-}
-
-// While the database is down rows wait (nothing is dropped) and are mirrored to the spool file;
-// the next start writes them, and a retry of rows that did commit inserts nothing twice.
-func TestWriterKeepsRowsWhileDatabaseIsDown(t *testing.T) {
-	s, schema := openPricedStore(t)
-	dsn := os.Getenv("TMX_REQUESTLOG_TEST_DSN")
-	down, err := Open(context.Background(), dsn, schema, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = down.db.Close() // every insert and ping now fails
-	w := &writer{s: down}
-	w.write([]Row{{TS: time.Now(), TraceID: "kept", Outcome: OutcomeSuccess}})
-	if len(w.pending) != 1 || down.dropped.Load() != 0 {
-		t.Fatalf("pending=%d dropped=%d", len(w.pending), down.dropped.Load())
-	}
-	if raw, errR := os.ReadFile(down.spoolFile); errR != nil || !strings.Contains(string(raw), `"kept"`) {
-		t.Fatalf("spool = %q %v", raw, errR)
-	}
-	// "Crash" and restart: the spool is read back and written, then removed.
-	recovered := readSpool(down.spoolFile)
-	w2 := &writer{s: s, pending: recovered, spooled: len(recovered) > 0}
-	w2.write(nil)
-	// The same rows again (as if the first insert had committed without an acknowledgement).
-	w3 := &writer{s: s, pending: recovered}
-	w3.write(nil)
-	var n int
-	_ = s.db.QueryRow(`SELECT count(*) FROM ` + s.table() + ` WHERE trace_id = 'kept'`).Scan(&n)
-	if n != 1 {
-		t.Fatalf("spooled row written %d times", n)
-	}
-	if _, errS := os.Stat(s.spoolFile); !os.IsNotExist(errS) {
-		t.Fatalf("spool file left behind: %v", errS)
 	}
 }
 

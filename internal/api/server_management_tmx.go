@@ -37,6 +37,7 @@ func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher, mgr
 	v8.POST("/tmx/requests/key-machines", tmxKeyMachinesSet)
 	registerTMXArchiveRoutes(v8)
 	registerTMXReviewRoutes(v8)
+	registerTMXDurabilityRoutes(v8) // server_management_tmx_durability.go
 	if store := requestlog.Default(); store != nil {
 		var observers []quota.RoutingObserver
 		if mgr != nil {
