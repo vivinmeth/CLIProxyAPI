@@ -337,6 +337,54 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
 			PRIMARY KEY (session_id, name, generation, seq)
 		)`,
+		// GitHub pull requests (pullrequests.go): the current state, and every state sent (append-only;
+		// the raw documents are blobs).
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.pull_requests (
+			id               TEXT PRIMARY KEY,       -- lower(owner/name)#number
+			repo             TEXT NOT NULL,          -- owner/name as GitHub spells it
+			number           BIGINT NOT NULL,
+			url              TEXT NOT NULL DEFAULT '',
+			title            TEXT NOT NULL DEFAULT '',
+			author           TEXT NOT NULL DEFAULT '',
+			state            TEXT NOT NULL DEFAULT '', -- GitHub: open | closed
+			draft            BOOLEAN NOT NULL DEFAULT FALSE,
+			outcome          TEXT NOT NULL DEFAULT '', -- open | merged | closed | reverted
+			reverted_by      TEXT NOT NULL DEFAULT '', -- owner/name#n or a commit sha
+			created_at       TIMESTAMPTZ,
+			updated_at       TIMESTAMPTZ,            -- GitHub's updated_at of the indexed version
+			merged_at        TIMESTAMPTZ,
+			closed_at        TIMESTAMPTZ,
+			merge_commit_sha TEXT NOT NULL DEFAULT '',
+			head_sha         TEXT NOT NULL DEFAULT '',
+			base_sha         TEXT NOT NULL DEFAULT '',
+			version          INTEGER NOT NULL,       -- the indexed version
+			machine          TEXT NOT NULL DEFAULT '',
+			ingested_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS pull_requests_updated_idx ON ` + schema + `.pull_requests (updated_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.pull_request_versions (
+			pr_id                TEXT NOT NULL,
+			version              INTEGER NOT NULL,
+			digest               TEXT NOT NULL,      -- of the blob hashes + outcome + reverted_by + metadata
+			pull_blob            TEXT NOT NULL,
+			reviews_blob         TEXT NOT NULL DEFAULT '',
+			review_comments_blob TEXT NOT NULL DEFAULT '',
+			issue_comments_blob  TEXT NOT NULL DEFAULT '',
+			commits_blob         TEXT NOT NULL DEFAULT '',
+			state                TEXT NOT NULL DEFAULT '',
+			outcome              TEXT NOT NULL DEFAULT '',
+			reverted_by          TEXT NOT NULL DEFAULT '',
+			merged_at            TIMESTAMPTZ,
+			closed_at            TIMESTAMPTZ,
+			head_sha             TEXT NOT NULL DEFAULT '',
+			gh_updated_at        TIMESTAMPTZ,
+			fetched_at           TIMESTAMPTZ,
+			metadata             JSONB NOT NULL DEFAULT '{}',
+			machine              TEXT NOT NULL DEFAULT '',
+			ingested_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+			PRIMARY KEY (pr_id, version),
+			UNIQUE (pr_id, digest)
+		)`,
 		// Changes for the analytics worker (analytics.go), written with the change itself.
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.analytics_journal (
 			id         BIGSERIAL PRIMARY KEY,

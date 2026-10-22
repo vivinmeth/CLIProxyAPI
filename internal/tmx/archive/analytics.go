@@ -82,6 +82,8 @@ type analytics struct {
 	lastErr     atomic.Value // string
 	lastRunUnix atomic.Int64
 	mu          sync.Mutex // serialises step() and backfill bookkeeping
+
+	review reviewState // the writable review schema (review.go)
 }
 
 // startAnalytics connects to TMX_ANALYTICS_DSN when set. Failures disable analytics, never the
@@ -245,7 +247,11 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 			an.reqMirror = nil
 		}
 	}
-	return an.ensureViews(ctx)
+	if err = an.ensureViews(ctx); err != nil {
+		return err
+	}
+	an.ensureReview(ctx) // after the views: its grants cover the recreated ones
+	return nil
 }
 
 // ensureViews (re)creates the views over requests, in one transaction so readers never see them
@@ -257,14 +263,17 @@ func (an *analytics) ensureViews(ctx context.Context) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	// Dependents first: thread_usage reads session_usage.
-	stmts := append([]string{`DROP VIEW IF EXISTS tasks, commit_tasks, session_tasks, thread_roots, thread_usage,
-		skill_invocations, session_threads, session_tree`}, threadSchemaSQL...)
+	stmts := append([]string{`DROP VIEW IF EXISTS pr_outcomes, pr_tasks, pr_sessions, pr_threads, pr_commit_links,
+		tasks, commit_tasks, session_tasks, thread_roots, thread_usage, skill_invocations, session_threads, session_tree`},
+		threadSchemaSQL...)
 	stmts = append(stmts, commitSchemaSQL...)
+	stmts = append(stmts, prSchemaSQL...)
 	if an.reqMirror != nil {
 		stmts = append(stmts, analyticsViewsSQL...)
 	}
 	stmts = append(stmts, threadViewsSQL...)
 	stmts = append(stmts, taskViewsSQL...)
+	stmts = append(stmts, prViewsSQL...)
 	if an.reqMirror != nil {
 		stmts = append(stmts, threadUsageSQL...)
 		stmts = append(stmts, tasksSQL...)
@@ -430,6 +439,7 @@ func (an *analytics) step() (bool, error) {
 	threads := map[string]bool{}
 	commits := map[string]bool{}
 	var prompts, attachments []string
+	pulls := map[string]bool{}
 	byRef := map[string][]journalEntry{}
 	for _, e := range entries {
 		switch e.kind {
@@ -451,6 +461,8 @@ func (an *analytics) step() (bool, error) {
 			prompts = append(prompts, e.ref)
 		case "attachment":
 			attachments = append(attachments, e.ref)
+		case "pull_request":
+			pulls[e.ref] = true
 		}
 		byRef[e.kind+"\x00"+e.ref] = append(byRef[e.kind+"\x00"+e.ref], e)
 	}
@@ -509,6 +521,11 @@ func (an *analytics) step() (bool, error) {
 			}
 		}
 	}
+	for id := range pulls {
+		if errP := an.extractPullRequest(ctx, id); errP != nil {
+			fail("pull_request", id, errP)
+		}
+	}
 	importedIDs := make([]string, 0, len(imported))
 	for id := range imported {
 		importedIDs = append(importedIDs, id)
@@ -538,10 +555,11 @@ func (an *analytics) step() (bool, error) {
 		if !bad {
 			done = append(done, fmt.Sprint(e.id))
 			if e.kind == "session" || e.kind == "proxy" || e.kind == "thread" || e.kind == "commit" ||
-				e.kind == "prompt" || e.kind == "attachment" {
+				e.kind == "prompt" || e.kind == "attachment" || e.kind == "pull_request" {
 				cleared[e.kind] = append(cleared[e.kind], e.ref)
 			}
-			if e.kind != "thread" && e.kind != "commit" && e.kind != "prompt" && e.kind != "attachment" {
+			if e.kind != "thread" && e.kind != "commit" && e.kind != "prompt" && e.kind != "attachment" &&
+				e.kind != "pull_request" {
 				an.linksDirty.Store(true)
 			}
 			continue
@@ -1234,6 +1252,7 @@ type BackfillResult struct {
 	Commits     int64 `json:"commits"`
 	Prompts     int64 `json:"prompts"`
 	Attachments int64 `json:"attachments"`
+	PRs         int64 `json:"pull_requests"`
 	Exchanges   int64 `json:"exchanges"`
 	RequestRows int   `json:"request_rows"` // tmx.requests rows copied (copies of deleted rows are removed)
 	Replayed    int   `json:"replayed"`     // failed entries + sessions deleted from the archive
@@ -1383,6 +1402,11 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 		return nil, fmt.Errorf("attachments: %w", errA)
 	}
 	res.Attachments = int64(n)
+	tag, err = a.db.ExecContext(ctx, `INSERT INTO `+journalTable+` (kind, ref) SELECT 'pull_request', id FROM `+schema+`.pull_requests`)
+	if err != nil {
+		return nil, err
+	}
+	res.PRs, _ = tag.RowsAffected()
 	// Under the worker lock: a row mirrored by step() during the scan must not be judged absent.
 	an.mu.Lock()
 	res.RequestRows, err = an.reconcileAllRequests(ctx)
