@@ -687,6 +687,7 @@ func (a *Archive) Stats() map[string]any {
 		"read_cache":           a.blobs.cache.stats(),
 		"upload_failures":      a.blobs.failures.Load(),
 		"unbacked_swept":       a.blobs.swept.Load(),
+		"blob_key_mismatches":  a.blobs.mismatched.Load(),
 		"spool_backlog":        a.blobs.SpoolBacklog(),
 		"r2_configured":        a.blobs.r2 != nil,
 		"analytics":            a.analytics != nil,

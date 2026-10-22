@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -65,6 +66,8 @@ type BlobStore struct {
 	packs    atomic.Int64
 	failures atomic.Int64
 	swept    atomic.Int64
+	// mismatched: objects found at a blob's key holding other bytes (left as is; blob packed).
+	mismatched atomic.Int64
 }
 
 func newBlobStore(db *sql.DB, schema string, r2 *minio.Client, bucket, env, spool string) (*BlobStore, error) {
@@ -475,12 +478,35 @@ func (b *BlobStore) hashLock(h string) *sync.Mutex {
 }
 
 // uploadOne stores a single blob as its own object (legacy layout, used for very large blobs).
+// Objects are write-once (the bucket may lock the prefix, refusing overwrites), so an object
+// already at the key is checked instead of written again: it is there from an earlier attempt
+// whose index update failed. One that doesn't hold this blob's bytes is left alone and the blob
+// goes into a pack (a new key) instead.
 func (b *BlobStore) uploadOne(blob spooled) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	if _, err := b.r2.PutObject(ctx, b.bucket, b.objectKey(blob.hash), bytes.NewReader(blob.data),
-		int64(len(blob.data)), minio.PutObjectOptions{ContentType: "application/zstd"}); err != nil {
+	key := b.objectKey(blob.hash)
+	held, err := b.objectHolds(ctx, key, blob)
+	if err != nil {
 		return err
+	}
+	if held == objectMissing {
+		_, errPut := b.r2.PutObject(ctx, b.bucket, key, bytes.NewReader(blob.data),
+			int64(len(blob.data)), minio.PutObjectOptions{ContentType: "application/zstd"})
+		if errPut != nil {
+			// A concurrent or unacknowledged write may have stored it (a locked key refuses the
+			// PUT): what's there now decides.
+			if held, err = b.objectHolds(ctx, key, blob); err != nil || held == objectMissing {
+				return errPut
+			}
+		} else {
+			held = objectMatches
+		}
+	}
+	if held == objectDiffers {
+		b.mismatched.Add(1)
+		log.WithField("key", key).Error("tmx archive: object at a blob's key holds other bytes; left as is, blob stored in a pack")
+		return b.uploadPack([]spooled{blob})
 	}
 	tag, err := b.db.ExecContext(ctx, `UPDATE `+b.schema+`.blobs SET uploaded_at = now() WHERE hash = $1`, blob.hash)
 	if err != nil {
@@ -490,6 +516,35 @@ func (b *BlobStore) uploadOne(blob spooled) error {
 	b.settleSpooled([]string{blob.hash}, map[string]bool{blob.hash: n > 0})
 	b.uploaded.Add(n)
 	return nil
+}
+
+const (
+	objectMissing = iota
+	objectMatches // holds this blob (same stored bytes, or another encoding of the same content)
+	objectDiffers
+)
+
+// objectHolds reports whether the object at key is absent, holds blob, or holds something else.
+func (b *BlobStore) objectHolds(ctx context.Context, key string, blob spooled) (int, error) {
+	st, err := b.r2.StatObject(ctx, b.bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		if minio.ToErrorResponse(err).StatusCode == http.StatusNotFound {
+			return objectMissing, nil
+		}
+		return 0, err
+	}
+	if st.Size == int64(len(blob.data)) {
+		return objectMatches, nil
+	}
+	// Another compression of the same content (an older encoder) is just as good.
+	data, err := b.readObject(ctx, key, minio.GetObjectOptions{})
+	if err != nil {
+		return 0, err
+	}
+	if raw, errDec := b.dec.DecodeAll(data, nil); errDec == nil && HashOf(raw) == blob.hash {
+		return objectMatches, nil
+	}
+	return objectDiffers, nil
 }
 
 // uploadPack concatenates blobs into one object, then records each blob's pack and offset. If the
