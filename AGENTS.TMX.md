@@ -48,6 +48,11 @@ but are **parked**. Don't work there; see `../wiki/parked-fork-clones.md`.)
   `handlers/management/tmx_resets_backend.go`). Every claim is journaled in `tmx.reset_redemptions`
   before it is sent. Upstream-package hook: `sdk/cliproxy/auth/tmx_quota_signals.go`
   (`Manager.ClearQuotaSignals`). Details: `../wiki/reset-credits.md`.
+- **Cooldown history** (`internal/tmx/cooldowns/`): append-only `tmx.cooldown_events` (windows as
+  start/update/end sharing a `cooldown_id`, plus 429 / usage-limit / auth-error / 529 events), a
+  backstop trigger on `cliproxy.cooldown_store`, `GET /tmx/cooldowns/{history,stats}`. Upstream
+  hooks: `sdk/cliproxy/auth/tmx_cooldown_events.go` + `// tmx` lines in `conductor_cooldown.go`,
+  start in `service_lifecycle.go`. Integration tests need `TMX_COOLDOWNS_TEST_DSN`.
 - Put new fork-only code under `internal/tmx/` and keep upstream-file edits to small hooks.
 
 ## Git
