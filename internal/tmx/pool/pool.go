@@ -21,6 +21,7 @@ type InFlightCounter interface{ InFlightCount(authID string) int }
 type Credential struct {
 	Provider       string              `json:"provider"`
 	AuthID         string              `json:"auth_id"`
+	AuthIndex      string              `json:"auth_index"`
 	Label          string              `json:"label"`
 	PlanType       string              `json:"plan_type"`
 	Enabled        bool                `json:"enabled"`
@@ -102,7 +103,7 @@ func Build(ctx context.Context, auths []*auth.Auth, counts map[string]int, accou
 		latest[account.AuthID] = account
 	}
 	for _, a := range auths {
-		c := Credential{Provider: a.Provider, AuthID: maskLabel(a.ID), Label: maskLabel(a.Label), Enabled: !a.Disabled && a.Status != auth.StatusDisabled, Status: a.Status, Unavailable: a.Unavailable, Cooldowns: auth.CooldownSnapshotForAuth(a, now), Windows: []quota.Current{}, BoundSessions: counts[a.ID], RankModel: models[a.Provider]}
+		c := Credential{Provider: a.Provider, AuthID: maskLabel(a.ID), AuthIndex: a.EnsureIndex(), Label: maskLabel(a.Label), Enabled: !a.Disabled && a.Status != auth.StatusDisabled, Status: a.Status, Unavailable: a.Unavailable, Cooldowns: auth.CooldownSnapshotForAuth(a, now), Windows: []quota.Current{}, BoundSessions: counts[a.ID], RankModel: models[a.Provider]}
 		if c.Label == "" {
 			c.Label = maskLabel(a.ID)
 		}

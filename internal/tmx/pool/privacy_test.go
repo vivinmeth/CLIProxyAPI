@@ -44,3 +44,16 @@ func TestPoolRankUsesConfiguredAdmissionThreshold(t *testing.T) {
 		t.Fatalf("configured threshold ignored: %+v", s.Credentials)
 	}
 }
+
+func TestPoolCarriesQuotaAuthIndex(t *testing.T) {
+	a := &auth.Auth{ID: "claude-hash-alice@example.com.json", Provider: "claude", Status: auth.StatusActive}
+	want := a.Clone().EnsureIndex()
+	s := Build(context.Background(), []*auth.Auth{a}, nil, nil, nil, "")
+	if want == "" || s.Credentials[0].AuthIndex != want {
+		t.Fatalf("auth_index=%q want %q", s.Credentials[0].AuthIndex, want)
+	}
+	raw, _ := json.Marshal(s)
+	if !strings.Contains(string(raw), `"auth_index":"`+want+`"`) || strings.Contains(string(raw), "alice@example.com") {
+		t.Fatalf("payload=%s", raw)
+	}
+}
