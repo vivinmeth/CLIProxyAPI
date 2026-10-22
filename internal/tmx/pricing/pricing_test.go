@@ -94,3 +94,27 @@ func TestPrice(t *testing.T) {
 		t.Fatalf("haiku = %+v", h)
 	}
 }
+
+func TestMetaOfficialPrices(t *testing.T) {
+	// models.dev disagreeing must not matter: Meta's own list prices win for the meta provider.
+	cat, err := ParseModelsDev([]byte(`{"meta":{"models":{"muse-spark-1.3":{"cost":{"input":9,"output":9}}}},
+		"opper":{"models":{"muse-wonder-full-1.0":{"cost":{"input":1,"output":1}}}},"anthropic":{"models":{}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, ok := cat.Price(Usage{Provider: "meta", Model: "muse-spark-1.3", Uncached: 1_000_000, CacheRead: 1_000_000, Output: 1_000_000})
+	if !ok || c.Source != "meta.ai" || c.PricedAs != "meta/muse-spark-1.3" || math.Abs(c.Total-(1.25+0.15+4.25)) > 1e-9 {
+		t.Fatalf("spark = %+v ok=%v", c, ok)
+	}
+	if c, ok = cat.Price(Usage{Provider: "meta", Model: "muse-wonder-1.0", Uncached: 1_000_000, CacheRead: 1_000_000, Output: 1_000_000}); !ok || math.Abs(c.Total-24.20) > 1e-9 {
+		t.Fatalf("wonder = %+v ok=%v", c, ok)
+	}
+	if c, ok = cat.Price(Usage{Provider: "meta", Model: "muse-spark-1.3-contributor", Uncached: 1_000_000, CacheRead: 1_000_000, Output: 1_000_000}); !ok || math.Abs(c.Total-0.302) > 1e-9 {
+		t.Fatalf("spark contributor = %+v ok=%v", c, ok)
+	}
+	for _, id := range []string{"muse-wonder-full-1.0", "muse-wonder-1.0-contributor"} {
+		if c, ok = cat.Price(Usage{Provider: "meta", Model: id, Output: 1}); ok {
+			t.Fatalf("%s must stay unpriced: %+v", id, c)
+		}
+	}
+}
