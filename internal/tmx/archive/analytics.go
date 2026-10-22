@@ -64,6 +64,7 @@ type analytics struct {
 
 	reqMirror  *mirror // tmx.requests -> requests (nil when the request log is off)
 	exchMirror *mirror // tmx_archive.exchanges -> exchanges
+	attMirror  *mirror // tmx_archive.session_attachments -> session_attachments
 
 	wake chan struct{}
 	stop chan struct{}
@@ -229,6 +230,9 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 	var err error
 	if an.exchMirror, err = ensureMirror(ctx, an.a.db, an.db, schema, "exchanges", "exchanges", "trace_id",
 		[]string{"ts", "session_id", "client_session_id"}); err != nil {
+		return err
+	}
+	if err = an.ensurePromptSchema(ctx); err != nil {
 		return err
 	}
 	if rl := requestlog.Default(); rl != nil {
@@ -425,6 +429,7 @@ func (an *analytics) step() (bool, error) {
 	proxy := map[string]bool{}
 	threads := map[string]bool{}
 	commits := map[string]bool{}
+	var prompts, attachments []string
 	byRef := map[string][]journalEntry{}
 	for _, e := range entries {
 		switch e.kind {
@@ -442,6 +447,10 @@ func (an *analytics) step() (bool, error) {
 			threads[e.ref] = true
 		case "commit":
 			commits[e.ref] = true
+		case "prompt":
+			prompts = append(prompts, e.ref)
+		case "attachment":
+			attachments = append(attachments, e.ref)
 		}
 		byRef[e.kind+"\x00"+e.ref] = append(byRef[e.kind+"\x00"+e.ref], e)
 	}
@@ -488,6 +497,18 @@ func (an *analytics) step() (bool, error) {
 			fail("commit", id, errC)
 		}
 	}
+	if len(prompts) > 0 {
+		for id, errP := range an.extractPrompts(ctx, prompts) {
+			fail("prompt", id, errP)
+		}
+	}
+	if len(attachments) > 0 {
+		if _, errA := an.attMirror.copy(ctx, `id = ANY($1::text[])`, pgTextArray(attachments)); errA != nil {
+			for _, id := range attachments {
+				fail("attachment", id, errA)
+			}
+		}
+	}
 	importedIDs := make([]string, 0, len(imported))
 	for id := range imported {
 		importedIDs = append(importedIDs, id)
@@ -516,10 +537,11 @@ func (an *analytics) step() (bool, error) {
 		errE, bad := failedIDs[e.id]
 		if !bad {
 			done = append(done, fmt.Sprint(e.id))
-			if e.kind == "session" || e.kind == "proxy" || e.kind == "thread" || e.kind == "commit" {
+			if e.kind == "session" || e.kind == "proxy" || e.kind == "thread" || e.kind == "commit" ||
+				e.kind == "prompt" || e.kind == "attachment" {
 				cleared[e.kind] = append(cleared[e.kind], e.ref)
 			}
-			if e.kind != "thread" && e.kind != "commit" {
+			if e.kind != "thread" && e.kind != "commit" && e.kind != "prompt" && e.kind != "attachment" {
 				an.linksDirty.Store(true)
 			}
 			continue
@@ -1210,6 +1232,8 @@ type BackfillResult struct {
 	Proxy       int64 `json:"proxy_sessions"`
 	Threads     int64 `json:"threads"`
 	Commits     int64 `json:"commits"`
+	Prompts     int64 `json:"prompts"`
+	Attachments int64 `json:"attachments"`
 	Exchanges   int64 `json:"exchanges"`
 	RequestRows int   `json:"request_rows"` // tmx.requests rows copied (copies of deleted rows are removed)
 	Replayed    int   `json:"replayed"`     // failed entries + sessions deleted from the archive
@@ -1349,6 +1373,16 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 		return nil, err
 	}
 	res.Commits, _ = tag.RowsAffected()
+	tag, err = a.db.ExecContext(ctx, `INSERT INTO `+journalTable+` (kind, ref) SELECT 'prompt', id FROM `+schema+`.prompt_history`)
+	if err != nil {
+		return nil, err
+	}
+	res.Prompts, _ = tag.RowsAffected()
+	n, errA := an.attMirror.copy(ctx, `TRUE`)
+	if errA != nil {
+		return nil, fmt.Errorf("attachments: %w", errA)
+	}
+	res.Attachments = int64(n)
 	// Under the worker lock: a row mirrored by step() during the scan must not be judged absent.
 	an.mu.Lock()
 	res.RequestRows, err = an.reconcileAllRequests(ctx)
@@ -1373,7 +1407,7 @@ func (a *Archive) AnalyticsStatus(ctx context.Context) (map[string]any, error) {
 	var backlog, retrying int64
 	_ = a.db.QueryRowContext(ctx, `SELECT count(*), count(*) FILTER (WHERE attempts > 0) FROM `+journalTable).Scan(&backlog, &retrying)
 	counts := map[string]int64{}
-	for _, t := range []string{"sessions", "messages", "items", "exchanges", "requests", "failed"} {
+	for _, t := range []string{"sessions", "messages", "items", "exchanges", "requests", "failed", "prompt_history", "session_attachments"} {
 		if t == "requests" && an.reqMirror == nil {
 			continue
 		}

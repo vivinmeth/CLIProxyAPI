@@ -281,6 +281,62 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 			committed_at TIMESTAMPTZ,
 			ingested_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		// Prompt history lines (prompts.go): the raw line is the blob line_hash. Append-only.
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.prompt_history (
+			id            TEXT PRIMARY KEY,          -- PromptKey(machine, harness, line_hash)
+			machine       TEXT NOT NULL,
+			harness       TEXT NOT NULL,
+			line_hash     TEXT NOT NULL,             -- sha256 of the raw line = its blob
+			ts            TIMESTAMPTZ,
+			project       TEXT NOT NULL DEFAULT '',
+			cwd           TEXT NOT NULL DEFAULT '',
+			session_id    TEXT NOT NULL DEFAULT '',  -- the harness's session id, when the line has one
+			session_key   TEXT NOT NULL DEFAULT '',  -- <harness>:<session_id> (sessions.id)
+			text_hash     TEXT NOT NULL DEFAULT '',  -- sha256 of the prompt text
+			text_bytes    BIGINT NOT NULL DEFAULT 0,
+			source_file   TEXT NOT NULL DEFAULT '',
+			line_no       BIGINT NOT NULL DEFAULT 0,
+			parse_warning TEXT NOT NULL DEFAULT '',
+			ingested_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (machine, harness, line_hash)
+		)`,
+		`CREATE INDEX IF NOT EXISTS prompt_history_ts_idx ON ` + schema + `.prompt_history (ts DESC)`,
+		`CREATE INDEX IF NOT EXISTS prompt_history_session_idx ON ` + schema + `.prompt_history (session_key) WHERE session_key <> ''`,
+		// Files kept next to transcripts (attachments.go). Append-only; no FK, so they outlive a
+		// session delete.
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.session_attachments (
+			id            TEXT PRIMARY KEY,          -- AttachmentKey(...)
+			harness       TEXT NOT NULL,
+			session_id    TEXT NOT NULL DEFAULT '',
+			session_key   TEXT NOT NULL DEFAULT '',
+			machine       TEXT NOT NULL DEFAULT '',
+			path          TEXT NOT NULL,
+			external_path TEXT NOT NULL DEFAULT '',
+			content_type  TEXT NOT NULL DEFAULT '',
+			size          BIGINT NOT NULL,
+			sha256        TEXT NOT NULL,             -- the blob
+			mtime         TIMESTAMPTZ,
+			metadata      JSONB NOT NULL DEFAULT '{}',
+			ingested_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS session_attachments_session_idx ON ` + schema + `.session_attachments (session_key, path)`,
+		`CREATE INDEX IF NOT EXISTS session_attachments_ingested_idx ON ` + schema + `.session_attachments (ingested_at DESC)`,
+		// Appended transcript chunks (files.go): the logical file is a generation's chunks in seq
+		// order. Append-only.
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.session_file_chunks (
+			session_id  TEXT NOT NULL,               -- <harness>:<external_id>
+			name        TEXT NOT NULL,               -- source name
+			generation  INTEGER NOT NULL,
+			seq         INTEGER NOT NULL,
+			"offset"    BIGINT NOT NULL,
+			length      BIGINT NOT NULL,
+			blob        TEXT NOT NULL,
+			file_sha256 TEXT NOT NULL,               -- sha256 of the file up to the end of this chunk
+			hash_state  BYTEA NOT NULL,              -- sha256 state at that point (extends without rereading)
+			origin      TEXT NOT NULL,               -- source | append | reset
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+			PRIMARY KEY (session_id, name, generation, seq)
+		)`,
 		// Changes for the analytics worker (analytics.go), written with the change itself.
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.analytics_journal (
 			id         BIGSERIAL PRIMARY KEY,

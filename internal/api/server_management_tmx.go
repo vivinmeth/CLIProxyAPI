@@ -383,6 +383,7 @@ func registerTMXArchiveRoutes(v8 *gin.RouterGroup) {
 	g.GET("/conversation", tmxArchive(tmxConversation))
 	g.GET("/exchanges", tmxArchive(tmxExchangeList))
 	g.GET("/exchanges/:trace", tmxArchive(tmxExchangeGet))
+	registerTMXArchiveIngestRoutes(g) // prompts, attachments, appended session files
 
 	// Derived query layer (archive/analytics.go): its own Postgres, fed from the archive.
 	an := v8.Group("/tmx/analytics")
