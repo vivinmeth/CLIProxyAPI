@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/muse"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -185,6 +186,8 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			eventData := bytes.TrimSpace(trimmedLine[len(dataTag):])
 			eventType := gjson.GetBytes(eventData, "type").String()
 			if isMetaSubscriptionUsageEvent(eventType, eventData) {
+				// tmx: the usage meter becomes a passive quota reading for this credential.
+				logging.MergeResponseHeaders(ctx, muse.SubscriptionUsageHeaders(eventData))
 				pendingEventLine = nil
 				filteringSubscriptionUsage = false
 				skipFilteredBlankLine = true

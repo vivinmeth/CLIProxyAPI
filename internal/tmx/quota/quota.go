@@ -11,6 +11,7 @@
 // A snapshot row is written when a window's reading changes, and at least every 30 minutes as a
 // heartbeat, so history shows both burn rate and "nothing happened". Codex accounts are polled at
 // chatgpt.com/backend-api/wham/usage (plan from the same payload); Codex API-key accounts are skipped.
+// Meta Muse Code accounts: see meta.go.
 package quota
 
 import (
@@ -55,7 +56,13 @@ const codexUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 
 // providerSpec is how one provider's quota is read: passive headers, the usage API, and the plan.
 type providerSpec struct {
-	usageURL   string
+	usageURL string
+	// usageURLFor, when set, replaces usageURL per account; method/body make it a POST.
+	usageURLFor func(*coreauth.Auth) string
+	method      string
+	body        []byte
+	// canPoll, when set, reports whether an account can be polled; others stay passive-only.
+	canPoll    func(*coreauth.Auth) bool
 	headers    func(*coreauth.Auth) map[string]string
 	passive    func(signals map[string]string, observedAt time.Time) []Window
 	parseUsage func([]byte) ([]Window, string, error) // plan "" when the usage API has none
@@ -93,6 +100,11 @@ var providers = map[string]providerSpec{
 		passive:    ParseCodexSignals,
 		parseUsage: ParseCodexUsage,
 	},
+	"meta": metaSpec,
+}
+
+func (p providerSpec) pollable(auth *coreauth.Auth) bool {
+	return p.canPoll == nil || p.canPoll(auth)
 }
 
 // specFor returns the quota spec for an auth, or false when its provider isn't tracked or the
@@ -107,6 +119,9 @@ func specFor(auth *coreauth.Auth) (providerSpec, string, bool) {
 		return providerSpec{}, "", false
 	}
 	if name == "codex" && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != "" {
+		return providerSpec{}, "", false
+	}
+	if name == "meta" && coreauth.IsConfigAPIKeyAuth(auth) {
 		return providerSpec{}, "", false
 	}
 	return spec, name, true
@@ -125,6 +140,26 @@ func copyHeaders(in map[string]string) map[string]string {
 type Fetcher interface {
 	TmxAuths() []*coreauth.Auth
 	TmxFetch(ctx context.Context, auth *coreauth.Auth, url string, headers map[string]string) (int, []byte, error)
+}
+
+// RequestFetcher is a Fetcher that can also send other methods with a body (Meta's key mint).
+type RequestFetcher interface {
+	TmxRequest(ctx context.Context, auth *coreauth.Auth, method, url string, headers map[string]string, body []byte) (int, []byte, error)
+}
+
+func (s *Service) fetchUsage(ctx context.Context, spec providerSpec, auth *coreauth.Auth) (int, []byte, error) {
+	url := spec.usageURL
+	if spec.usageURLFor != nil {
+		url = spec.usageURLFor(auth)
+	}
+	if spec.method != "" && spec.method != "GET" {
+		rf, ok := s.fetch.(RequestFetcher)
+		if !ok {
+			return 0, nil, fmt.Errorf("fetcher cannot send %s", spec.method)
+		}
+		return rf.TmxRequest(ctx, auth, spec.method, url, spec.headers(auth), spec.body)
+	}
+	return s.fetch.TmxFetch(ctx, auth, url, spec.headers(auth))
 }
 
 // Current is the latest reading of one window.
@@ -363,6 +398,10 @@ func (s *Service) tick(ctx context.Context) {
 		if label := strings.TrimSpace(auth.Label); label != "" {
 			a.Label = label
 		}
+		if provider == "meta" && a.Plan == "" {
+			a.Plan = metaStoredPlan(auth)
+		}
+		canPoll := spec.pollable(auth)
 		observed := auth.Quota.ObservedAt
 		readings := passiveReadings(auth, spec, now)
 		passiveWindows := make([]Window, 0, len(readings))
@@ -377,7 +416,7 @@ func (s *Service) tick(ctx context.Context) {
 			}
 		}
 		a.PassiveFresh = fresh
-		pollDue := s.pollDueLocked(a, passiveWindows, fresh, now)
+		pollDue := canPoll && s.pollDueLocked(a, passiveWindows, fresh, now)
 		if pollDue {
 			pollDue = s.reservePollLocked(a)
 		}
@@ -447,7 +486,7 @@ func (s *Service) poll(ctx context.Context, spec providerSpec, auth *coreauth.Au
 	defer cancel()
 	now := s.now().UTC()
 	status, body, err := ReadUsage(ctx, auth, func(readCtx context.Context) (int, []byte, error) {
-		return s.fetch.TmxFetch(readCtx, auth, spec.usageURL, spec.headers(auth))
+		return s.fetchUsage(readCtx, spec, auth)
 	})
 	var windows []Window
 	var usagePlan string
@@ -546,12 +585,13 @@ func changed(last written, w Window) bool {
 // ErrUnknownAccount / ErrUnsupportedProvider are returned by PollNow.
 var (
 	ErrUnknownAccount      = errors.New("unknown auth_id")
-	ErrUnsupportedProvider = errors.New("quota polling supports claude and codex subscription accounts only")
+	ErrUnsupportedProvider = errors.New("quota polling supports claude, codex and meta subscription accounts only")
 )
 
 // PollNow polls one account immediately and returns its fresh state. A second call within 30 s,
 // or while the account is paused after a 429/401, returns the current state without calling the
-// provider (throttled = true).
+// provider (throttled = true). So does an account that can't be polled (a Meta credential without
+// a DCA token, or TMX_QUOTA_META_POLL=off): its latest passive reading, no error.
 func (s *Service) PollNow(ctx context.Context, authID string) (Account, bool, error) {
 	var auth *coreauth.Auth
 	for _, candidate := range s.fetch.TmxAuths() {
@@ -574,7 +614,10 @@ func (s *Service) PollNow(ctx context.Context, authID string) (Account, bool, er
 	if label := strings.TrimSpace(auth.Label); label != "" {
 		a.Label = label
 	}
-	throttled := now.Before(a.pauseUntil) || (a.LastPollAt != nil && now.Sub(*a.LastPollAt) < pollNowMinGap)
+	if provider == "meta" && a.Plan == "" {
+		a.Plan = metaStoredPlan(auth)
+	}
+	throttled := !spec.pollable(auth) || now.Before(a.pauseUntil) || (a.LastPollAt != nil && now.Sub(*a.LastPollAt) < pollNowMinGap)
 	planDue := now.Sub(a.planAt) >= planEvery
 	waiting := a.polling
 	if !throttled && waiting == nil {

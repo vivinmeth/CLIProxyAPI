@@ -28,6 +28,9 @@ func passiveReadings(auth *coreauth.Auth, spec providerSpec, now time.Time) []Cu
 	for _, w := range windows {
 		prefix := "Anthropic-Ratelimit-Unified-" + w.Window + "-"
 		fields := []string{prefix + "Utilization", prefix + "Reset", prefix + "Status"}
+		if auth.Provider == "meta" {
+			fields = metaSignalFields(signals, w.Window)
+		}
 		if auth.Provider == "codex" {
 			fields = nil
 			for _, slot := range []string{"Primary", "Secondary"} {

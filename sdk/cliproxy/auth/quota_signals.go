@@ -16,7 +16,7 @@ const (
 // passive credential-level quota snapshot understood by collectQuotaSignals.
 func ProviderSupportsQuotaObservation(provider string) bool {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "claude", "codex", "devin":
+	case "claude", "codex", "devin", "meta":
 		return true
 	default:
 		return false
@@ -167,6 +167,10 @@ func isQuotaSignalHeaderForProvider(provider, name string) bool {
 	}
 	if strings.HasPrefix(name, "anthropic-ratelimit-unified-") {
 		return provider == "claude"
+	}
+	if strings.HasPrefix(name, "x-meta-subscription-") {
+		// tmx: Meta's response.subscription_usage events, as headers (internal/tmx/muse).
+		return provider == "meta"
 	}
 	if strings.HasPrefix(name, "x-ratelimit-") {
 		// Observed Codex responses do not carry x-ratelimit-* headers; the only
