@@ -48,6 +48,11 @@ but are **parked**. Don't work there; see `../wiki/parked-fork-clones.md`.)
   `handlers/management/tmx_resets_backend.go`). Every claim is journaled in `tmx.reset_redemptions`
   before it is sent. Upstream-package hook: `sdk/cliproxy/auth/tmx_quota_signals.go`
   (`Manager.ClearQuotaSignals`). Details: `../wiki/reset-credits.md`.
+- **Muse Code** (`internal/tmx/muse/`): `GET /muse-code/models` (route in
+  `internal/api/server_tmx_muse.go`, one hook line in `server_routes.go`), Meta
+  `response.subscription_usage` passed to Muse clients (`meta_executor_stream.go` +
+  `isMuseClient` on the Responses SSE framer), harness `muse-code` (`ClientID` on
+  `logging.ClientRequestMetadata`, set in `sdk/api/handlers/handlers.go`). Details: `../wiki/muse-code.md`.
 - Put new fork-only code under `internal/tmx/` and keep upstream-file edits to small hooks.
 
 ## Git
