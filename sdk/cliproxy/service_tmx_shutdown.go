@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/archive"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/cooldowns"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/quota"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
 	log "github.com/sirupsen/logrus"
@@ -29,7 +30,8 @@ func (s *Service) tmxShutdownWindow(parent context.Context) (context.Context, co
 }
 func (s *Service) flushTMXWorkers(ctx context.Context) {
 	// Polling shares requestlog's pool; archive can still emit rejected-request rows.
-	for _, closeWorker := range []func(context.Context) error{quota.Default().CloseContext, archive.Default().CloseContext, requestlog.Default().CloseContext} {
+	for _, closeWorker := range []func(context.Context) error{quota.Default().CloseContext, archive.Default().CloseContext,
+		cooldowns.Default().CloseContext, requestlog.Default().CloseContext} {
 		if err := closeWorker(ctx); err != nil {
 			log.WithError(err).Warn("tmx: shutdown flush window elapsed")
 		}
@@ -79,6 +81,7 @@ func (s *Service) startTMXShutdownCheckpoint(ctx, drain context.Context, drained
 		usage.DefaultManager().FlushContext,
 		quota.Default().FlushPassiveContext,
 		archive.Default().FlushContext,
+		cooldowns.Default().FlushContext,
 		requestlog.Default().FlushContext,
 	)
 }

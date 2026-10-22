@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	tmxcooldowns "github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/cooldowns"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/sessionbindings"
 	"os"
@@ -116,6 +117,7 @@ func (s *Service) Run(ctx context.Context) error {
 			if errBindings != nil {
 				log.WithError(errBindings).Warn("tmx: session persistence disabled")
 			}
+			tmxcooldowns.Start(context.Background(), store.DB(), store.Schema(), s.coreManager)
 		}
 	}
 

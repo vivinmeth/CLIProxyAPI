@@ -68,6 +68,7 @@ func (m *Manager) ClearRecoveredQuota(ctx context.Context, authID string, r Quot
 	auth.Generation++
 	auth.UpdatedAt = now
 	snapshot := auth.Clone()
+	m.tmxReportCooldownsLocked(auth, now)
 	cooldownStateChanged := false
 	if trackCooldownState {
 		cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, m.cooldownStateRecordsForAuthLocked(auth, now))
