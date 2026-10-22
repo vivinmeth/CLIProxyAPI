@@ -20,6 +20,9 @@ import (
 )
 
 func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	if errBlocked := muse.CheckUpstreamModel(req.Model); errBlocked != nil { // tmx: Contributor mode is off
+		return nil, errBlocked
+	}
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}

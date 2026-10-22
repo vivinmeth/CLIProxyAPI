@@ -3,7 +3,8 @@
 // Muse points at the proxy with settings.json `endpoint_transport.base_url`. Before every session
 // it fetches GET /muse-code/models from that URL's origin and refuses to start without a catalog,
 // then sends inference to POST /v1/responses. This package answers the catalog: Meta's own when a
-// Meta credential is logged in, otherwise one built from the registry's meta models.
+// Meta credential is logged in, otherwise one built from the registry's meta models. Contributor
+// models are refused and unlisted (contributor.go).
 package muse
 
 import (
@@ -73,6 +74,8 @@ func Handler(mgr *auth.Manager) func(http.ResponseWriter, *http.Request) {
 		body := upstreamCatalog(r.Context(), mgr)
 		if body == nil {
 			body = RegistryCatalog(registry.GetMetaModels())
+		} else {
+			body = filterCatalog(body) // Contributor mode is off on this proxy (contributor.go)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "private, no-store")

@@ -112,6 +112,48 @@ func TestRowsPricedAtWrite(t *testing.T) {
 	}
 }
 
+// An estimate (muse-wonder-full-1.0) prices new rows and is counted as estimated; rows already
+// stored as unpriced stay unpriced, through the retry pass and a re-import.
+func TestEstimatesPriceNewRowsOnly(t *testing.T) {
+	s, _ := openPricedStore(t)
+	ctx := context.Background()
+	old := Row{TS: time.Now(), Provider: "meta", Model: "muse-wonder-full-1.0", Outcome: OutcomeSuccess, UncachedInput: 1_000_000,
+		TotalTokens: 1_000_000, Source: "extern:muse-code", ImportRef: "muse:s#old"}
+	src := "unpriced"
+	old.PriceSource = &src
+	if err := s.insert([]Row{old, {TS: time.Now(), TraceID: "old-live", Provider: "meta", Model: "muse-wonder-full-1.0",
+		Outcome: OutcomeSuccess, UncachedInput: 1_000_000, TotalTokens: 1_000_000, PriceSource: &src}}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.PricePending(ctx, true); err != nil || n != 0 {
+		t.Fatalf("retry priced %d (%v)", n, err)
+	}
+	old.PriceSource = nil
+	if err := s.UpsertImported(ctx, []Row{old}); err != nil {
+		t.Fatal(err)
+	}
+	for _, where := range []string{`trace_id = 'old-live'`, `import_ref = 'muse:s#old'`} {
+		if cost, _, ps := costOf(t, s, where); cost != nil || ps != "unpriced" {
+			t.Fatalf("%s repriced: %v %q", where, cost, ps)
+		}
+	}
+	s.write([]Row{{TS: time.Now(), TraceID: "new", Provider: "meta", Model: "muse-wonder-full-1.0", Outcome: OutcomeSuccess,
+		UncachedInput: 1_000_000, CacheRead: 1_000_000, OutputNonReasoning: 100_000, TotalTokens: 2_100_000}})
+	if cost, as, ps := costOf(t, s, `trace_id = 'new'`); cost == nil || math.Abs(*cost-(10+0.25+5)) > 1e-9 ||
+		as != "meta/muse-wonder-full-1.0" || ps != "estimate:fable-5.1" {
+		t.Fatalf("new row = %v %q %q", cost, as, ps)
+	}
+	f := Filter{From: time.Now().Add(-time.Hour), To: time.Now().Add(time.Hour)}
+	sum, err := s.Summarize(ctx, f, time.Hour)
+	if err != nil || sum.Totals.Estimated != 1 || sum.Totals.Unpriced != 2 || math.Abs(sum.Totals.CostEstimatedUSD-15.25) > 1e-9 {
+		t.Fatalf("summary = %+v %v", sum.Totals.Cost, err)
+	}
+	cells, _, err := s.Rollup(ctx, f, "day", "UTC", []string{"model"}, 100)
+	if err != nil || len(cells) != 1 || cells[0].Estimated != 1 || cells[0].Unpriced != 2 {
+		t.Fatalf("rollup = %+v %v", cells, err)
+	}
+}
+
 // Catalog snapshots are never deleted; an unchanged fetch isn't stored again and keeps naming the
 // stored snapshot; the latest stored one is what a restart loads.
 func TestPriceCatalogsKeptAndDeduped(t *testing.T) {
@@ -157,5 +199,26 @@ func TestPriceCatalogsKeptAndDeduped(t *testing.T) {
 	c, ok := loaded.cat.Price(pricing.Usage{Provider: "claude", Model: "claude-opus-5-5", Uncached: 1_000_000})
 	if !ok || math.Abs(c.Total-36) > 1e-9 {
 		t.Fatalf("latest catalog price = %+v %v", c, ok)
+	}
+}
+
+// A stored snapshot from before a code-pinned price is loaded with it, stored as a new snapshot.
+func TestLoadSnapshotAddsPinnedPrices(t *testing.T) {
+	s, schema := openPricedStore(t)
+	ctx := context.Background()
+	if _, err := s.db.Exec(`INSERT INTO `+schema+`.price_catalogs (fetched_at, source, catalog) VALUES ($1, 'models.dev', $2)`,
+		time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), `{"anthropic":{"claude-opus-5-5":{"input":4,"output":20,"cache_read":0.2,"cache_write":5}}}`); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := s.loadSnapshot(ctx)
+	if err != nil || snap == nil {
+		t.Fatalf("load: %v", err)
+	}
+	if m, ok := snap.cat["meta"]["muse-wonder-full-1.0"]; !ok || !pricing.IsEstimate(m.Source) || !snap.fetchedAt.After(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("pinned estimate missing: %+v at %s", m, snap.fetchedAt)
+	}
+	again, err := s.loadSnapshot(ctx)
+	if err != nil || !again.fetchedAt.Equal(snap.fetchedAt) {
+		t.Fatalf("second load stored another snapshot: %v %s vs %s", err, again.fetchedAt, snap.fetchedAt)
 	}
 }

@@ -126,23 +126,30 @@ const countsSelect = `
 
 // Cost sums the list-price cost stored on each row (fixed when the row was written). Unpriced
 // counts rows with tokens but no price (model not in the catalog, or not priced yet); when it is
-// non-zero the cost is a lower bound.
+// non-zero the cost is a lower bound. Estimated counts rows priced from an estimate rather than a
+// list price (price_source "estimate:<basis>", e.g. muse-wonder-full-1.0); CostEstimatedUSD is
+// their share of CostUSD.
 type Cost struct {
-	CostUSD        float64 `json:"cost_usd"`
-	CostInput      float64 `json:"cost_input"`
-	CostCacheRead  float64 `json:"cost_cache_read"`
-	CostCacheWrite float64 `json:"cost_cache_write"`
-	CostOutput     float64 `json:"cost_output"`
-	Unpriced       int64   `json:"unpriced"`
+	CostUSD          float64 `json:"cost_usd"`
+	CostInput        float64 `json:"cost_input"`
+	CostCacheRead    float64 `json:"cost_cache_read"`
+	CostCacheWrite   float64 `json:"cost_cache_write"`
+	CostOutput       float64 `json:"cost_output"`
+	Unpriced         int64   `json:"unpriced"`
+	Estimated        int64   `json:"estimated"`
+	CostEstimatedUSD float64 `json:"cost_estimated_usd"`
 }
 
 const costSelect = `
 	COALESCE(sum(cost_usd), 0), COALESCE(sum(cost_input), 0), COALESCE(sum(cost_cache_read), 0),
 	COALESCE(sum(cost_cache_write), 0), COALESCE(sum(cost_output), 0),
-	count(*) FILTER (WHERE cost_usd IS NULL AND total_tokens > 0)`
+	count(*) FILTER (WHERE cost_usd IS NULL AND total_tokens > 0),
+	count(*) FILTER (WHERE price_source LIKE 'estimate:%'),
+	COALESCE(sum(cost_usd) FILTER (WHERE price_source LIKE 'estimate:%'), 0)`
 
 func (c *Cost) costTargets() []any {
-	return []any{&c.CostUSD, &c.CostInput, &c.CostCacheRead, &c.CostCacheWrite, &c.CostOutput, &c.Unpriced}
+	return []any{&c.CostUSD, &c.CostInput, &c.CostCacheRead, &c.CostCacheWrite, &c.CostOutput, &c.Unpriced,
+		&c.Estimated, &c.CostEstimatedUSD}
 }
 
 func (c *Counts) scanTargets() []any {

@@ -112,9 +112,32 @@ func TestMetaOfficialPrices(t *testing.T) {
 	if c, ok = cat.Price(Usage{Provider: "meta", Model: "muse-spark-1.3-contributor", Uncached: 1_000_000, CacheRead: 1_000_000, Output: 1_000_000}); !ok || math.Abs(c.Total-0.302) > 1e-9 {
 		t.Fatalf("spark contributor = %+v ok=%v", c, ok)
 	}
-	for _, id := range []string{"muse-wonder-full-1.0", "muse-wonder-1.0-contributor"} {
-		if c, ok = cat.Price(Usage{Provider: "meta", Model: id, Output: 1}); ok {
-			t.Fatalf("%s must stay unpriced: %+v", id, c)
-		}
+	if c, ok = cat.Price(Usage{Provider: "meta", Model: "muse-wonder-1.0-contributor", Output: 1}); ok {
+		t.Fatalf("wonder contributor must stay unpriced: %+v", c)
+	}
+	// Wonder Full: Fable 5.1's rates as an estimate (the reseller's $1 is ignored), flat at any
+	// context length, cache writes at the input rate.
+	c, ok = cat.Price(Usage{Provider: "meta", Model: "muse-wonder-full-1.0", Uncached: 1_000_000, CacheRead: 1_000_000,
+		CacheWrite: 1_000_000, Output: 1_000_000})
+	if !ok || c.Source != "estimate:fable-5.1" || !IsEstimate(c.Source) || c.PricedAs != "meta/muse-wonder-full-1.0" ||
+		!near(c.Total, 10+0.25+10+50) {
+		t.Fatalf("wonder full = %+v ok=%v", c, ok)
+	}
+	if long, _ := cat.Price(Usage{Provider: "meta", Model: "muse-wonder-full-1.0", Uncached: 2_000_000}); !near(long.Total, 20) {
+		t.Fatalf("wonder full long = %+v", long)
+	}
+	if IsEstimate("meta.ai") || IsEstimate("models.dev") {
+		t.Fatal("list prices reported as estimates")
+	}
+}
+
+func TestAddPinned(t *testing.T) {
+	cat := Catalog{"anthropic": {}}
+	if !AddPinned(cat) || AddPinned(cat) {
+		t.Fatal("AddPinned must report the first change only")
+	}
+	delete(cat["meta"], "muse-wonder-full-1.0")
+	if !AddPinned(cat) {
+		t.Fatal("a snapshot without the estimate must count as changed")
 	}
 }

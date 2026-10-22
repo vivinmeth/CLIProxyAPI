@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/durability"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/pricing"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/spool"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
@@ -740,7 +741,9 @@ func (s *Store) UpsertImportedWith(ctx context.Context, ex Execer, rows []Row) e
 	for i, c := range pricedOn {
 		same[i] = "t." + c + " IS NOT DISTINCT FROM EXCLUDED." + c
 	}
-	keep := "(t.price_source IS NOT NULL AND t.price_source <> 'unpriced' AND " + strings.Join(same, " AND ") + ")"
+	// An "unpriced" row also keeps that against an estimate (prices.go: estimates price new traffic only).
+	keep := "((t.price_source IS NOT NULL AND t.price_source <> 'unpriced' OR t.price_source = 'unpriced' AND " +
+		"EXCLUDED.price_source LIKE '" + pricing.EstimatePrefix + "%') AND " + strings.Join(same, " AND ") + ")"
 	set := make([]string, 0, len(columnNames))
 	for _, c := range columnNames {
 		switch {

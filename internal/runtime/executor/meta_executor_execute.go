@@ -93,6 +93,9 @@ func (e *MetaExecutor) prepareResponsesRequest(ctx context.Context, auth *clipro
 }
 
 func (e *MetaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if errBlocked := muse.CheckUpstreamModel(req.Model); errBlocked != nil { // tmx: Contributor mode is off
+		return resp, errBlocked
+	}
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
@@ -326,6 +329,9 @@ func (e *MetaExecutor) executeMetaCompactionStream(ctx context.Context, auth *cl
 }
 
 func (e *MetaExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if errBlocked := muse.CheckUpstreamModel(req.Model); errBlocked != nil { // tmx: Contributor mode is off
+		return cliproxyexecutor.Response{}, errBlocked
+	}
 	if errExpand := helps.ExpandResponsesCompactionCapsules(&req, &opts, "meta"); errExpand != nil {
 		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadRequest, msg: errExpand.Error()}
 	}

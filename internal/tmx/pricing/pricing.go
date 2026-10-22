@@ -8,7 +8,8 @@
 //   - Anthropic 1-hour cache writes cost 2x the input rate (5-minute writes are the catalog's
 //     cache_write, 1.25x);
 //   - speed / service tier multipliers the catalog doesn't carry (see tierMultiplier);
-//   - Meta's own list prices for the Muse models (metaPrices), over whatever the catalog says.
+//   - Meta's own list prices for the Muse models (metaPrices), over whatever the catalog says, and
+//     owner-set estimates for Muse models Meta publishes no price for (metaEstimates).
 package pricing
 
 import (
@@ -39,8 +40,8 @@ type Model struct {
 
 // metaPrices are Meta's pay-as-you-go API prices (USD per 1M tokens) from
 // dev.meta.ai/docs/pricing-rate-limits, checked 2026-10-22: no long-context premium, no separate
-// cache-write price (writes are charged as input). muse-wonder-full-1.0 and the Wonder contributor
-// variant have no API price and stay unpriced.
+// cache-write price (writes are charged as input). muse-wonder-full-1.0 has no API price (see
+// metaEstimates); the Wonder contributor variant has none and stays unpriced.
 var metaPrices = map[string]Rate{
 	"muse-wonder-1.0":            {Input: 4.00, Output: 20.00, CacheRead: 0.20, CacheWrite: 4.00},
 	"muse-spark-1.3":             {Input: 1.25, Output: 4.25, CacheRead: 0.15, CacheWrite: 1.25},
@@ -52,13 +53,43 @@ var metaPrices = map[string]Rate{
 
 const metaPriceSource = "meta.ai"
 
-func addMetaPrices(cat Catalog) {
+// EstimatePrefix starts the Source of a price that is not the provider's own (rows keep it in
+// price_source; the request rollups count them as `estimated`).
+const EstimatePrefix = "estimate:"
+
+// metaEstimates are unofficial prices for Muse models Meta sells no API access to (owner's call,
+// 2026-10-22). muse-wonder-full-1.0 is priced at Claude Fable 5.1's list rates, flat at any
+// context length: Anthropic and OpenAI both price their top tier at $10 / $50, and Meta prices
+// Wonder exactly like Opus 5.5. Cache writes are charged as input, as on Meta's priced models.
+var metaEstimates = map[string]Model{
+	"muse-wonder-full-1.0": {Rate: Rate{Input: 10.00, Output: 50.00, CacheRead: 0.25, CacheWrite: 10.00},
+		Source: EstimatePrefix + "fable-5.1"},
+}
+
+// IsEstimate reports whether a price source is an estimate rather than a list price.
+func IsEstimate(source string) bool { return strings.HasPrefix(source, EstimatePrefix) }
+
+// AddPinned writes the code-pinned Meta prices and estimates into cat and reports whether that
+// changed it (a stored snapshot from before a pin was added).
+func AddPinned(cat Catalog) bool {
 	if cat["meta"] == nil {
 		cat["meta"] = map[string]Model{}
 	}
-	for id, r := range metaPrices {
-		cat["meta"][id] = Model{Rate: r, Source: metaPriceSource}
+	changed := false
+	set := func(id string, m Model) {
+		if old, ok := cat["meta"][id]; !ok || old.Rate != m.Rate || old.Source != m.Source ||
+			old.LongThreshold != m.LongThreshold || old.Long != nil {
+			changed = true
+		}
+		cat["meta"][id] = m
 	}
+	for id, r := range metaPrices {
+		set(id, Model{Rate: r, Source: metaPriceSource})
+	}
+	for id, m := range metaEstimates {
+		set(id, m)
+	}
+	return changed
 }
 
 // Catalog: provider id -> lower-case model id -> prices. Only priced models are kept.
@@ -125,7 +156,7 @@ func ParseModelsDev(raw []byte) (Catalog, error) {
 	if len(cat) == 0 {
 		return nil, fmt.Errorf("price catalog is empty")
 	}
-	addMetaPrices(cat)
+	AddPinned(cat)
 	return cat, nil
 }
 
@@ -205,8 +236,8 @@ func (c Catalog) Resolve(provider, model string) (catProvider, catModel string, 
 			}
 		}
 	}
-	// Meta's own rows only take Meta's prices: a reseller listing a model Meta sells no API access
-	// to (muse-wonder-full-1.0) must not price subscription traffic.
+	// Meta's own rows only take Meta's prices (or our estimates): a reseller listing a model Meta
+	// sells no API access to (muse-wonder-full-1.0) must not price subscription traffic.
 	if CatalogProvider(provider) == "meta" {
 		return "", "", Model{}, false
 	}
@@ -267,7 +298,7 @@ type Cost struct {
 	Total      float64
 	// PricedAs records what was applied: "<provider>/<model>", plus " long", " fast×2" ….
 	PricedAs string
-	Source   string // "models.dev" | "local"
+	Source   string // "models.dev" | "local" | "meta.ai" | "estimate:<basis>"
 }
 
 // Price returns the list-price cost of u, or ok=false when the model is unpriced.

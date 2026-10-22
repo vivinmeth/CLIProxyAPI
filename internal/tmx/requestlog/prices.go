@@ -8,7 +8,9 @@ package requestlog
 // fetch identical to the latest stored one (same source and catalog) is not stored again.
 //
 // Rows written while no catalog is loaded stay NULL (price_source IS NULL) and are priced by the
-// hourly pass; rows of models the catalog doesn't know are "unpriced" and retried once a day.
+// hourly pass; rows of models the catalog doesn't know are "unpriced" and retried once a day. A
+// retry only takes a list price: an "unpriced" row is never given an estimate (pricing.IsEstimate),
+// so an estimate added later prices new traffic only.
 
 import (
 	"context"
@@ -106,9 +108,10 @@ func pricesFetchOff() bool {
 
 func (s *Store) loadSnapshot(ctx context.Context) (*priceSnapshot, error) {
 	var at time.Time
+	var source string
 	var body []byte
-	err := s.db.QueryRowContext(ctx, `SELECT fetched_at, catalog FROM `+s.schema+`.price_catalogs
-		ORDER BY fetched_at DESC LIMIT 1`).Scan(&at, &body)
+	err := s.db.QueryRowContext(ctx, `SELECT fetched_at, source, catalog FROM `+s.schema+`.price_catalogs
+		ORDER BY fetched_at DESC LIMIT 1`).Scan(&at, &source, &body)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -118,6 +121,18 @@ func (s *Store) loadSnapshot(ctx context.Context) (*priceSnapshot, error) {
 	var cat pricing.Catalog
 	if err = json.Unmarshal(body, &cat); err != nil {
 		return nil, err
+	}
+	// A snapshot stored before a code-pinned price was added gets it now, as a new snapshot, so every
+	// row's priced_at still names a stored catalog that holds the rate it was priced at.
+	if pricing.AddPinned(cat) {
+		if body, err = json.Marshal(cat); err != nil {
+			return nil, err
+		}
+		at = time.Now().UTC().Truncate(time.Microsecond)
+		if _, err = s.db.ExecContext(ctx, `INSERT INTO `+s.schema+`.price_catalogs (fetched_at, source, catalog)
+			VALUES ($1, $2, $3)`, at, source, string(body)); err != nil {
+			return nil, err
+		}
 	}
 	return &priceSnapshot{cat: cat, fetchedAt: at.UTC(), checkedAt: at.UTC()}, nil
 }
@@ -175,7 +190,7 @@ func (s *Store) fetchSnapshot(ctx context.Context) (*priceSnapshot, error) {
 }
 
 // pricePending prices rows that have no price yet (and, when retryUnpriced, rows whose model the
-// catalog didn't know). Priced rows are never repriced.
+// catalog didn't know, with a list price only). Priced rows are never repriced.
 func (s *Store) pricePending(ctx context.Context, retryUnpriced bool) (int, error) {
 	snap := s.priceSnap()
 	if snap == nil {
@@ -189,7 +204,8 @@ func (s *Store) pricePending(ctx context.Context, retryUnpriced bool) (int, erro
 	lastID := int64(0)
 	for {
 		rows, err := s.db.QueryContext(ctx, `SELECT id, provider, model, uncached_input, cache_read, cache_write,
-			cache_write_1h, output_non_reasoning, reasoning_tokens, speed, service_tier, `+pricingInputs+`
+			cache_write_1h, output_non_reasoning, reasoning_tokens, speed, service_tier, `+pricingInputs+`,
+			price_source IS NOT NULL
 			FROM `+s.table()+` t WHERE `+cond+` AND id > $1 ORDER BY id LIMIT $2`, lastID, pricesBatch)
 		if err != nil {
 			return total, err
@@ -197,14 +213,22 @@ func (s *Store) pricePending(ctx context.Context, retryUnpriced bool) (int, erro
 		var ids []int64
 		var fps []string
 		var batch []Row
+		scanned := 0
 		for rows.Next() {
 			var id int64
 			var fp string
+			var wasUnpriced bool
 			var r Row
 			if err = rows.Scan(&id, &r.Provider, &r.Model, &r.UncachedInput, &r.CacheRead, &r.CacheWrite,
-				&r.CacheWrite1h, &r.OutputNonReasoning, &r.ReasoningTokens, &r.Speed, &r.ServiceTier, &fp); err != nil {
+				&r.CacheWrite1h, &r.OutputNonReasoning, &r.ReasoningTokens, &r.Speed, &r.ServiceTier, &fp, &wasUnpriced); err != nil {
 				_ = rows.Close()
 				return total, err
+			}
+			scanned++
+			lastID = id
+			priceRow(&r, snap)
+			if wasUnpriced && (r.PriceSource == nil || *r.PriceSource == "unpriced" || pricing.IsEstimate(*r.PriceSource)) {
+				continue // still unknown, or only an estimate: history stays as it was
 			}
 			ids = append(ids, id)
 			fps = append(fps, fp)
@@ -215,12 +239,11 @@ func (s *Store) pricePending(ctx context.Context, retryUnpriced bool) (int, erro
 			return total, err
 		}
 		_ = rows.Close()
-		if len(ids) == 0 {
+		if scanned == 0 {
 			return total, nil
 		}
-		lastID = ids[len(ids)-1]
-		for i := range batch {
-			priceRow(&batch[i], snap)
+		if len(ids) == 0 {
+			continue
 		}
 		if err = s.writePrices(ctx, ids, fps, batch, snap.fetchedAt); err != nil {
 			return total, err

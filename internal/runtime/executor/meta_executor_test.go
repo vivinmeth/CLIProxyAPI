@@ -1247,6 +1247,7 @@ func TestMetaExecutor_NotFoundCooldown_Shortened_Issue6117(t *testing.T) {
 }
 
 func TestMetaExecutor_Execute_StripsSearchContentTypesFromWebSearch(t *testing.T) {
+	t.Setenv("TMX_META_CONTRIBUTOR", "allow") // tmx: contributor models are refused by default
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var errRead error
@@ -1304,6 +1305,7 @@ func TestMetaExecutor_Execute_StripsSearchContentTypesFromWebSearch(t *testing.T
 }
 
 func TestMetaExecutor_ExecuteStream_StripsSearchContentTypesFromWebSearch(t *testing.T) {
+	t.Setenv("TMX_META_CONTRIBUTOR", "allow") // tmx: contributor models are refused by default
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var errRead error

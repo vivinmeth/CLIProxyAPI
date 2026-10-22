@@ -11,6 +11,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/muse"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -126,4 +127,30 @@ func TestMetaExecutor_SubscriptionUsageBecomesQuotaSignals(t *testing.T) {
 		}
 		check(t, ctx)
 	})
+}
+
+// Contributor-mode models are refused before anything is sent to Meta (tmx/muse/contributor.go).
+func TestMetaExecutor_RefusesContributorModels(t *testing.T) {
+	t.Setenv("TMX_META_CONTRIBUTOR", "")
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
+	defer server.Close()
+	exec := NewMetaExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Provider: "meta", Attributes: map[string]string{"api_key": "k", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{Model: "muse-spark-1.3-contributor", Payload: []byte(`{"model":"muse-spark-1.3-contributor","input":"hi"}`)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: true}
+	_, errStream := exec.ExecuteStream(context.Background(), auth, req, opts)
+	_, errExec := exec.Execute(context.Background(), auth, req, opts)
+	_, errCount := exec.CountTokens(context.Background(), auth, req, opts)
+	for _, err := range []error{errStream, errExec, errCount} {
+		if !muse.IsContributorError(err) || !strings.Contains(err.Error(), muse.ContributorBlockedMessage) {
+			t.Fatalf("err = %v", err)
+		}
+		if sc, ok := err.(interface{ IsRequestScoped() bool }); !ok || !sc.IsRequestScoped() {
+			t.Fatalf("refusal must be request-scoped: %T", err)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("upstream called %d times", hits)
+	}
 }

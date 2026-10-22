@@ -126,6 +126,9 @@ func nativeInteractionsExecutionError() *interfaces.ErrorMessage {
 // router selected a built-in provider, it skips model->provider resolution and uses the router's
 // provider (with an optional target model); otherwise it falls back to the registry-based path.
 func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel string, allowImageModel bool, routeDecision modelRouteDecision, execOptions modelExecutionOptions) ([]string, string, *interfaces.ErrorMessage) {
+	if errMsg := tmxContributorBlocked(modelName, originalRequestedModel, routeDecision.Model); errMsg != nil {
+		return nil, "", errMsg
+	}
 	forcedProvider := strings.ToLower(strings.TrimSpace(execOptions.ForcedProvider))
 	if forcedProvider != "" {
 		if routeDecision.ExecutorPluginID != "" {

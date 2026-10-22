@@ -9,6 +9,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/modelconfig"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/muse"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
@@ -210,6 +211,7 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 			}
 		}
 		models = applyExcludedModels(models, excluded)
+		models = muse.DropContributorModels(models, oauthModelAliasesForAuth(cfg, coreauth.OAuthModelAliasChannel(provider, authKind), a.Attributes)) // tmx
 	default:
 		// Handle OpenAI-compatibility providers by name using config
 		if cfg != nil {
