@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/pool"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/probes"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
@@ -93,5 +94,18 @@ func TestTMXPoolHistoryContract(t *testing.T) {
 		if rec.Code != 400 {
 			t.Fatalf("%s: %d", bad, rec.Code)
 		}
+	}
+}
+
+func TestTMXProbesRoute(t *testing.T) {
+	probes.ResetForTest()
+	probes.Record("HEAD", "/api/hello", "10.64.0.106", "Bun/1.4.4", 404, time.Now())
+	r := gin.New()
+	registerTMXManagementRoutes(r.Group("/v8/management"), nil, nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("GET", "/v8/management/tmx/probes", nil))
+	var sum probes.Summary
+	if err := json.Unmarshal(rec.Body.Bytes(), &sum); err != nil || rec.Code != 200 || sum.Total != 1 || sum.Sources[0].Path != "/api/hello" {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/archive"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/pool"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/probes"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/quota"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -26,6 +27,8 @@ func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher, mgr
 		c.JSON(http.StatusOK, tmxPoolBuild(c.Request.Context(), fetcher, mgr, c.Query("model")))
 	})
 	v8.GET("/tmx/pool/history", tmxPoolHistory)
+	// Health-check / discovery probes counted instead of written as error logs (internal/tmx/probes).
+	v8.GET("/tmx/probes", func(c *gin.Context) { c.JSON(http.StatusOK, probes.Snapshot()) })
 	v8.GET("/tmx/requests/summary", tmxRequestSummary)
 	v8.GET("/tmx/requests", tmxRequestList)
 	v8.GET("/tmx/requests/rollup", tmxRequestRollup)
