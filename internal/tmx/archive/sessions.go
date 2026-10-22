@@ -500,7 +500,20 @@ func (a *Archive) GetSession(ctx context.Context, id string) (map[string]any, er
 		}
 		sources = append(sources, map[string]any{"name": name, "blob": blob, "size": size, "ingested_at": at})
 	}
-	return map[string]any{"session": sessions, "messages": msgs, "sources": sources}, nil
+	if err = srcRows.Err(); err != nil {
+		return nil, err
+	}
+	// Raw files as they stand now (whole uploads and appends) and files kept next to the transcript.
+	files, err := a.ListFiles(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	attachments, _, err := a.ListAttachments(ctx, AttachmentQuery{SessionID: id, Limit: 1000})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"session": sessions, "messages": msgs, "sources": sources, "files": files,
+		"attachments": attachments}, nil
 }
 
 // ListSessionByID returns one session summary or an error when it doesn't exist.
