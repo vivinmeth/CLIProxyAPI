@@ -20,6 +20,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/durability"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/spool"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
@@ -27,16 +29,22 @@ import (
 const (
 	defaultSchema        = "tmx"
 	defaultRetentionDays = 0 // keep forever: the request log is the long-term usage record
-	queueSize            = 10000
 	batchSize            = 200
 	flushInterval        = 2 * time.Second
 	pruneInterval        = 6 * time.Hour
-	// Rows whose insert failed wait in memory (up to pendingMax) and are retried with backoff; on
-	// shutdown they go to a spool file that the next start reads back.
-	pendingMax    = 100000
-	retryMaxDelay = time.Minute
-	spoolFileName = "tmx-requestlog-pending.jsonl"
+	// Rows the database can't take right now (it is down, or the queue is full) go to a durable
+	// on-disk spool (internal/tmx/spool) and are replayed when it recovers; rows it refuses for
+	// their content go to the spool's dead-letter file. Nothing is dropped unless the spool is
+	// over its cap (TMX_SPOOL_REQUESTLOG_MAX_MB, default 1 GiB), and that is counted.
+	spoolMaxBytes = 1 << 30
+	// legacySpoolFileName: the pending-rows file of earlier versions, moved into the spool at start.
+	legacySpoolFileName = "tmx-requestlog-pending.jsonl"
+	// allowPruneValue must be in TMX_REQUESTLOG_ALLOW_PRUNE for a nonzero retention to delete rows.
+	allowPruneValue = "yes-delete-history"
 )
+
+// queueSize is the in-memory queue in front of the writer (a variable for tests).
+var queueSize = 10000
 
 var schemaNamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
 
@@ -52,8 +60,8 @@ type Store struct {
 	dropped       atomic.Int64
 	written       atomic.Int64
 	writeErrors   atomic.Int64
-	rejected      atomic.Int64 // rows the database refused one by one (logged, not retried)
-	pendingRows   atomic.Int64
+	rejected      atomic.Int64 // rows the database refused for their content (dead-lettered)
+	spooled       atomic.Int64 // rows sent to the spool (database down / queue full)
 	stopOnce      sync.Once
 	closeWaitOnce sync.Once
 	closeDone     chan struct{}
@@ -62,7 +70,7 @@ type Store struct {
 	keyMachines atomic.Pointer[map[string]string] // api_key_hash -> machine (key_machines)
 	prices      atomic.Pointer[priceSnapshot]
 	stopPrices  chan struct{}
-	spoolFile   string // pending-rows file, resolved once at Open (see spoolPath)
+	spool       *spool.Spool // nil only when the spool directory can't be opened
 }
 
 var current atomic.Pointer[Store]
@@ -75,8 +83,12 @@ func Default() *Store { return current.Load() }
 //	TMX_REQUESTLOG=off                 disable
 //	TMX_REQUESTLOG_DSN                 Postgres DSN (falls back to PGSTORE_DSN)
 //	TMX_REQUESTLOG_SCHEMA              schema name (default "tmx")
-//	TMX_REQUESTLOG_RETENTION_DAYS      live proxy rows older than this are pruned (default 0 = keep
-//	                                   forever); imported rows (extern:*) are never pruned
+//	TMX_REQUESTLOG_RETENTION_DAYS      default 0 = keep forever (the request log is the long-term
+//	                                   usage record). A nonzero value is IGNORED, with a loud error,
+//	                                   unless TMX_REQUESTLOG_ALLOW_PRUNE=yes-delete-history is also
+//	                                   set; then live proxy rows older than that many days are
+//	                                   deleted. Imported rows (extern:*) are never pruned.
+//	TMX_SPOOL_DIR / TMX_SPOOL_REQUESTLOG_MAX_MB   durable spool location and cap (spool.Dir)
 //
 // Failure to connect is logged and leaves logging disabled; it never blocks startup.
 func StartFromEnv(ctx context.Context) *Store {
@@ -96,20 +108,50 @@ func StartFromEnv(ctx context.Context) *Store {
 	if schema == "" {
 		schema = defaultSchema
 	}
-	retention := defaultRetentionDays
-	if raw := strings.TrimSpace(os.Getenv("TMX_REQUESTLOG_RETENTION_DAYS")); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
-			retention = n
-		}
-	}
+	retention := retentionFromEnv()
 	store, err := Open(ctx, dsn, schema, retention)
 	if err != nil {
 		log.WithError(err).Error("tmx request log: disabled, could not open store")
 		return nil
 	}
 	current.Store(store)
-	log.Infof("tmx request log: writing to %s.requests (retention %d days)", schema, retention)
+	durability.Register("requestlog", store.Durability)
+	retained := "kept forever"
+	if retention > 0 {
+		retained = fmt.Sprintf("PRUNED after %d days", retention)
+	}
+	spoolDir := "none"
+	if store.spool != nil {
+		spoolDir = store.spool.Dir()
+	}
+	log.Infof("tmx request log: writing to %s.requests (rows %s, spool %s)", schema, retained, spoolDir)
 	return store
+}
+
+// retentionFromEnv is the retention in days: 0 (keep forever) unless TMX_REQUESTLOG_RETENTION_DAYS
+// is nonzero AND TMX_REQUESTLOG_ALLOW_PRUNE=yes-delete-history. Deleting history is never the
+// default and never the result of one stray variable.
+func retentionFromEnv() int {
+	raw := strings.TrimSpace(os.Getenv("TMX_REQUESTLOG_RETENTION_DAYS"))
+	if raw == "" {
+		return defaultRetentionDays
+	}
+	n, err := strconv.Atoi(raw)
+	switch {
+	case err != nil || n < 0:
+		log.Errorf("tmx request log: TMX_REQUESTLOG_RETENTION_DAYS=%q is not a day count; IGNORED, rows are kept forever", raw)
+		return defaultRetentionDays
+	case n == 0:
+		return 0
+	case strings.TrimSpace(os.Getenv("TMX_REQUESTLOG_ALLOW_PRUNE")) != allowPruneValue:
+		log.Errorf("tmx request log: TMX_REQUESTLOG_RETENTION_DAYS=%d IGNORED, rows are kept forever: pruning "+
+			"deletes request history. Also set TMX_REQUESTLOG_ALLOW_PRUNE=%s to really delete rows older than %d days",
+			n, allowPruneValue, n)
+		return defaultRetentionDays
+	default:
+		log.Warnf("tmx request log: DELETING live proxy rows older than %d days (TMX_REQUESTLOG_ALLOW_PRUNE is set)", n)
+		return n
+	}
 }
 
 // Open connects, ensures the schema and starts the writer and pruner.
@@ -138,12 +180,12 @@ func Open(ctx context.Context, dsn, schema string, retentionDays int) (*Store, e
 		flush:         make(chan chan struct{}),
 		done:          make(chan struct{}),
 		stopPrices:    make(chan struct{}),
-		spoolFile:     spoolPath(),
 	}
 	if errSchema := s.ensureSchema(pingCtx); errSchema != nil {
 		_ = db.Close()
 		return nil, errSchema
 	}
+	s.openSpool()
 	go s.run()
 	go s.backfillAccounting()
 	go s.backfillHarness()
@@ -250,19 +292,15 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	return nil
 }
 
-// Enqueue hands a row to the writer without blocking; when the queue is full the row is dropped
-// and counted rather than slowing the request path. (The writer never blocks on the database:
-// failed inserts wait in its pending list, so the queue only fills under extreme load.)
+// Enqueue hands a row to the writer without waiting on the database. When the queue is full (the
+// writer is stuck on a slow database) or the store is closing, the row goes to the on-disk spool
+// instead (one fsynced append; only under overload).
 func (s *Store) Enqueue(row Row) {
 	if s == nil {
 		return
 	}
 	s.queueMu.RLock()
 	defer s.queueMu.RUnlock()
-	if s.closing {
-		s.dropped.Add(1)
-		return
-	}
 	if row.RowKey == "" {
 		row.RowKey = newRowKey()
 	}
@@ -271,25 +309,45 @@ func (s *Store) Enqueue(row Row) {
 			row.Machine = (*m)[row.APIKeyHash]
 		}
 	}
+	if s.closing {
+		s.spoolRows([]Row{row})
+		return
+	}
 	select {
 	case s.queue <- row:
 	default:
-		if s.dropped.Add(1)%100 == 1 {
-			log.Warn("tmx request log: queue full, dropping rows")
+		if n := s.spooled.Load(); n%1000 == 0 {
+			log.Warn("tmx request log: queue full, spooling rows to disk")
 		}
+		s.spoolRows([]Row{row})
 	}
 }
 
-// Stats reports writer counters for the status endpoint.
+// Stats reports writer counters for the status endpoint. pending = rows in the on-disk spool.
 func (s *Store) Stats() map[string]int64 {
+	d := s.Durability()
 	return map[string]int64{
 		"written":      s.written.Load(),
-		"dropped":      s.dropped.Load(),
+		"dropped":      d.Dropped,
 		"write_errors": s.writeErrors.Load(),
 		"rejected":     s.rejected.Load(),
-		"pending":      s.pendingRows.Load(),
-		"queued":       int64(len(s.queue)),
+		"pending":      d.SpooledPending,
+		"queued":       d.Queued,
+		"spooled":      d.Spooled,
+		"replayed":     d.Replayed,
+		"deadlettered": d.Deadlettered,
 	}
+}
+
+// Durability is the request log's entry in GET /tmx/durability.
+func (s *Store) Durability() durability.Stats {
+	var d durability.Stats
+	if s.spool != nil {
+		d = s.spool.Stats()
+	}
+	d.Queued = int64(len(s.queue))
+	d.Dropped += s.dropped.Load()
+	return d
 }
 
 // Close flushes queued rows and stops the writer.
@@ -304,6 +362,7 @@ func (s *Store) Close() {
 		close(s.queue)
 		s.queueMu.Unlock()
 		<-s.done
+		s.spool.Close() // what is still spooled is replayed by the next start
 		_ = s.db.Close()
 	})
 }
@@ -316,11 +375,9 @@ func (s *Store) run() {
 	defer prune.Stop()
 	s.prune()
 
-	w := &writer{s: s, pending: readSpool(s.spoolFile)}
-	w.spooled = len(w.pending) > 0
 	batch := make([]Row, 0, batchSize)
 	flush := func() {
-		w.write(batch)
+		s.write(batch)
 		batch = batch[:0]
 	}
 	for {
@@ -328,7 +385,6 @@ func (s *Store) run() {
 		case row, ok := <-s.queue:
 			if !ok {
 				flush()
-				w.persistAt(time.Time{}) // whatever is still pending survives the restart
 				return
 			}
 			batch = append(batch, row)
@@ -348,7 +404,6 @@ func (s *Store) run() {
 				batch = append(batch, row)
 			}
 			flush()
-			w.persistAt(time.Time{})
 			close(ack)
 			if stopped {
 				return
@@ -361,24 +416,15 @@ func (s *Store) run() {
 	}
 }
 
-// writer is the run loop's insert state: rows that failed to insert are kept and retried.
-type writer struct {
-	s         *Store
-	pending   []Row
-	nextRetry time.Time
-	delay     time.Duration
-	spooled   bool      // the spool file holds pending rows
-	dirty     bool      // pending changed since the spool was last written
-	lastSpool time.Time // throttles spool rewrites during an outage
-}
-
-// write prices and inserts batch (after anything still pending). Rows are only dropped when the
-// database refuses them for what they contain (data / constraint errors, logged one by one);
-// anything else (connection loss, deadlock, a restart) keeps them for a retry with backoff, and
-// while rows are pending they are also kept in the spool file, so a crash doesn't lose them.
-// Inserts are idempotent per row key, so a retry never double counts.
-func (w *writer) write(batch []Row) {
-	s := w.s
+// write prices and inserts batch. Rows the database can't take now (connection loss, a restart,
+// a timeout) go to the spool and are replayed when it is back; while the spool's replay is
+// failing, rows go straight to the spool instead of waiting on a database known to be down. A
+// row refused for what it contains (data / constraint error) is dead-lettered alone; the rest of
+// its batch is written. Inserts are idempotent per row key, so a replay never double counts.
+func (s *Store) write(batch []Row) {
+	if len(batch) == 0 {
+		return
+	}
 	snap := s.priceSnap()
 	for i := range batch {
 		if batch[i].RowKey == "" {
@@ -386,62 +432,152 @@ func (w *writer) write(batch []Row) {
 		}
 		priceRow(&batch[i], snap)
 	}
-	w.pending = append(w.pending, batch...)
-	if over := len(w.pending) - pendingMax; over > 0 {
-		s.dropped.Add(int64(over))
-		log.Warnf("tmx request log: %d unwritten rows over the pending limit dropped", over)
-		w.pending = append([]Row(nil), w.pending[over:]...)
-	}
-	before := len(w.pending)
-	defer func() {
-		s.pendingRows.Store(int64(len(w.pending)))
-		if len(batch) > 0 || len(w.pending) != before {
-			w.dirty = true
-		}
-		w.persistAt(time.Now())
-	}()
-	if len(w.pending) == 0 || time.Now().Before(w.nextRetry) {
+	if s.spool != nil && s.spool.Failing() {
+		s.spoolRows(batch)
 		return
 	}
-	if w.delay > 0 { // retrying: save what is pending before possibly long database attempts
-		w.persistAt(time.Now())
+	for len(batch) > 0 {
+		done, err := s.insertRows(context.Background(), batch)
+		s.written.Add(int64(done))
+		batch = batch[done:]
+		switch {
+		case err == nil:
+			if s.spool != nil {
+				s.spool.Recovered()
+			}
+			return
+		case spool.IsPermanent(err):
+			s.reject(batch[0], err)
+			batch = batch[1:]
+		default:
+			if s.writeErrors.Add(1)%20 == 1 {
+				log.WithError(err).Warnf("tmx request log: write failed; %d rows spooled to disk for retry", len(batch))
+			}
+			if s.spool != nil {
+				s.spool.NoteError(err)
+			}
+			s.spoolRows(batch)
+			return
+		}
 	}
-	backoff := func(err error) {
-		s.writeErrors.Add(1)
-		w.delay = min(max(2*w.delay, flushInterval), retryMaxDelay)
-		w.nextRetry = time.Now().Add(w.delay)
-		log.WithError(err).Warnf("tmx request log: write failed; %d rows kept for retry", len(w.pending))
-	}
-	for len(w.pending) > 0 {
-		chunk := w.pending[:min(batchSize, len(w.pending))]
-		err := s.insert(chunk)
+}
+
+// insertRows inserts rows in chunks and returns how many leading rows are now in the table. On an
+// error the row at that index (and those after it) are not: spool.Permanent when the database
+// refuses that row for its content, a plain error when it can't take rows right now.
+func (s *Store) insertRows(ctx context.Context, rows []Row) (int, error) {
+	done := 0
+	for done < len(rows) {
+		chunk := rows[done:min(done+batchSize, len(rows))]
+		err := s.insertContext(ctx, chunk)
 		if err == nil {
-			s.written.Add(int64(len(chunk)))
-			w.pending = w.pending[len(chunk):]
+			done += len(chunk)
 			continue
 		}
 		if !isDataError(err) || !s.reachable() {
-			backoff(err)
-			return
+			return done, err
 		}
 		// Something in the chunk is refused: find it row by row.
-		for len(chunk) > 0 {
-			errOne := s.insert(chunk[:1])
+		for i := range chunk {
+			errOne := s.insertContext(ctx, chunk[i:i+1])
 			switch {
 			case errOne == nil:
-				s.written.Add(1)
+				done++
 			case isDataError(errOne):
-				s.rejected.Add(1)
-				log.WithError(errOne).Warnf("tmx request log: row rejected (trace %s, model %s)", chunk[0].TraceID, chunk[0].Model)
+				return done, spool.Permanent(errOne)
 			default:
-				backoff(errOne)
-				return
+				return done, errOne
 			}
-			chunk = chunk[1:]
-			w.pending = w.pending[1:]
 		}
 	}
-	w.pending, w.delay, w.nextRetry = nil, 0, time.Time{}
+	return done, nil
+}
+
+// reject dead-letters a row the database refused for its content.
+func (s *Store) reject(row Row, err error) {
+	s.rejected.Add(1)
+	log.WithError(err).Warnf("tmx request log: row rejected, dead-lettered (trace %s, model %s)", row.TraceID, row.Model)
+	payload, errJ := json.Marshal(&row)
+	if s.spool == nil || errJ != nil {
+		s.dropped.Add(1)
+		return
+	}
+	_ = s.spool.Deadletter(payload, err.Error())
+}
+
+// spoolRows appends rows to the on-disk spool (one fsync for the lot). Without a spool they are
+// dropped, counted and logged.
+func (s *Store) spoolRows(rows []Row) {
+	payloads := make([][]byte, 0, len(rows))
+	for i := range rows {
+		if rows[i].RowKey == "" {
+			rows[i].RowKey = newRowKey()
+		}
+		payload, err := json.Marshal(&rows[i])
+		if err != nil || s.spool == nil {
+			if s.dropped.Add(1)%100 == 1 {
+				log.Errorf("tmx request log: ROW DROPPED, no spool to keep it (%d dropped since start)", s.dropped.Load())
+			}
+			continue
+		}
+		payloads = append(payloads, payload)
+	}
+	if len(payloads) > 0 && s.spool.AppendBatch(payloads) == nil { // failures are counted by the spool
+		s.spooled.Add(int64(len(payloads)))
+	}
+}
+
+// deliverSpooled is the spool's replay sink: decode and insert in one batch.
+func (s *Store) deliverSpooled(ctx context.Context, items []spool.Item) (int, error) {
+	rows := make([]Row, 0, len(items))
+	var decodeErr error
+	for _, it := range items {
+		raw, err := it.Bytes()
+		if err != nil {
+			decodeErr = err
+			break
+		}
+		var r Row
+		if err = json.Unmarshal(raw, &r); err != nil {
+			decodeErr = spool.Permanent(fmt.Errorf("undecodable spooled row: %w", err))
+			break
+		}
+		rows = append(rows, r)
+	}
+	done, err := s.insertRows(ctx, rows)
+	s.written.Add(int64(done))
+	if err == nil {
+		err = decodeErr
+	}
+	if spool.IsPermanent(err) {
+		s.rejected.Add(1)
+	}
+	return done, err
+}
+
+// openSpool opens the durable spool and moves the pending-rows file of earlier versions into it.
+func (s *Store) openSpool() {
+	name := "requestlog"
+	if s.schema != defaultSchema {
+		name += "-" + s.schema
+	}
+	sp, err := spool.OpenFirstFree(spool.Dir(name), spool.Options{Name: name, Deliver: s.deliverSpooled,
+		MaxBatch: batchSize, MaxBytes: spool.MaxBytesFromEnv("requestlog", spoolMaxBytes)})
+	if err != nil {
+		log.WithError(err).Error("tmx request log: NO DURABLE SPOOL, rows the database can't take will be dropped")
+		return
+	}
+	s.spool = sp
+	legacy := legacySpoolPath()
+	if rows := readSpool(legacy); len(rows) > 0 {
+		before := sp.Stats().Dropped
+		s.spoolRows(rows)
+		if sp.Stats().Dropped != before {
+			log.Errorf("tmx request log: could not move every row of %s into the spool; file kept", legacy)
+			return
+		}
+	}
+	_ = os.Remove(legacy)
 }
 
 // isDataError: the database refused the row's content (data exception or integrity violation:
@@ -472,59 +608,19 @@ func (s *Store) reachable() bool {
 	return s.db.PingContext(ctx) == nil
 }
 
-// spoolPath is the pending-rows file: TMX_REQUESTLOG_SPOOL (a directory), else the archive
-// spool volume (persistent on prod), else WRITABLE_PATH, else the temp dir.
-func spoolPath() string {
+// legacySpoolPath is where earlier versions kept rows pending a retry: TMX_REQUESTLOG_SPOOL (a
+// directory), else the archive spool volume, else WRITABLE_PATH, else the temp dir.
+func legacySpoolPath() string {
 	for _, dir := range []string{os.Getenv("TMX_REQUESTLOG_SPOOL"), os.Getenv("TMX_ARCHIVE_SPOOL"),
 		"/CLIProxyAPI/archive-spool", os.Getenv("WRITABLE_PATH")} {
 		if dir = strings.TrimSpace(dir); dir == "" {
 			continue
 		}
 		if st, err := os.Stat(dir); err == nil && st.IsDir() {
-			return filepath.Join(dir, spoolFileName)
+			return filepath.Join(dir, legacySpoolFileName)
 		}
 	}
-	return filepath.Join(os.TempDir(), spoolFileName)
-}
-
-// spoolEvery: while rows are pending the spool is rewritten at most this often, before each
-// write attempt (a long outage isn't rewritten on every flush). A crash during an outage loses
-// the rows received since the last spool write: up to spoolEvery plus the batch being written.
-// When the database is healthy rows are never spooled; they live in memory for one flush.
-const spoolEvery = 10 * time.Second
-
-// persistAt mirrors the pending rows to the spool file (atomically) when they changed and the
-// last write is spoolEvery old (now zero = write regardless), or removes the file once nothing
-// is pending; readSpool loads it at the next start. A failed write stays dirty and is retried.
-func (w *writer) persistAt(now time.Time) {
-	path := w.s.spoolFile
-	if len(w.pending) == 0 {
-		if !w.spooled && !w.dirty {
-			return
-		}
-		if err := os.Remove(path); err == nil || os.IsNotExist(err) {
-			w.spooled, w.dirty = false, false
-		}
-		return
-	}
-	if !w.dirty || (!now.IsZero() && now.Sub(w.lastSpool) < spoolEvery) {
-		return
-	}
-	var b bytes.Buffer
-	enc := json.NewEncoder(&b)
-	for i := range w.pending {
-		_ = enc.Encode(&w.pending[i])
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b.Bytes(), 0o600); err != nil {
-		log.WithError(err).Warnf("tmx request log: can't spool %d pending rows", len(w.pending))
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		log.WithError(err).Warnf("tmx request log: can't spool %d pending rows", len(w.pending))
-		return
-	}
-	w.spooled, w.dirty, w.lastSpool = true, false, now
+	return filepath.Join(os.TempDir(), legacySpoolFileName)
 }
 
 func readSpool(path string) []Row {
@@ -542,7 +638,7 @@ func readSpool(path string) []Row {
 		rows = append(rows, r)
 	}
 	if len(rows) > 0 {
-		log.Infof("tmx request log: %d rows from the previous run queued for writing", len(rows))
+		log.Infof("tmx request log: %d rows from an earlier version's pending file moved to the spool", len(rows))
 	}
 	return rows
 }
@@ -595,8 +691,10 @@ func insertValues(rows []Row) (string, []any) {
 	return b.String(), args
 }
 
-func (s *Store) insert(rows []Row) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func (s *Store) insert(rows []Row) error { return s.insertContext(context.Background(), rows) }
+
+func (s *Store) insertContext(ctx context.Context, rows []Row) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	values, args := insertValues(rows)
 	// A retried batch whose first attempt did commit (the acknowledgement was lost) inserts nothing.

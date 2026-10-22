@@ -21,7 +21,9 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/capture"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/durability"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/requestlog"
+	tmxspool "github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/spool"
 	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	log "github.com/sirupsen/logrus"
 )
@@ -30,7 +32,7 @@ const (
 	schema             = "tmx_archive"
 	defaultBucket      = "tmx-bodies"
 	defaultSpool       = "/CLIProxyAPI/archive-spool"
-	queueBytesLimit    = 256 << 20 // in-flight exchange bytes before new captures are dropped
+	queueBytesLimit    = 256 << 20 // in-flight exchange bytes before new captures go to the disk spool
 	queueLengthLimit   = 4096
 	captureWorkerCount = 2
 )
@@ -48,8 +50,10 @@ type Archive struct {
 	queue         chan *capture.Exchange
 	queueBytes    atomic.Int64
 	captured      atomic.Int64
-	dropped       atomic.Int64
-	failed        atomic.Int64
+	dropped       atomic.Int64 // lost: no durable spool to keep them
+	failed        atomic.Int64 // live stores that failed (the exchange was spooled)
+	overflowed    atomic.Int64 // exchanges the queue couldn't take (spooled)
+	spool         *tmxspool.Spool
 	wg            sync.WaitGroup
 	closeOnce     sync.Once
 	closeWaitOnce sync.Once
@@ -74,6 +78,7 @@ func Default() *Archive { return current.Load() }
 //	TMX_ARCHIVE_BUCKET               default tmx-bodies
 //	TMX_ARCHIVE_SPOOL                local spool dir (default /CLIProxyAPI/archive-spool; mount a volume)
 //	TMX_ARCHIVE_CAPTURE=off          keep the ingest API but don't capture proxied traffic
+//	TMX_SPOOL_ARCHIVE_MAX_MB         cap of the durable spool (<spool>/durable/archive, durable.go)
 //
 // Without R2 credentials blobs stay in the spool (dev). Failures never block startup.
 func StartFromEnv(ctx context.Context) *Archive {
@@ -121,6 +126,8 @@ func StartFromEnv(ctx context.Context) *Archive {
 	}
 	a.startAnalytics(ctx)
 	current.Store(a)
+	durability.Register("archive", a.Durability)
+	durability.Register("capture", captureDurability)
 	go func() {
 		// Imported usage rows written when a whole session was shadowed get their direct turns back.
 		if n, errR := a.Reshadow(context.Background()); errR != nil {
@@ -169,6 +176,7 @@ func Open(ctx context.Context, dsn string, r2 *minio.Client, bucket, env, spool 
 		return nil, err
 	}
 	a := &Archive{db: db, blobs: blobs, env: env, queue: make(chan *capture.Exchange, queueLengthLimit)}
+	a.openSpool(spool)
 	for i := 0; i < captureWorkerCount; i++ {
 		a.wg.Add(1)
 		go a.worker()
@@ -299,21 +307,20 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// enqueue is the capture sink. It never blocks: when the queue is over its byte or length limit
-// the exchange is dropped and counted.
+// enqueue is the capture sink. It never waits on the database: when the queue is over its byte
+// or length limit (or the archive is closing) the exchange is written to the durable spool
+// instead and stored by the replayer later.
 func (a *Archive) enqueue(ex *capture.Exchange) {
 	a.queueMu.RLock()
 	defer a.queueMu.RUnlock()
 	if a.closing.Load() {
-		ex.Release()
-		a.drop()
+		a.overflow(ex)
 		return
 	}
 	size := exchangeMemory(ex)
 	if a.queueBytes.Add(size) > queueBytesLimit {
 		a.queueBytes.Add(-size)
-		ex.Release()
-		a.drop()
+		a.overflow(ex)
 		return
 	}
 	finished := make(chan struct{})
@@ -324,15 +331,17 @@ func (a *Archive) enqueue(ex *capture.Exchange) {
 		a.pending.Delete(ex)
 		close(finished)
 		a.queueBytes.Add(-size)
-		ex.Release()
-		a.drop()
+		a.overflow(ex)
 	}
 }
 
-func (a *Archive) drop() {
-	if a.dropped.Add(1)%20 == 1 {
-		log.Warn("tmx archive: capture queue full, dropping exchanges")
+// overflow spools an exchange the queue can't take, then releases it.
+func (a *Archive) overflow(ex *capture.Exchange) {
+	if a.overflowed.Add(1)%20 == 1 {
+		log.Warn("tmx archive: capture queue full, spooling exchanges to disk")
 	}
+	a.spoolExchange(ex, "capture queue full")
+	ex.Release()
 }
 
 func (a *Archive) worker() {
@@ -340,12 +349,24 @@ func (a *Archive) worker() {
 	for ex := range a.queue {
 		size := exchangeMemory(ex)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		if err := a.storeExchange(ctx, ex); err != nil {
-			if a.failed.Add(1)%20 == 1 {
-				log.WithError(err).Warn("tmx archive: failed to store exchange")
+		switch {
+		case a.spool != nil && a.spool.Failing():
+			a.spoolExchange(ex, "archive store failing") // known to be down: don't wait on it
+		default:
+			if err := a.storeExchange(ctx, ex); err != nil {
+				if a.failed.Add(1)%20 == 1 {
+					log.WithError(err).Warn("tmx archive: failed to store exchange; spooled to disk for retry")
+				}
+				if a.spool != nil {
+					a.spool.NoteError(err)
+				}
+				a.spoolExchange(ex, err.Error())
+			} else {
+				a.captured.Add(1)
+				if a.spool != nil {
+					a.spool.Recovered()
+				}
 			}
-		} else {
-			a.captured.Add(1)
 		}
 		cancel()
 		ex.Release()
@@ -375,6 +396,13 @@ func redactHeaders(h map[string][]string) map[string][]string {
 }
 
 func (a *Archive) storeExchange(ctx context.Context, ex *capture.Exchange) error {
+	return a.storeExchangeWith(ctx, ex, rejectedRow)
+}
+
+// storeExchangeWith is storeExchange with the rejected-row source (a replayed exchange brings the
+// row computed before its credential headers were redacted).
+func (a *Archive) storeExchangeWith(ctx context.Context, ex *capture.Exchange,
+	rejected func(*capture.Exchange) (requestlog.Row, bool)) error {
 	requestPrefix := capturePrefix(ex, "request", ex.RequestBody, 1<<20)
 	clientSession := clientSessionID(ex.RequestHeaders, nil)
 	if clientSession == "" {
@@ -482,7 +510,7 @@ func (a *Archive) storeExchange(ctx context.Context, ex *capture.Exchange) error
 	if err == nil {
 		// Requests the proxy refused before trying any account never reach the usage plugin;
 		// record them here so they show up in the request log as "rejected".
-		if rej, ok := rejectedRow(ex); ok {
+		if rej, ok := rejected(ex); ok {
 			rej.TraceID, rej.RequestID = traceID, "rejected:"+traceID
 			requestlog.Default().Enqueue(rej)
 		}
@@ -542,8 +570,10 @@ func (a *Archive) Stats() map[string]any {
 		"live_capture_bytes":   capture.LiveBytes(),
 		"live_capture_dropped": capture.Dropped(),
 		"captured":             a.captured.Load(),
-		"dropped":              a.dropped.Load(),
+		"dropped":              a.Durability().Dropped,
 		"failed":               a.failed.Load(),
+		"overflowed":           a.overflowed.Load(),
+		"spooled_pending":      a.spool.Pending(),
 		"queued":               len(a.queue),
 		"queued_bytes":         a.queueBytes.Load(),
 		"blobs_stored":         a.blobs.stored.Load(),
@@ -571,6 +601,9 @@ func (a *Archive) Close() {
 		close(a.queue)
 		a.queueMu.Unlock()
 		a.wg.Wait()
+		a.queueMu.Lock() // wait out enqueues still spooling
+		a.queueMu.Unlock()
+		a.spool.Close() // what is still spooled is stored by the next start
 		if a.analytics != nil {
 			a.analytics.close()
 		}

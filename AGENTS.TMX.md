@@ -48,6 +48,11 @@ but are **parked**. Don't work there; see `../wiki/parked-fork-clones.md`.)
   `handlers/management/tmx_resets_backend.go`). Every claim is journaled in `tmx.reset_redemptions`
   before it is sent. Upstream-package hook: `sdk/cliproxy/auth/tmx_quota_signals.go`
   (`Manager.ClearQuotaSignals`). Details: `../wiki/reset-credits.md`.
+- **Durable spool** (`internal/tmx/spool/`, registry `internal/tmx/durability/`): writers that
+  can't reach Postgres (request log, quota snapshots, archive capture) append to an fsynced
+  on-disk spool under `<archive spool volume>/durable/<writer>` and replay with backoff; refused
+  items go to `deadletter/` (never deleted). Counters: `GET /v8/management/tmx/durability`. New
+  writers register with `durability.Register(name, fn)`. Details: `../wiki/durability-spool.md`.
 - Put new fork-only code under `internal/tmx/` and keep upstream-file edits to small hooks.
 
 ## Git

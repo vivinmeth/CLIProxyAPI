@@ -66,6 +66,7 @@ func openTestService(t *testing.T, f *fakeFetcher, clock *time.Time) *Service {
 	if dsn == "" {
 		t.Skip("TMX_REQUESTLOG_TEST_DSN not set")
 	}
+	t.Setenv("TMX_SPOOL_DIR", t.TempDir())
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -79,6 +80,7 @@ func openTestService(t *testing.T, f *fakeFetcher, clock *time.Time) *Service {
 		t.Fatal(err)
 	}
 	s.now = func() time.Time { return *clock }
+	t.Cleanup(s.spool.Close)
 	return s
 }
 
