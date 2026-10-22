@@ -10,8 +10,10 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/muse"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -125,6 +127,8 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			}
 			return true
 		}
+		// tmx: Muse reads its own usage meter from these events; other clients never see them.
+		passSubscriptionUsage := prepared.responseFormat == sdktranslator.FormatOpenAIResponse && muse.IsClientHeaders(opts.Headers)
 		var pendingEventLine []byte
 		var filteringSubscriptionUsage bool
 		var skipFilteredBlankLine bool
@@ -184,6 +188,14 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				pendingEventLine = nil
 				filteringSubscriptionUsage = false
 				skipFilteredBlankLine = true
+				if passSubscriptionUsage {
+					frame := append([]byte("event: "+metaSubscriptionUsageEventType+"\ndata: "), eventData...)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: append(frame, '\n', '\n')}:
+					case <-ctx.Done():
+						return
+					}
+				}
 				continue
 			}
 			if filteringSubscriptionUsage {

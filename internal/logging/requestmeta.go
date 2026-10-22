@@ -18,6 +18,7 @@ type ClientRequestMetadata struct {
 	ResolvedClientIP string
 	XForwardedFor    string
 	UserAgent        string
+	ClientID         string // tmx: x-client-id (Muse sends "tbh:<surface>")
 	SessionID        string
 	ParentSessionID  string
 	NodeKind         string

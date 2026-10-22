@@ -17,6 +17,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/muse"
 	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
@@ -373,6 +374,10 @@ func rowFromRecord(ctx context.Context, record coreusage.Record) Row {
 		ServiceTier:     tier,
 		CacheWrite1h:    detail.CacheWrite1hTokens,
 		Speed:           strings.TrimSpace(detail.ResponseSpeed),
+	}
+	// Muse's x-client-id ("tbh:<surface>") names the harness even when the user agent doesn't.
+	if muse.IsClient(meta.UserAgent, meta.ClientID) {
+		row.Harness, row.ClientMode = muse.Harness, muse.ClientMode(meta.UserAgent, meta.ClientID)
 	}
 	row.Billing = BillingFor(row.AuthType, row.Provider)
 	// Raw provider-shaped columns above are kept as reported; the normalised ones come from

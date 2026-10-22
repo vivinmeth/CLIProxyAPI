@@ -24,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/muse"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
@@ -71,6 +72,7 @@ type responsesSSEFramer struct {
 	terminalError        *interfaces.ErrorMessage
 	failureEvent         string
 	isCodexClient        bool
+	isMuseClient         bool // tmx: Muse keeps Meta's subscription_usage events
 	dataFrames           int
 	writeErr             error
 	canComplete          func() bool
@@ -148,7 +150,7 @@ func (f *responsesSSEFramer) shouldFilterPrivateEvent(streamEvent, payloadType s
 		}
 
 		// Always filter internal WebSocket timing telemetry and Meta subscription usage from SSE streams.
-		if strings.HasPrefix(name, "responsesapi.") || name == "response.subscription_usage" {
+		if strings.HasPrefix(name, "responsesapi.") || (name == "response.subscription_usage" && (f == nil || !f.isMuseClient)) {
 			return true
 		}
 
@@ -778,7 +780,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	if isCodexClient {
 		failureEvent = "response.failed"
 	}
-	framer := &responsesSSEFramer{failureEvent: failureEvent, isCodexClient: isCodexClient, canComplete: func() bool { return usage.StreamDeliverySupported(cliCtx) }}
+	framer := &responsesSSEFramer{failureEvent: failureEvent, isCodexClient: isCodexClient, isMuseClient: muse.IsClientHeaders(c.Request.Header), canComplete: func() bool { return usage.StreamDeliverySupported(cliCtx) }}
 	var initialOutput bytes.Buffer
 
 	// Peek at the first complete SSE data frame.

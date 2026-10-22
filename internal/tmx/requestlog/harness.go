@@ -1,6 +1,10 @@
 package requestlog
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/muse"
+)
 
 // HarnessFor names the client that produced a row, so live traffic and imported sessions share
 // labels. Imported rows ("extern:<harness>") keep their harness; proxied rows are classified by
@@ -26,6 +30,8 @@ func HarnessFor(source, userAgent string) (harness, clientMode string) {
 		default:
 			return "claude-code", "cli"
 		}
+	case muse.IsClient(ua, ""):
+		return muse.Harness, muse.ClientMode(ua, "")
 	case name == "codex_exec":
 		return "codex", "exec"
 	case name == "codex-tui" || name == "codex_cli_rs" || name == "codex_vscode":
