@@ -61,7 +61,10 @@ but are **parked**. Don't work there; see `../wiki/parked-fork-clones.md`.)
   `logging.ClientRequestMetadata`, set in `sdk/api/handlers/handlers.go`). Quota: the executor turns
   `subscription_usage` into `X-Meta-Subscription-*` signals (`muse/usage.go`; `meta` accepted in
   `sdk/cliproxy/auth/quota_signals.go`), `internal/tmx/quota/meta.go` reads them and polls
-  `/muse-code/key`; Meta list prices in `internal/tmx/pricing`. Details: `../wiki/muse-code.md`,
+  `/muse-code/key`; Meta list prices + the `muse-wonder-full-1.0` estimate in `internal/tmx/pricing`.
+  Contributor block (`muse/contributor.go`): hooks in `sdk/api/handlers/handlers_routing.go`
+  (`tmxContributorBlocked`, in `handlers_routing_tmx.go`), `sdk/cliproxy/service_models.go` (meta case),
+  and the top of the Meta executor's Execute / ExecuteStream / CountTokens. Details: `../wiki/muse-code.md`,
   `../wiki/quota-history.md`.
 - **Cooldown history** (`internal/tmx/cooldowns/`): append-only `tmx.cooldown_events` (windows as
   start/update/end sharing a `cooldown_id`, plus 429 / usage-limit / auth-error / 529 events), a
