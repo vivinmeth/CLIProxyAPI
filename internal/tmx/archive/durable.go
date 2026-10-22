@@ -253,13 +253,14 @@ func (a *Archive) deliverSpooled(ctx context.Context, items []tmxspool.Item) (in
 	return len(items), nil
 }
 
-// isDataError: the database refused the row's content; storing it again would fail again.
+// isDataError: the database refused the row's content (bad data, a constraint, or a value too
+// large to index); storing it again would fail again.
 func isDataError(err error) bool {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || len(pgErr.Code) < 2 {
 		return false
 	}
-	return pgErr.Code[:2] == "22" || pgErr.Code[:2] == "23"
+	return pgErr.Code[:2] == "22" || pgErr.Code[:2] == "23" || pgErr.Code == "54000"
 }
 
 // Durability is the archive capture writer's entry in GET /tmx/durability.

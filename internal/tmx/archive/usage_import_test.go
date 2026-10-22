@@ -181,8 +181,12 @@ func TestImportAccountAndBilling(t *testing.T) {
 		t.Fatalf("ollama billing = %q %v", billing, err)
 	}
 	in.Messages[0].Usage = json.RawMessage(`{"provider":"openai","model":"gpt-5.5","billing":"prepaid"}`)
-	if _, err := a.IngestSession(ctx, in); err == nil {
-		t.Fatal("unknown billing accepted")
+	// Refused alone: listed, and its stored version (billing subscription) is kept.
+	if res, err := a.IngestSession(ctx, in); err != nil || res.Errors != 1 || len(res.Rejected) != 1 || res.Rejected[0].ExternalID != "m1" {
+		t.Fatalf("unknown billing: %+v %v", res, err)
+	}
+	if err := rl.DB().QueryRow(`SELECT billing FROM tmx.requests WHERE import_ref = 'nanx-app:acct#m1'`).Scan(&billing); err != nil || billing != "subscription" {
+		t.Fatalf("m1 after refused re-send = %q %v", billing, err)
 	}
 }
 

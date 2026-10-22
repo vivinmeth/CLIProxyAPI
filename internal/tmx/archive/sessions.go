@@ -67,6 +67,27 @@ type IngestResult struct {
 	UsageRows    int      `json:"usage_rows"`
 	Removed      int      `json:"removed,omitempty"`       // messages dropped by replace
 	UsageRemoved int64    `json:"usage_removed,omitempty"` // usage rows dropped by replace
+	// Errors counts messages and sources that were refused; each is listed in Rejected. The rest of
+	// the session is stored. A refused message keeps its stored version, if any.
+	Errors   int            `json:"errors"`
+	Rejected []RejectedPart `json:"rejected,omitempty"`
+	// ReplaceSkipped: replace was asked for but some messages were refused, so nothing was removed
+	// (the body isn't the complete session). Fix them and send again to replace.
+	ReplaceSkipped bool `json:"replace_skipped,omitempty"`
+}
+
+// RejectedPart is one refused message or source of a session ingest.
+type RejectedPart struct {
+	Kind       string `json:"kind"`  // message | source
+	Index      int    `json:"index"` // position in messages / sources
+	ExternalID string `json:"external_id,omitempty"`
+	Name       string `json:"name,omitempty"`
+	Error      string `json:"error"`
+}
+
+func (r *IngestResult) reject(p RejectedPart) {
+	r.Errors++
+	r.Rejected = append(r.Rejected, p)
 }
 
 // SessionKey is the archive id of an ingested session.
@@ -98,10 +119,10 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 	in.Harness = strings.TrimSpace(in.Harness)
 	in.ExternalID = strings.TrimSpace(in.ExternalID)
 	if !validIdent(in.Harness, 64) || !validIdent(in.ExternalID, 256) {
-		return nil, fmt.Errorf("harness and external_id are required (no spaces)")
+		return nil, badRequest("harness and external_id are required (no spaces, at most 64 / 256 bytes)")
 	}
 	if len(in.Metadata) > 0 && !json.Valid(in.Metadata) {
-		return nil, fmt.Errorf("metadata is not valid JSON")
+		return nil, badRequest("metadata is not valid JSON")
 	}
 	id := SessionKey(in.Harness, in.ExternalID)
 	res := &IngestResult{SessionID: id, Messages: len(in.Messages)}
@@ -114,12 +135,17 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 		}
 	}
 
-	// Raw sources must already be uploaded, so the original survives any transpiler bug.
-	for _, src := range in.Sources {
+	// Raw sources must already be uploaded, so the original survives any transpiler bug. A malformed
+	// source entry is refused alone.
+	sources := in.Sources[:0:0]
+	for i, src := range in.Sources {
 		if !ValidHash(src.Blob) || strings.TrimSpace(src.Name) == "" {
-			return nil, fmt.Errorf("source %q: name and sha256 blob required", src.Name)
+			res.reject(RejectedPart{Kind: "source", Index: i, Name: src.Name, Error: "name and sha256 blob required"})
+			continue
 		}
+		sources = append(sources, src)
 	}
+	in.Sources = sources
 	hashes := make([]string, 0, len(in.Sources))
 	for _, src := range in.Sources {
 		hashes = append(hashes, src.Blob)
@@ -130,36 +156,30 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 	}
 	if len(missing) > 0 {
 		res.MissingBlobs = missing
-		return res, fmt.Errorf("upload missing source blobs first")
+		return res, badRequest("upload missing source blobs first")
 	}
 
 	// Store message bodies (media extracted, deduplicated) before touching the index.
+	// An invalid message is refused alone; the rest of the session is stored.
 	type prepared struct {
-		m    MessageIngest
-		hash string
+		m     MessageIngest
+		hash  string
+		index int
 	}
 	prep := make([]prepared, 0, len(in.Messages))
 	seen := map[string]bool{}
 	for i, m := range in.Messages {
-		if seen[m.ExternalID] {
-			return nil, fmt.Errorf("message %d: duplicate external_id %q", i, m.ExternalID)
+		if msg := validateMessage(m, seen); msg != "" {
+			res.reject(RejectedPart{Kind: "message", Index: i, ExternalID: m.ExternalID, Error: msg})
+			continue
 		}
 		seen[m.ExternalID] = true
-		if !json.Valid(m.Message) {
-			return nil, fmt.Errorf("message %q: message is not valid JSON", m.ExternalID)
-		}
-		if (len(m.Usage) > 0 && !json.Valid(m.Usage)) || (len(m.Metadata) > 0 && !json.Valid(m.Metadata)) {
-			return nil, fmt.Errorf("message %q: usage/metadata is not valid JSON", m.ExternalID)
-		}
-		if b := gjson.GetBytes(m.Usage, "billing").String(); !requestlog.ValidBilling(strings.TrimSpace(b)) {
-			return nil, fmt.Errorf("message %q: billing must be subscription, api_key, local or free", m.ExternalID)
-		}
 		wrapped, _ := json.Marshal(map[string]json.RawMessage{"message": m.Message})
 		hash, errSplit := a.splitBody(ctx, wrapped, "import.message")
 		if errSplit != nil {
 			return nil, errSplit
 		}
-		prep = append(prep, prepared{m: m, hash: hash})
+		prep = append(prep, prepared{m: m, hash: hash, index: i})
 	}
 
 	viaProxy := in.ViaProxy
@@ -212,9 +232,14 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 	}
 	res.Created = created
 
+	stored := make([]MessageIngest, 0, len(prep))
 	for _, p := range prep {
 		// The upsert says what happened: a new row, a changed one (body, position, usage or
-		// metadata), or nothing (no row returned).
+		// metadata), or nothing (no row returned). A message the database refuses is rolled back
+		// alone (savepoint).
+		if _, err = tx.ExecContext(ctx, `SAVEPOINT tmx_message`); err != nil {
+			return nil, err
+		}
 		var inserted bool
 		errUp := tx.QueryRowContext(ctx, `INSERT INTO `+schema+`.session_messages (session_id,
 			external_id, seq, parent_id, ts, role, model, message, usage, metadata)
@@ -234,17 +259,34 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 		case errors.Is(errUp, sql.ErrNoRows):
 			res.Unchanged++
 		case errUp != nil:
-			return nil, fmt.Errorf("message %q: %w", p.m.ExternalID, errUp)
+			if _, err = tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT tmx_message`); err != nil {
+				return nil, err
+			}
+			if !isDataError(errUp) {
+				return nil, fmt.Errorf("message %q: %w", p.m.ExternalID, errUp)
+			}
+			res.reject(RejectedPart{Kind: "message", Index: p.index, ExternalID: p.m.ExternalID, Error: errUp.Error()})
+			continue
 		case inserted:
 			res.Inserted++
 		default:
 			res.Updated++
 		}
+		if _, err = tx.ExecContext(ctx, `RELEASE SAVEPOINT tmx_message`); err != nil {
+			return nil, err
+		}
+		stored = append(stored, p.m)
+	}
+	// Usage rows follow the stored messages only. With a refused message the body isn't the whole
+	// session, so replace removes nothing (neither messages nor usage rows).
+	in.Messages = stored
+	if in.Replace && res.Errors > 0 {
+		in.Replace, res.ReplaceSkipped = false, true
 	}
 	if in.Replace {
-		keep := make([]string, 0, len(prep))
-		for _, p := range prep {
-			keep = append(keep, p.m.ExternalID)
+		keep := make([]string, 0, len(stored))
+		for _, m := range stored {
+			keep = append(keep, m.ExternalID)
 		}
 		tag, errDel := tx.ExecContext(ctx, `DELETE FROM `+schema+`.session_messages WHERE session_id = $1
 			AND NOT (external_id = ANY($2::text[]))`, id, pgTextArray(keep))
@@ -285,6 +327,22 @@ func (a *Archive) IngestSession(ctx context.Context, in SessionIngest) (*IngestR
 		}
 	}
 	return res, nil
+}
+
+// validateMessage returns why a message can't be stored, or "". seen holds the ids already taken.
+func validateMessage(m MessageIngest, seen map[string]bool) string {
+	switch {
+	case seen[m.ExternalID]:
+		return fmt.Sprintf("duplicate external_id %q", m.ExternalID)
+	case !json.Valid(m.Message):
+		return "message is not valid JSON"
+	case (len(m.Usage) > 0 && !json.Valid(m.Usage)) || (len(m.Metadata) > 0 && !json.Valid(m.Metadata)):
+		return "usage/metadata is not valid JSON"
+	}
+	if b := gjson.GetBytes(m.Usage, "billing").String(); !requestlog.ValidBilling(strings.TrimSpace(b)) {
+		return "billing must be subscription, api_key, local or free"
+	}
+	return ""
 }
 
 // DeleteResult reports what DeleteSession removed.

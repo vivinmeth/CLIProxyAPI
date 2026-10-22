@@ -100,90 +100,85 @@ type ThreadBatch struct {
 	Threads []ThreadIngest `json:"threads"`
 }
 
-// ThreadBatchResult reports what a batch changed.
-type ThreadBatchResult struct {
-	Created   int `json:"created"`
-	Updated   int `json:"updated"`
-	Unchanged int `json:"unchanged"`
-}
-
 const maxThreadBatch = 1000
 
 // ThreadKey is the archive id of a thread.
 func ThreadKey(source, externalID string) string { return source + ":" + externalID }
 
 // IngestThreads upserts a batch of threads. Idempotent: an unchanged thread is left alone; a
-// changed one replaces its record and is re-extracted by analytics.
+// changed one replaces its record and is re-extracted by analytics. Each thread is judged on its
+// own: an invalid or refused one is reported in Results and the others are written.
 func (a *Archive) IngestThreads(ctx context.Context, in ThreadBatch) (*ThreadBatchResult, error) {
 	in.Source = strings.TrimSpace(in.Source)
 	if !validIdent(in.Source, 64) {
-		return nil, fmt.Errorf("source is required (no spaces)")
+		return nil, badRequest("source is required (no spaces)")
 	}
 	if len(in.Threads) > maxThreadBatch {
-		return nil, fmt.Errorf("at most %d threads per batch", maxThreadBatch)
+		return nil, badRequest("at most %d threads per batch", maxThreadBatch)
 	}
-	for i := range in.Threads {
-		t := &in.Threads[i]
-		t.ExternalID = strings.TrimSpace(t.ExternalID)
-		if !validIdent(t.ExternalID, 256) {
-			return nil, fmt.Errorf("thread %d: external_id is required (no spaces)", i)
-		}
-		if len(t.Metadata) > 0 && !json.Valid(t.Metadata) {
-			return nil, fmt.Errorf("thread %q: metadata is not valid JSON", t.ExternalID)
-		}
-		if strings.TrimSpace(t.ParentID) == t.ExternalID {
-			return nil, fmt.Errorf("thread %q: a thread can't be its own parent", t.ExternalID)
-		}
-		for j, s := range t.Sessions {
-			if strings.TrimSpace(s.SessionID) == "" {
-				return nil, fmt.Errorf("thread %q: session %d has no session_id", t.ExternalID, j)
-			}
-		}
-		for j, pr := range t.PullRequests {
-			if strings.TrimSpace(pr.URL) == "" {
-				return nil, fmt.Errorf("thread %q: pull request %d has no url", t.ExternalID, j)
-			}
-		}
-	}
-	res := &ThreadBatchResult{}
+	res := &ThreadBatchResult{Results: make([]RecordResult, 0, len(in.Threads))}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	for _, t := range in.Threads {
+	for i := range in.Threads {
+		t := &in.Threads[i]
+		t.ExternalID = strings.TrimSpace(t.ExternalID)
+		if msg := validateThread(t); msg != "" {
+			r := RecordResult{Index: i, Status: "error", Error: msg}
+			if validIdent(t.ExternalID, 256) {
+				r.ID = ThreadKey(in.Source, t.ExternalID)
+			}
+			res.add(r)
+			continue
+		}
 		doc, errM := json.Marshal(t)
 		if errM != nil {
-			return nil, errM
+			res.add(RecordResult{Index: i, Status: "error", Error: errM.Error()})
+			continue
 		}
 		id := ThreadKey(in.Source, t.ExternalID)
-		var inserted bool
-		errUp := tx.QueryRowContext(ctx, `INSERT INTO `+schema+`.threads (id, source, external_id, machine, doc,
+		r, errUp := a.upsertRecord(ctx, tx, i, id, "thread", `INSERT INTO `+schema+`.threads (id, source, external_id, machine, doc,
 			created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
 			ON CONFLICT (id) DO UPDATE SET machine = COALESCE(NULLIF(EXCLUDED.machine, ''), threads.machine),
 				doc = EXCLUDED.doc, created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at, ingested_at = now()
 			WHERE threads.doc IS DISTINCT FROM EXCLUDED.doc OR threads.machine IS DISTINCT FROM COALESCE(NULLIF(EXCLUDED.machine, ''), threads.machine)
 			RETURNING (xmax = 0)`, id, in.Source, t.ExternalID, in.Machine, string(doc),
-			timePtr(t.CreatedAt), timePtr(t.UpdatedAt)).Scan(&inserted)
-		switch {
-		case errors.Is(errUp, sql.ErrNoRows):
-			res.Unchanged++
-			continue
-		case errUp != nil:
-			return nil, fmt.Errorf("thread %q: %w", t.ExternalID, errUp)
-		case inserted:
-			res.Created++
-		default:
-			res.Updated++
+			timePtr(t.CreatedAt), timePtr(t.UpdatedAt))
+		if errUp != nil {
+			return nil, errUp
 		}
-		if err = a.journal(ctx, tx, "thread", id); err != nil {
-			return nil, fmt.Errorf("analytics journal: %w", err)
-		}
+		res.add(r)
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+// validateThread returns why a thread can't be stored, or "".
+func validateThread(t *ThreadIngest) string {
+	if !validIdent(t.ExternalID, 256) {
+		return "external_id is required (no spaces, at most 256 bytes)"
+	}
+	if len(t.Metadata) > 0 && !json.Valid(t.Metadata) {
+		return "metadata is not valid JSON"
+	}
+	if strings.TrimSpace(t.ParentID) == t.ExternalID {
+		return "a thread can't be its own parent"
+	}
+	for j, s := range t.Sessions {
+		if strings.TrimSpace(s.SessionID) == "" {
+			return fmt.Sprintf("session %d has no session_id", j)
+		}
+	}
+	for j, pr := range t.PullRequests {
+		if strings.TrimSpace(pr.URL) == "" {
+			return fmt.Sprintf("pull request %d has no url", j)
+		}
+	}
+	return ""
 }
 
 // ErrThreadNotFound is returned when a thread id is unknown.

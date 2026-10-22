@@ -7,7 +7,6 @@ package archive
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,71 +57,74 @@ func validSHA(s string) bool {
 	return true
 }
 
-// IngestCommits upserts a batch of commits. Idempotent: unchanged commits are left alone.
+// IngestCommits upserts a batch of commits. Idempotent: unchanged commits are left alone. Each
+// commit is judged on its own: an invalid or refused one is reported in Results and the others are
+// written.
 func (a *Archive) IngestCommits(ctx context.Context, in CommitBatch) (*ThreadBatchResult, error) {
 	if len(in.Commits) > maxCommitBatch {
-		return nil, fmt.Errorf("at most %d commits per batch", maxCommitBatch)
+		return nil, badRequest("at most %d commits per batch", maxCommitBatch)
 	}
-	for i := range in.Commits {
-		c := &in.Commits[i]
-		c.Repo, c.SHA = strings.TrimSpace(c.Repo), strings.ToLower(strings.TrimSpace(c.SHA))
-		if c.Repo == "" || len(c.Repo) > 1024 {
-			return nil, fmt.Errorf("commit %d: repo is required", i)
-		}
-		if !validSHA(c.SHA) {
-			return nil, fmt.Errorf("commit %d: sha must be 7-64 hex characters", i)
-		}
-		switch c.Match {
-		case "", "trailer", "time_cwd":
-		default:
-			return nil, fmt.Errorf("commit %s: match must be trailer or time_cwd", c.SHA)
-		}
-		if c.Additions < 0 || c.Deletions < 0 || c.Files < 0 {
-			return nil, fmt.Errorf("commit %s: additions, deletions and files can't be negative", c.SHA)
-		}
-		if len(c.Metadata) > 0 && !json.Valid(c.Metadata) {
-			return nil, fmt.Errorf("commit %s: metadata is not valid JSON", c.SHA)
-		}
-	}
-	res := &ThreadBatchResult{}
+	res := &ThreadBatchResult{Results: make([]RecordResult, 0, len(in.Commits))}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	for _, c := range in.Commits {
+	for i := range in.Commits {
+		c := &in.Commits[i]
+		c.Repo, c.SHA = strings.TrimSpace(c.Repo), strings.ToLower(strings.TrimSpace(c.SHA))
+		if msg := validateCommit(c); msg != "" {
+			r := RecordResult{Index: i, Status: "error", Error: msg}
+			if c.Repo != "" && validSHA(c.SHA) {
+				r.ID = CommitKey(c.Repo, c.SHA)
+			}
+			res.add(r)
+			continue
+		}
 		doc, errM := json.Marshal(c)
 		if errM != nil {
-			return nil, errM
+			res.add(RecordResult{Index: i, Status: "error", Error: errM.Error()})
+			continue
 		}
 		id := CommitKey(c.Repo, c.SHA)
-		var inserted bool
-		errUp := tx.QueryRowContext(ctx, `INSERT INTO `+schema+`.commits (id, repo, sha, machine, doc, committed_at)
+		r, errUp := a.upsertRecord(ctx, tx, i, id, "commit", `INSERT INTO `+schema+`.commits (id, repo, sha, machine, doc, committed_at)
 			VALUES ($1, $2, $3, $4, $5, $6)
 			ON CONFLICT (id) DO UPDATE SET machine = COALESCE(NULLIF(EXCLUDED.machine, ''), commits.machine),
 				doc = EXCLUDED.doc, committed_at = EXCLUDED.committed_at, ingested_at = now()
 			WHERE commits.doc IS DISTINCT FROM EXCLUDED.doc
 				OR commits.machine IS DISTINCT FROM COALESCE(NULLIF(EXCLUDED.machine, ''), commits.machine)
-			RETURNING (xmax = 0)`, id, c.Repo, c.SHA, in.Machine, string(doc), timePtr(firstTime(c.CommittedAt, c.AuthoredAt))).Scan(&inserted)
-		switch {
-		case errors.Is(errUp, sql.ErrNoRows):
-			res.Unchanged++
-			continue
-		case errUp != nil:
-			return nil, fmt.Errorf("commit %s: %w", c.SHA, errUp)
-		case inserted:
-			res.Created++
-		default:
-			res.Updated++
+			RETURNING (xmax = 0)`, id, c.Repo, c.SHA, in.Machine, string(doc), timePtr(firstTime(c.CommittedAt, c.AuthoredAt)))
+		if errUp != nil {
+			return nil, errUp
 		}
-		if err = a.journal(ctx, tx, "commit", id); err != nil {
-			return nil, fmt.Errorf("analytics journal: %w", err)
-		}
+		res.add(r)
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+// validateCommit returns why a commit can't be stored, or "".
+func validateCommit(c *CommitIngest) string {
+	if c.Repo == "" || len(c.Repo) > 1024 {
+		return "repo is required (at most 1024 bytes)"
+	}
+	if !validSHA(c.SHA) {
+		return "sha must be 7-64 hex characters"
+	}
+	switch c.Match {
+	case "", "trailer", "time_cwd":
+	default:
+		return "match must be trailer or time_cwd"
+	}
+	if c.Additions < 0 || c.Deletions < 0 || c.Files < 0 {
+		return "additions, deletions and files can't be negative"
+	}
+	if len(c.Metadata) > 0 && !json.Valid(c.Metadata) {
+		return "metadata is not valid JSON"
+	}
+	return ""
 }
 
 func firstTime(ts ...*time.Time) *time.Time {

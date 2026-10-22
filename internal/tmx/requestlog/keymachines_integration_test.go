@@ -34,8 +34,11 @@ func TestKeyMachinesAndBillingBackfill(t *testing.T) {
 	if err != nil || res.Stored != 1 || res.RowsUpdated != 1 {
 		t.Fatalf("set = %+v %v", res, err)
 	}
-	if _, err = s.SetKeyMachines(ctx, []KeyMachine{{APIKeyHash: "nothex", Machine: "x"}}); err == nil {
-		t.Fatal("bad hash accepted")
+	// A bad entry is refused alone; the valid one next to it is stored.
+	k2 := "00112233445566aa"
+	bad, err := s.SetKeyMachines(ctx, []KeyMachine{{APIKeyHash: "nothex", Machine: "x"}, {APIKeyHash: k2, Machine: "alien"}})
+	if err != nil || bad.Stored != 1 || bad.Errors != 1 || len(bad.Rejected) != 1 || bad.Rejected[0].Index != 0 {
+		t.Fatalf("mixed set = %+v %v", bad, err)
 	}
 	machineOf := func(trace string) string {
 		var m string

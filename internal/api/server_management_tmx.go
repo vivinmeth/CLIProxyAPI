@@ -374,10 +374,14 @@ func tmxKeyMachinesSet(c *gin.Context) {
 	}
 	res, err := store.SetKeyMachines(c.Request.Context(), body.Keys)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, res)
+	status := http.StatusOK
+	if res.Errors > 0 {
+		status = http.StatusMultiStatus
+	}
+	c.JSON(status, res)
 }
 
 // tmxKeyMachinesList: GET /tmx/requests/key-machines — the stored ledger.
@@ -515,15 +519,22 @@ func tmxBlobsMissing(c *gin.Context, a *archive.Archive) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {\"hashes\": [sha256...]} (max 10000)"})
 		return
 	}
+	// An invalid hash is reported in "invalid"; the rest are still checked.
+	valid, invalid := make([]string, 0, len(body.Hashes)), []string{}
 	for _, h := range body.Hashes {
-		if !archive.ValidHash(h) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid hash " + h})
-			return
+		if archive.ValidHash(h) {
+			valid = append(valid, h)
+		} else {
+			invalid = append(invalid, h)
 		}
 	}
-	missing, err := a.Blobs().Missing(c.Request.Context(), body.Hashes)
+	missing, err := a.Blobs().Missing(c.Request.Context(), valid)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if len(invalid) > 0 {
+		c.JSON(http.StatusMultiStatus, gin.H{"missing": missing, "invalid": invalid})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"missing": missing})
@@ -573,6 +584,14 @@ func tmxBlobGet(c *gin.Context, a *archive.Archive) {
 	c.Data(http.StatusOK, mt, data)
 }
 
+// tmxIngestErrorStatus: 400 for a request the client has to fix, 500 (send again) otherwise.
+func tmxIngestErrorStatus(err error) int {
+	if archive.IsBadRequest(err) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
 func tmxSessionIngest(c *gin.Context, a *archive.Archive) {
 	var in archive.SessionIngest
 	if err := c.ShouldBindJSON(&in); err != nil {
@@ -581,14 +600,21 @@ func tmxSessionIngest(c *gin.Context, a *archive.Archive) {
 	}
 	res, err := a.IngestSession(c.Request.Context(), in)
 	if err != nil {
-		status := http.StatusBadRequest
-		if res != nil && len(res.MissingBlobs) > 0 {
+		status := http.StatusInternalServerError
+		switch {
+		case res != nil && len(res.MissingBlobs) > 0:
 			status = http.StatusConflict
+		case archive.IsBadRequest(err):
+			status = http.StatusBadRequest
 		}
 		c.JSON(status, gin.H{"error": err.Error(), "result": res})
 		return
 	}
-	c.JSON(http.StatusOK, res)
+	status := http.StatusOK
+	if res.Errors > 0 {
+		status = http.StatusMultiStatus // stored, except the parts listed in rejected
+	}
+	c.JSON(status, res)
 }
 
 // tmxCommitIngest: PUT /tmx/archive/commits — upsert a batch of git commits with the sessions /
@@ -601,10 +627,10 @@ func tmxCommitIngest(c *gin.Context, a *archive.Archive) {
 	}
 	res, err := a.IngestCommits(c.Request.Context(), in)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(tmxIngestErrorStatus(err), gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, res)
+	c.JSON(res.HTTPStatus(), res)
 }
 
 func tmxCommitList(c *gin.Context, a *archive.Archive) {
@@ -655,10 +681,10 @@ func tmxThreadIngest(c *gin.Context, a *archive.Archive) {
 	}
 	res, err := a.IngestThreads(c.Request.Context(), in)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(tmxIngestErrorStatus(err), gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, res)
+	c.JSON(res.HTTPStatus(), res)
 }
 
 func tmxThreadList(c *gin.Context, a *archive.Archive) {

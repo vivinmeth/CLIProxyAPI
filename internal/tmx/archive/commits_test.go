@@ -58,7 +58,13 @@ func TestCommitsAndTasks(t *testing.T) {
 		SessionIDs: []string{"dup"}}, {Repo: "github.com/o/r", SHA: "ddddddd4", Additions: 1, SessionIDs: []string{"codex:dup"}}}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = a.IngestCommits(ctx, CommitBatch{Commits: []CommitIngest{{Repo: "r", SHA: "zz"}}}); err == nil {
+	mixed, err := a.IngestCommits(ctx, CommitBatch{Commits: []CommitIngest{{Repo: "r", SHA: "zz"},
+		{Repo: "github.com/o/r", SHA: "eeeeeee5"}}})
+	if err != nil || mixed.Errors != 1 || mixed.Created != 1 || mixed.Results[0].Status != "error" ||
+		mixed.Results[1].ID != "github.com/o/r@eeeeeee5" {
+		t.Fatalf("mixed batch = %+v %v", mixed, err)
+	}
+	if res, err = a.IngestCommits(ctx, CommitBatch{Commits: []CommitIngest{{Repo: "r", SHA: "zz"}}}); err != nil || res.Errors != 1 {
 		t.Fatal("bad sha accepted")
 	}
 	drain(t, an)

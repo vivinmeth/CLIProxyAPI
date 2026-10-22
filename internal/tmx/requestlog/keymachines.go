@@ -7,7 +7,6 @@ package requestlog
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
@@ -25,6 +24,15 @@ type KeyMachine struct {
 type KeyMachinesResult struct {
 	Stored      int   `json:"stored"`
 	RowsUpdated int64 `json:"rows_updated"` // existing rows without a machine that got one
+	// Errors counts entries refused (listed in Rejected); the valid ones are stored.
+	Errors   int               `json:"errors"`
+	Rejected []KeyMachineError `json:"rejected,omitempty"`
+}
+
+// KeyMachineError is one refused ledger entry.
+type KeyMachineError struct {
+	Index int    `json:"index"`
+	Error string `json:"error"`
 }
 
 func (s *Store) loadKeyMachines(ctx context.Context) error {
@@ -60,7 +68,10 @@ func (s *Store) SetKeyMachines(ctx context.Context, entries []KeyMachine) (*KeyM
 	for i, e := range entries {
 		e.APIKeyHash, e.Machine = strings.ToLower(strings.TrimSpace(e.APIKeyHash)), strings.TrimSpace(e.Machine)
 		if len(e.APIKeyHash) != 16 || !isHex(e.APIKeyHash) || e.Machine == "" || len(e.Machine) > 64 {
-			return nil, fmt.Errorf("entry %d: api_key_hash must be 16 hex characters and machine non-empty", i)
+			res.Errors++
+			res.Rejected = append(res.Rejected, KeyMachineError{Index: i,
+				Error: "api_key_hash must be 16 hex characters and machine non-empty (at most 64 bytes)"})
+			continue
 		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO `+s.schema+`.key_machines (api_key_hash, machine) VALUES ($1, $2)
 			ON CONFLICT (api_key_hash) DO UPDATE SET machine = EXCLUDED.machine, updated_at = now()`,

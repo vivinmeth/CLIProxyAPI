@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -105,8 +106,42 @@ func TestThreadsInAnalytics(t *testing.T) {
 	if n := count(t, an, `SELECT threads FROM thread_usage WHERE thread_id = 't3:C1'`); n != 2 {
 		t.Fatalf("cycle tree = %d threads", n)
 	}
-	if _, err = a.IngestThreads(ctx, ThreadBatch{Source: "t3", Threads: []ThreadIngest{{ExternalID: "S", ParentID: "S"}}}); err == nil {
-		t.Fatal("self-parented thread accepted")
+	// Bad threads are refused one by one; the good one in the same batch is stored.
+	mixed, err := a.IngestThreads(ctx, ThreadBatch{Source: "t3", Threads: []ThreadIngest{
+		{ExternalID: "S", ParentID: "S"},
+		{ExternalID: strings.Repeat("x", 319)},
+		{ExternalID: "OK1", Metadata: json.RawMessage(`{"a":1}`)},
+		{ExternalID: "BADMETA", Metadata: json.RawMessage(`{`)},
+	}})
+	if err != nil || mixed.Created != 1 || mixed.Errors != 3 || len(mixed.Results) != 4 || mixed.HTTPStatus() != 207 {
+		t.Fatalf("mixed batch = %+v %v", mixed, err)
+	}
+	for i, want := range []string{"error", "error", "created", "error"} {
+		if r := mixed.Results[i]; r.Index != i || r.Status != want || (want == "error") != (r.Error != "") {
+			t.Fatalf("result %d = %+v, want %s", i, r, want)
+		}
+	}
+	if mixed.Results[2].ID != "t3:OK1" || mixed.Results[0].ID != "t3:S" || mixed.Results[1].ID != "" {
+		t.Fatalf("result ids = %+v", mixed.Results)
+	}
+	var stored int
+	if err = a.db.QueryRow(`SELECT count(*) FROM ` + schema + `.threads WHERE id = 't3:OK1'`).Scan(&stored); err != nil || stored != 1 {
+		t.Fatalf("good thread stored %d times (%v)", stored, err)
+	}
+	// A value the database refuses (NUL in JSON text) is rolled back alone too.
+	nul, err := a.IngestThreads(ctx, ThreadBatch{Source: "t3", Threads: []ThreadIngest{
+		{ExternalID: "NUL", Title: "a\u0000b"}, {ExternalID: "OK2"},
+	}})
+	if err != nil || nul.Errors != 1 || nul.Results[0].Status != "error" || nul.Results[1].Status != "created" {
+		t.Fatalf("nul batch = %+v %v", nul, err)
+	}
+	if _, err = a.IngestThreads(ctx, ThreadBatch{Source: "", Threads: []ThreadIngest{{ExternalID: "x"}}}); !IsBadRequest(err) {
+		t.Fatalf("missing source: %v", err)
+	}
+	for _, id := range []string{"t3:OK1", "t3:OK2"} { // keep the counts below as they were
+		if err = a.DeleteThread(ctx, id); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	if err = a.DeleteThread(ctx, "t3:T2"); err != nil {
