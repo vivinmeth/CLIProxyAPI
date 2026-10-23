@@ -161,8 +161,8 @@ const linkAffected = `WITH ds AS (SELECT unnest($1::text[]) AS id),
 		UNION SELECT e.trace_id FROM exchanges e JOIN keys ON keys.k = e.client_session_id
 		UNION SELECT e.trace_id FROM exchanges e JOIN keys ON keys.k = e.session_id
 	)
-	SELECT rs.request_id AS id FROM request_sessions rs
-		WHERE rs.session_id IN (SELECT id FROM ds) OR rs.canonical_session_id IN (SELECT id FROM ds)
+	SELECT rs.request_id AS id FROM request_sessions rs WHERE rs.session_id IN (SELECT id FROM ds)
+	UNION SELECT rs.request_id FROM request_sessions rs WHERE rs.canonical_session_id IN (SELECT id FROM ds)
 	UNION SELECT rs.request_id FROM request_sessions rs JOIN sessions s ON s.id = rs.session_id
 		WHERE s.shadowed_by IN (SELECT id FROM ds)
 	UNION SELECT r.id FROM requests r WHERE r.import_ref <> '' AND split_part(r.import_ref, '#', 1) IN (SELECT id FROM ds)
@@ -193,12 +193,7 @@ func (an *analytics) refreshLinks(force bool) {
 	if d.full {
 		_, err = an.db.ExecContext(an.ctx, linkUpsert(`SELECT id FROM requests UNION SELECT request_id FROM request_sessions`))
 	} else {
-		reqs := make([]string, 0, len(d.requests))
-		for id := range d.requests {
-			reqs = append(reqs, strconv.FormatInt(id, 10))
-		}
-		_, err = an.db.ExecContext(an.ctx, linkUpsert(linkAffected), pgArray(mapKeys(d.sessions)),
-			"{"+strings.Join(reqs, ",")+"}", pgArray(mapKeys(d.traces)))
+		err = an.updateLinks(d)
 	}
 	if err != nil {
 		an.setErr(fmt.Errorf("refresh request_sessions: %w", err))
@@ -207,6 +202,49 @@ func (an *analytics) refreshLinks(force bool) {
 	full := d.full
 	d.reset()
 	log.Debugf("tmx analytics: request_sessions updated (full=%v) in %s", full, time.Since(start).Round(time.Millisecond))
+}
+
+// updateLinks rewrites the links the changes in d can move. The affected requests are looked up
+// first and passed as a literal array: inside one statement the planner can't tell a few thousand
+// rows from every row, and read all of messages for a merge join (~2.5 s instead of ~0.1 s).
+// Custom plans throughout: a cached generic plan has the same blind spot.
+func (an *analytics) updateLinks(d *linkDirty) error {
+	tx, err := an.db.BeginTx(an.ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err = tx.ExecContext(an.ctx, `SET LOCAL plan_cache_mode = force_custom_plan`); err != nil {
+		return err
+	}
+	reqs := make([]string, 0, len(d.requests))
+	for id := range d.requests {
+		reqs = append(reqs, strconv.FormatInt(id, 10))
+	}
+	rows, err := tx.QueryContext(an.ctx, linkAffected, pgArray(mapKeys(d.sessions)), "{"+strings.Join(reqs, ",")+"}",
+		pgArray(mapKeys(d.traces)))
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		ids = append(ids, strconv.FormatInt(id, 10))
+	}
+	if err = closeRows(rows); err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return tx.Commit()
+	}
+	if _, err = tx.ExecContext(an.ctx, linkUpsert(`SELECT unnest($1::bigint[]) AS id`), "{"+strings.Join(ids, ",")+"}"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func mapKeys(m map[string]bool) []string {
