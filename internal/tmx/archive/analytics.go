@@ -36,11 +36,30 @@ import (
 
 // trgmIndexSQL: substring search over every item, plus a small one over prose (kind = 'text':
 // user/assistant/system text) — tool outputs are most of the bytes and make prose searches with
-// common trigrams recheck far more rows.
+// common trigrams recheck far more rows. Both carry ts (btree_gin), so a search of a recent window
+// only rechecks that window's candidates (AnalyticsSearch widens the window until it has enough).
+// The ts-less indexes they replace are dropped once these exist.
 var trgmIndexSQL = []string{
-	`CREATE INDEX IF NOT EXISTS items_text_trgm_idx ON items USING gin (text gin_trgm_ops)`,
-	`CREATE INDEX IF NOT EXISTS items_prose_trgm_idx ON items USING gin (text gin_trgm_ops) WHERE kind = 'text'`,
+	`CREATE INDEX IF NOT EXISTS items_text_ts_trgm_idx ON items USING gin (text gin_trgm_ops, ts)`,
+	`CREATE INDEX IF NOT EXISTS items_prose_ts_trgm_idx ON items USING gin (text gin_trgm_ops, ts) WHERE kind = 'text'`,
+	`DROP INDEX IF EXISTS items_text_trgm_idx, items_prose_trgm_idx`,
+	// skill_invocations' three sources, each a handful of rows found by a filter that otherwise
+	// reads every tool call (the predicates match the view's word for word, or the planner
+	// can't use them).
+	`CREATE INDEX IF NOT EXISTS items_skill_tool_idx ON items (session_id) WHERE kind = 'tool_call' AND lower(name) = 'skill'`,
+	`CREATE INDEX IF NOT EXISTS items_skill_command_idx ON items (session_id)
+		WHERE kind = 'text' AND role = 'user' AND text LIKE '%<command-name>%'`,
+	`CREATE INDEX IF NOT EXISTS items_skill_file_idx ON items (session_id)
+		WHERE kind = 'tool_call' AND data::text LIKE '%/skills/%SKILL.md%'`,
 }
+
+// deferredIndexes are the indexes trgmIndexSQL creates; at start, any missing over a filled
+// items table are built by the worker instead (minutes, not to hold up startup).
+var deferredIndexes = []string{"items_text_ts_trgm_idx", "items_prose_ts_trgm_idx", "items_skill_tool_idx",
+	"items_skill_command_idx", "items_skill_file_idx"}
+
+// trgmIndexNames are every trigram index on items, current and replaced (a backfill drops them all).
+const trgmIndexNames = `items_text_ts_trgm_idx, items_prose_ts_trgm_idx, items_text_trgm_idx, items_prose_trgm_idx`
 
 const (
 	// analyticsVersion is bumped when extraction changes; sessions extracted by an older version
@@ -71,8 +90,7 @@ type analytics struct {
 	done chan struct{}
 
 	processed   atomic.Int64
-	linksDirty  atomic.Bool // request_sessions needs a refresh
-	linksAt     time.Time   // last refresh (run loop only)
+	links       linkDirty // request_sessions rows to bring up to date (run loop only)
 	extracted   atomic.Int64
 	failures    atomic.Int64
 	backfilling atomic.Bool
@@ -133,6 +151,7 @@ func openAnalytics(ctx context.Context, a *Archive, dsn string) (*analytics, err
 func (an *analytics) ensureSchema(ctx context.Context) error {
 	stmts := []string{
 		`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
+		`CREATE EXTENSION IF NOT EXISTS btree_gin`,
 		`CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS sessions (
 			id           TEXT PRIMARY KEY,           -- imported: <harness>:<external_id>; proxied: proxy:<client session id>
@@ -218,9 +237,22 @@ func (an *analytics) ensureSchema(ctx context.Context) error {
 	if pending, err := an.getState(ctx, "trgm_index"); err != nil {
 		return err
 	} else if pending != "pending" {
-		for _, stmt := range trgmIndexSQL {
-			if _, err = an.db.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("analytics schema: %w", err)
+		// Building a missing index over a filled items table takes minutes: leave that to the
+		// worker (buildDeferredIndexes) rather than holding up startup.
+		var missing, filled bool
+		if err = an.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM unnest($1::text[]) n WHERE to_regclass(n) IS NULL),
+			EXISTS (SELECT 1 FROM items)`, pgArray(deferredIndexes)).Scan(&missing, &filled); err != nil {
+			return fmt.Errorf("analytics schema: %w", err)
+		}
+		if missing && filled {
+			if err = an.setState(ctx, "trgm_index", "pending"); err != nil {
+				return err
+			}
+		} else {
+			for _, stmt := range trgmIndexSQL {
+				if _, err = an.db.ExecContext(ctx, stmt); err != nil {
+					return fmt.Errorf("analytics schema: %w", err)
+				}
 			}
 		}
 	}
@@ -558,10 +590,7 @@ func (an *analytics) step() (bool, error) {
 				e.kind == "prompt" || e.kind == "attachment" || e.kind == "pull_request" {
 				cleared[e.kind] = append(cleared[e.kind], e.ref)
 			}
-			if e.kind != "thread" && e.kind != "commit" && e.kind != "prompt" && e.kind != "attachment" &&
-				e.kind != "pull_request" {
-				an.linksDirty.Store(true)
-			}
+			an.markLinks(e.kind, e.ref)
 			continue
 		}
 		an.setErr(fmt.Errorf("%s %s: %w", e.kind, e.ref, errE))
@@ -1310,7 +1339,7 @@ func (a *Archive) AnalyticsBackfill(ctx context.Context) (*BackfillResult, error
 	an.idxMu.Lock()
 	err := an.setState(ctx, "trgm_index", "pending")
 	if err == nil {
-		_, err = an.db.ExecContext(ctx, `DROP INDEX IF EXISTS items_text_trgm_idx, items_prose_trgm_idx`)
+		_, err = an.db.ExecContext(ctx, `DROP INDEX IF EXISTS `+trgmIndexNames)
 	}
 	an.idxMu.Unlock()
 	if err != nil {

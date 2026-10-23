@@ -117,6 +117,12 @@ type SearchHit struct {
 	Snippet     string     `json:"snippet"`
 }
 
+// searchWindows are the time windows a text search tries in turn, newest first, until one holds
+// enough hits (0 = the whole history). Hits are ordered newest first, so when a window has a full
+// page it is the page; the trigram indexes carry ts, so a recent window only rechecks its own
+// candidates and a common word costs the same however long the history grows.
+var searchWindows = []time.Duration{7 * 24 * time.Hour, 30 * 24 * time.Hour, 90 * 24 * time.Hour, 365 * 24 * time.Hour, 0}
+
 // AnalyticsSearch finds items by substring (case-insensitive, trigram-indexed) and filters.
 func (a *Archive) AnalyticsSearch(ctx context.Context, q SearchQuery) ([]SearchHit, error) {
 	an := a.analytics
@@ -133,7 +139,9 @@ func (a *Archive) AnalyticsSearch(ctx context.Context, q SearchQuery) ([]SearchH
 		return "$" + strconv.Itoa(len(args))
 	}
 	if q.Q != "" {
-		where = append(where, "i.text ILIKE "+arg("%"+escapeLike(q.Q)+"%"))
+		// A literal (***=) case-insensitive regex: the same matches as ILIKE '%q%', several times
+		// cheaper to recheck on long texts, and served by the same trigram indexes.
+		where = append(where, "i.text ~* "+arg("***="+q.Q))
 	}
 	for col, v := range map[string]string{"i.role": q.Role, "i.kind": q.Kind, "i.name": q.Name, "s.harness": q.Harness,
 		"s.machine": q.Machine, "s.kind": q.SessionKind, "s.id": q.SessionID} {
@@ -154,10 +162,24 @@ func (a *Archive) AnalyticsSearch(ctx context.Context, q SearchQuery) ([]SearchH
 	if q.Q != "" {
 		snippetFrom = "GREATEST(1, strpos(lower(i.text), lower(" + arg(q.Q) + ")) - 120)"
 	}
-	sqlText := `SELECT s.id, s.kind, s.harness, s.machine, s.project, s.title, i.seq, i.idx, i.role, i.kind, i.name,
-		i.call_id, i.is_error, i.ts, substr(i.text, ` + snippetFrom + `, 400)
-		FROM items i JOIN sessions s ON s.id = i.session_id
-		WHERE ` + strings.Join(where, " AND ") + ` ORDER BY i.ts DESC NULLS LAST LIMIT ` + arg(q.Limit)
+	limit := arg(q.Limit)
+	windowArg := arg(time.Time{})
+	windowIdx := len(args) - 1
+	// Hits are picked first and only the page's snippets are cut (lower() on every candidate's
+	// text was most of a search's time).
+	query := func(windowed bool) string {
+		cond := strings.Join(where, " AND ")
+		if windowed {
+			cond += " AND i.ts >= " + windowArg
+		}
+		return `WITH hits AS (SELECT s.id, s.kind skind, s.harness, s.machine, s.project, s.title, i.session_id, i.seq, i.idx
+			FROM items i JOIN sessions s ON s.id = i.session_id
+			WHERE ` + cond + ` ORDER BY i.ts DESC NULLS LAST LIMIT ` + limit + `)
+		SELECT h.id, h.skind, h.harness, h.machine, h.project, h.title, i.seq, i.idx, i.role, i.kind, i.name,
+			i.call_id, i.is_error, i.ts, substr(i.text, ` + snippetFrom + `, 400)
+		FROM hits h JOIN items i ON i.session_id = h.session_id AND i.seq = h.seq AND i.idx = h.idx
+		ORDER BY i.ts DESC NULLS LAST, i.session_id, i.seq, i.idx`
+	}
 
 	tx, err := an.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
@@ -167,7 +189,46 @@ func (a *Archive) AnalyticsSearch(ctx context.Context, q SearchQuery) ([]SearchH
 	if _, err = tx.ExecContext(ctx, `SET LOCAL statement_timeout = '20s'`); err != nil {
 		return nil, err
 	}
-	rows, err := tx.QueryContext(ctx, sqlText, args...)
+	windows := []time.Duration{0}
+	if q.Q != "" {
+		windows = searchWindows
+		// Walking items_ts_idx backwards and filtering looks cheap to the planner (it can't
+		// estimate how many rows a substring matches) but reads the whole history for a rare word;
+		// the bitmap over the trigram+ts index is bounded by the window's candidates.
+		if _, err = tx.ExecContext(ctx, `SET LOCAL enable_indexscan = off`); err != nil {
+			return nil, err
+		}
+	}
+	anchor := q.To
+	if anchor.IsZero() {
+		anchor = time.Now()
+	}
+	var hits []SearchHit
+	for _, w := range windows {
+		windowed := w > 0
+		if windowed {
+			since := anchor.Add(-w)
+			if !q.From.IsZero() && !since.After(q.From) {
+				windowed = false // the filter's own from bounds this window: search it whole
+			}
+			args[windowIdx] = since
+		}
+		pageArgs := args
+		if !windowed {
+			pageArgs = args[:windowIdx] // the window is the last parameter; unused, it must not be sent
+		}
+		if hits, err = searchPage(ctx, tx, query(windowed), pageArgs); err != nil {
+			return nil, err
+		}
+		if !windowed || len(hits) >= q.Limit {
+			break
+		}
+	}
+	return hits, nil
+}
+
+func searchPage(ctx context.Context, tx *sql.Tx, query string, args []any) ([]SearchHit, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -184,8 +245,4 @@ func (a *Archive) AnalyticsSearch(ctx context.Context, q SearchQuery) ([]SearchH
 		hits = append(hits, h)
 	}
 	return hits, rows.Err()
-}
-
-func escapeLike(s string) string {
-	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }

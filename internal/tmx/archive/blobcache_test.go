@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -50,5 +51,26 @@ func TestBlobCacheGetPutEvict(t *testing.T) {
 	t.Setenv("TMX_ARCHIVE_CACHE_MB", "0")
 	if newBlobCache(t.TempDir()) != nil {
 		t.Fatal("TMX_ARCHIVE_CACHE_MB=0 should disable the cache")
+	}
+}
+
+// Small blobs count at the disk blocks they take: 1000 files of 10 bytes fill a 1 MiB cache
+// (~4 MB of disk), not 10 KB of it.
+func TestBlobCacheCountsBlocks(t *testing.T) {
+	t.Setenv("TMX_ARCHIVE_CACHE_MB", "1")
+	c := newBlobCache(t.TempDir())
+	for i := 0; i < 1000; i++ {
+		h := "s" + strconv.Itoa(i)
+		c.put(h, []byte("0123456789"))
+		old := time.Now().Add(time.Duration(i-2000) * time.Second)
+		_ = os.Chtimes(c.path(h), old, old)
+	}
+	c.sweep()
+	entries, _ := os.ReadDir(c.dir)
+	if n, limit := len(entries), int(c.maxBytes/cacheBlock); n > limit {
+		t.Fatalf("%d files kept, %d blocks fit the cap", n, limit)
+	}
+	if _, ok := c.get("s999"); !ok {
+		t.Fatal("most recent entry evicted")
 	}
 }

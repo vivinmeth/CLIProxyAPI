@@ -80,6 +80,10 @@ func (c *blobCache) put(hash string, compressed []byte) {
 	}
 }
 
+// cacheBlock: files are counted at the disk space they take (whole 4 KiB blocks); most cached
+// blobs are a few hundred bytes, so counting their length let the cache take ~3x its limit.
+const cacheBlock = 4096
+
 // sweep evicts least recently used files until the cache is under its size limit.
 func (c *blobCache) sweep() {
 	entries, err := os.ReadDir(c.dir)
@@ -98,8 +102,9 @@ func (c *blobCache) sweep() {
 		if errInfo != nil || !strings.HasSuffix(e.Name(), ".zst") {
 			continue
 		}
-		files = append(files, f{e.Name(), info.Size(), info.ModTime()})
-		total += info.Size()
+		size := (info.Size() + cacheBlock - 1) / cacheBlock * cacheBlock
+		files = append(files, f{e.Name(), size, info.ModTime()})
+		total += size
 	}
 	if total <= c.maxBytes {
 		return

@@ -49,11 +49,31 @@ func drain(t *testing.T, an *analytics) {
 			t.Fatal(err)
 		}
 		if !more {
-			an.refreshLinks(true) // the worker refreshes request_sessions after draining
+			// As the worker does after draining: incremental, so every test also checks that the
+			// incremental update leaves exactly what a full recompute would.
+			an.refreshLinks(false)
+			assertLinksMatch(t, an)
 			return
 		}
 	}
 	t.Fatal("journal never drained")
+}
+
+// assertLinksMatch fails when request_sessions differs from request_links (the full recompute).
+func assertLinksMatch(t *testing.T, an *analytics) {
+	t.Helper()
+	if an.reqMirror == nil {
+		return
+	}
+	var diff string
+	if err := an.db.QueryRow(`SELECT COALESCE(string_agg(x::text, '; '), '') FROM (
+		(SELECT 'missing', * FROM request_links EXCEPT SELECT 'missing', * FROM request_sessions)
+		UNION ALL (SELECT 'stale', * FROM request_sessions EXCEPT SELECT 'stale', * FROM request_links)) x`).Scan(&diff); err != nil {
+		t.Fatal(err)
+	}
+	if diff != "" {
+		t.Fatalf("request_sessions differs from a full recompute: %s", diff)
+	}
 }
 
 func count(t *testing.T, an *analytics, q string, args ...any) int {
@@ -222,7 +242,7 @@ func TestAnalyticsProxyShadowAndBackfill(t *testing.T) {
 	}
 	drain(t, an)
 	an.buildDeferredIndexes()
-	if n := count(t, an, `SELECT count(*) FROM pg_indexes WHERE indexname IN ('items_text_trgm_idx', 'items_prose_trgm_idx')`); n != 2 {
+	if n := count(t, an, `SELECT count(*) FROM pg_indexes WHERE indexname IN ('items_text_ts_trgm_idx', 'items_prose_ts_trgm_idx')`); n != 2 {
 		t.Fatal("trigram index not rebuilt after backfill")
 	}
 	if n := count(t, an, `SELECT count(*) FROM sessions`); n != 2 {
