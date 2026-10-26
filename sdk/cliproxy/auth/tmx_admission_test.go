@@ -315,3 +315,26 @@ func TestResetSoonestAdmissionParsesBodiesOutsideMutex(t *testing.T) {
 	}
 	assertNoReservations(t, m)
 }
+
+// A Guardian review inherits its parent's credential, but like any affinity hit it may spill
+// while that credential is at the in-flight cap; the parent binding stays.
+func TestResetSoonestGuardianInheritanceRespectsCap(t *testing.T) {
+	selector := NewSessionAffinitySelector(&ResetSoonestSelector{})
+	t.Cleanup(selector.Stop)
+	authA := &Auth{ID: "auth-a", Provider: "codex"}
+	authB := &Auth{ID: "auth-b", Provider: "codex"}
+	guardianTestPick(t, selector, "codex", "parent-model", guardianTestOptions("main-thread", ""), []*Auth{authB}, "auth-b")
+
+	state := &tmxAdmission{}
+	state.counter(authB.ID).Add(1)
+	ctx := context.WithValue(context.Background(), tmxAdmissionViewKey{}, tmxAdmissionView{state: state, five: .95, seven: .98, cap: 1})
+	reviewOpts := guardianTestOptions("review-thread", "main-thread")
+	got, err := selector.Pick(ctx, "codex", "custom-review", reviewOpts, []*Auth{authA, authB})
+	if err != nil || got == nil || got.ID != authA.ID {
+		t.Fatalf("saturated parent: got %v %v, want spill to auth-a", got, err)
+	}
+	if reviewOpts.Metadata[tmxAdmissionSpillKey] != authB.ID {
+		t.Fatalf("spill not marked: %v", reviewOpts.Metadata)
+	}
+	guardianTestPick(t, selector, "codex", "custom-review", guardianTestOptions("another-review", "main-thread"), []*Auth{authA, authB}, "auth-b")
+}
