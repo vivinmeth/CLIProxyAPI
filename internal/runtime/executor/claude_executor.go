@@ -3,6 +3,8 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -76,7 +78,10 @@ func shouldSanitizeClaudeMessagesForUpstream(baseModel string) bool {
 }
 
 func sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx context.Context, body []byte, baseModel string, preserveEmptyThinkingBlocks ...bool) []byte {
-	sanitized := body
+	// The internal commentary marker must never reach any upstream, so its
+	// restore runs unconditionally, independent of the provider signature
+	// sanitization gate below (which non-Claude model names skip entirely).
+	sanitized, _ := sigcompat.RestoreCodexCommentaryMarkers(body)
 	preserveEmpty := len(preserveEmptyThinkingBlocks) > 0 && preserveEmptyThinkingBlocks[0]
 	if shouldSanitizeClaudeMessagesForUpstream(baseModel) || preserveEmpty {
 		var report sigcompat.SignatureSanitizeReport
@@ -189,7 +194,7 @@ func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor {
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
 
-func (e *ClaudeExecutor) claudeWebSearchResultCacheScope(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, originalPayload []byte) (string, time.Duration, int) {
+func (e *ClaudeExecutor) claudeWebSearchResultCacheScope(ctx context.Context, auth *cliproxyauth.Auth, from sdktranslator.Format, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, originalPayload []byte) (string, time.Duration, int) {
 	if e == nil || e.cfg == nil || !e.cfg.Client.Codex.WebSearchResultCache.Enabled {
 		return "", 0, 0
 	}
@@ -200,8 +205,33 @@ func (e *ClaudeExecutor) claudeWebSearchResultCacheScope(ctx context.Context, fr
 	if sessionKey == "" {
 		return "", 0, 0
 	}
+	if credScope := claudeWebSearchResultCacheCredentialScope(auth); credScope != "" {
+		sessionKey = credScope + ":" + sessionKey
+	}
 	cacheCfg := e.cfg.Client.Codex.WebSearchResultCache
 	return sessionKey, cacheCfg.EffectiveTTL(), cacheCfg.EffectiveLimit()
+}
+
+func claudeWebSearchResultCacheCredentialScope(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	identity := strings.TrimSpace(auth.ID)
+	if identity == "" {
+		identity = helps.ClaudeCLIAuthIdentitySeed(auth)
+	}
+	if identity == "" {
+		apiKey, baseURL := claudeCreds(auth)
+		identity = strings.TrimSpace(apiKey)
+		if identity == "" {
+			identity = strings.TrimSpace(baseURL)
+		}
+	}
+	if identity == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(identity))
+	return "claude:" + hex.EncodeToString(sum[:8])
 }
 
 var _ cliproxyauth.NativeToolSearchSupport = (*ClaudeExecutor)(nil)

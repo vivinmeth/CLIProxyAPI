@@ -36,6 +36,22 @@ func upstreamRetryAfterHeader(err error) http.Header {
 	return safeRetryAfterHeader(min(*retryAfter, maxClientRetryAfter))
 }
 
+// tmxTrustedRetryAfterHeader puts our rules ahead of upstream's per-attempt trusted deadline
+// (v8.0.47): a pool-exhausting refusal reports the pool's soonest recovery, which errors.As would
+// otherwise skip for the trusted deadline wrapped inside it, and a trusted deadline is capped
+// like every other client hint. Nil when neither applies.
+func tmxTrustedRetryAfterHeader(err error) http.Header {
+	var pool *poolRetryAfterError
+	if errors.As(err, &pool) && pool != nil {
+		return safeRetryAfterHeader(min(pool.retryAfter, maxClientRetryAfter))
+	}
+	var trusted *trustedRetryAfterError
+	if errors.As(err, &trusted) && trusted != nil && !trusted.deadline.IsZero() {
+		return safeRetryAfterHeader(min(time.Until(trusted.deadline), maxClientRetryAfter))
+	}
+	return nil
+}
+
 // poolRetryAfterError reports the pool's recovery as the client's Retry-After for a refusal that
 // exhausted the pool. The upstream error (status, body, headers) is otherwise unchanged, and the
 // per-credential deadlines MarkResult recorded are untouched.

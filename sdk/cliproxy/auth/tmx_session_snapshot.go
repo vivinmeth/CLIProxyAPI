@@ -49,16 +49,22 @@ func (c *SessionCache) Restore(bindings []SessionBinding, allowed func(string) b
 		}
 		previous := make([]sessionEntry, 0, len(aliases))
 		newer := false
+		// The snapshot doesn't carry the provider-aware binding; keep the newest one it replaces,
+		// as Bind does for a selection without a session or provider.
+		var restored sessionBinding
 		for _, alias := range aliases {
 			if e, ok := c.entries[alias]; ok {
 				previous = append(previous, e)
 				if e.expiresAt.After(binding.ExpiresAt) {
 					newer = true
 				}
+				if e.binding.sequence > restored.sequence {
+					restored = e.binding
+				}
 			}
 		}
 		if !newer {
-			c.replaceAliasGroupsLocked(binding.AuthID, binding.ExpiresAt, aliases, previous...)
+			c.replaceAliasGroupsLocked(binding.AuthID, binding.ExpiresAt, aliases, restored, previous...)
 		}
 	}
 }

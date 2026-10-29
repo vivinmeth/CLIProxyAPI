@@ -68,7 +68,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	originalPayload := originalPayloadSource
 	incomingHeaders, claudeCodeDetection := detectIncomingClaudeCodeRequest(ctx, opts.Headers, originalPayload, false, e.cfg)
-	confirmedClaudeCode := claudeCodeDetection.Confirmed
+	wirePolicy, wireSettings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, claudeCodeDetection.Confirmed)
+	confirmedClaudeCode := isEffectiveConfirmedClaudeCode(claudeCodeDetection, wirePolicy)
 	claudeSessionID := ""
 	if fp.ProfileClaudeCodeCLI {
 		claudeSessionID = helps.ClaudeAgentSessionUUIDForRequest(incomingHeaders, originalPayload, req.Payload, confirmedClaudeCode, opts.Metadata, req.Metadata)
@@ -88,12 +89,13 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 	body = helps.SetStringIfDifferent(body, "model", upstreamModel)
+	body = helps.NormalizeClaudeToolChoice(e.upstreamRequestLogProvider(), upstreamModel, body)
 
 	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
-	webSearchSessionKey, webSearchTTL, webSearchLimit := e.claudeWebSearchResultCacheScope(ctx, from, req, opts, originalPayload)
+	webSearchSessionKey, webSearchTTL, webSearchLimit := e.claudeWebSearchResultCacheScope(ctx, auth, from, req, opts, originalPayload)
 	body = helps.RestoreClaudeWebSearchResultsContext(ctx, body, webSearchSessionKey, webSearchTTL)
 	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
 		body = rebuildMidSystemMessagesToTopLevel(body)
@@ -101,7 +103,6 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
-	_, wireSettings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, confirmedClaudeCode)
 	isProbeOrHelper := helps.IsClaudeProbeOrHelperRequest(body)
 	explicitCacheMode := isExplicitPromptCacheMode(originalPayload, req.Payload, body)
 	if explicitCacheMode {
@@ -206,7 +207,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	bodyForUpstream := body
 	var oauthToolNamesReverseMap map[string]string
 	if fp.MCPAlias && cloaked {
-		mcpAliases := resolveClaudeMCPAliasOptions(ctx)
+		mcpAliases := resolveClaudeMCPAliasOptions(ctx, opts.Metadata, req.Metadata)
 		bodyForUpstream, oauthToolNamesReverseMap, err = e.prepareClaudeOAuthToolNamesForRequest(bodyForUpstream, mcpAliases)
 		if err != nil {
 			return nil, err

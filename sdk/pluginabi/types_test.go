@@ -28,8 +28,8 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 }
 
 func TestMethodNamesAreStable(t *testing.T) {
-	if SchemaVersion != 6 {
-		t.Fatalf("SchemaVersion = %d, want 6", SchemaVersion)
+	if SchemaVersion != 8 {
+		t.Fatalf("SchemaVersion = %d, want 8", SchemaVersion)
 	}
 	if SchemaVersionWebSocketResponseObserver != 4 {
 		t.Fatalf("SchemaVersionWebSocketResponseObserver = %d, want 4", SchemaVersionWebSocketResponseObserver)
@@ -43,6 +43,15 @@ func TestMethodNamesAreStable(t *testing.T) {
 	if SchemaVersionRawManagementResponse != 6 {
 		t.Fatalf("SchemaVersionRawManagementResponse = %d, want 6", SchemaVersionRawManagementResponse)
 	}
+	if SchemaVersionRequestInterceptorOmitBody != 7 {
+		t.Fatalf("SchemaVersionRequestInterceptorOmitBody = %d, want 7", SchemaVersionRequestInterceptorOmitBody)
+	}
+	if SchemaVersionFrontendAuthOmitBody != 7 {
+		t.Fatalf("SchemaVersionFrontendAuthOmitBody = %d, want 7", SchemaVersionFrontendAuthOmitBody)
+	}
+	if SchemaVersionRequestInterceptorBodyPatch != 8 {
+		t.Fatalf("SchemaVersionRequestInterceptorBodyPatch = %d, want 8", SchemaVersionRequestInterceptorBodyPatch)
+	}
 	if MethodPluginRegister != "plugin.register" {
 		t.Fatalf("MethodPluginRegister = %q", MethodPluginRegister)
 	}
@@ -54,6 +63,12 @@ func TestMethodNamesAreStable(t *testing.T) {
 	}
 	if MethodRequestInterceptAfter != "request.intercept_after" {
 		t.Fatalf("MethodRequestInterceptAfter = %q", MethodRequestInterceptAfter)
+	}
+	if MethodRequestPatchBodyBefore != "request.patch_body_before" {
+		t.Fatalf("MethodRequestPatchBodyBefore = %q", MethodRequestPatchBodyBefore)
+	}
+	if MethodRequestPatchBodyAfter != "request.patch_body_after" {
+		t.Fatalf("MethodRequestPatchBodyAfter = %q", MethodRequestPatchBodyAfter)
 	}
 	if MethodRequestComplete != "request.complete" {
 		t.Fatalf("MethodRequestComplete = %q", MethodRequestComplete)
@@ -105,6 +120,9 @@ func TestMethodNamesAreStable(t *testing.T) {
 	}
 	if MethodHostAuthSave != "host.auth.save" {
 		t.Fatalf("MethodHostAuthSave = %q", MethodHostAuthSave)
+	}
+	if MethodHostAuthModels != "host.auth.models" {
+		t.Fatalf("MethodHostAuthModels = %q", MethodHostAuthModels)
 	}
 	if MethodHostAffinityLookup != "host.affinity.lookup" {
 		t.Fatalf("MethodHostAffinityLookup = %q", MethodHostAffinityLookup)
