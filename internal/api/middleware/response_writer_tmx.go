@@ -6,9 +6,11 @@ package middleware
 // client, with per-chunk timing, and submits the whole exchange at Finalize.
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -25,6 +27,36 @@ type tmxCapture struct {
 	chunks     *capture.Body
 	chunkCount int
 	first      time.Time
+}
+
+// tmxDropProxyContentEncoding removes a Content-Encoding the response compression middleware
+// added after capture: the archived body is what the handler wrote, so a gzip/zstd label on a body
+// without that format's magic bytes would mislead any later decoder. A body the handler really
+// encoded keeps its header.
+func tmxDropProxyContentEncoding(ex *capture.Exchange) {
+	var encoding string
+	for key, values := range ex.ResponseHeaders {
+		if http.CanonicalHeaderKey(key) == "Content-Encoding" && len(values) > 0 {
+			encoding = strings.ToLower(strings.TrimSpace(values[0]))
+		}
+	}
+	var magic []byte
+	switch encoding {
+	case "gzip":
+		magic = []byte{0x1f, 0x8b}
+	case "zstd":
+		magic = []byte{0x28, 0xb5, 0x2f, 0xfd}
+	default:
+		return
+	}
+	if body := ex.Bodies["response"]; body != nil && bytes.HasPrefix(body.Prefix(int64(len(magic))), magic) {
+		return
+	}
+	for key := range ex.ResponseHeaders {
+		if http.CanonicalHeaderKey(key) == "Content-Encoding" {
+			delete(ex.ResponseHeaders, key)
+		}
+	}
 }
 
 // tmxTee records a chunk written to the client. Called after the client write.
@@ -143,6 +175,7 @@ func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
 	} else if w.tmx != nil {
 		ex.Bodies["response"] = w.tmx.body
 	}
+	tmxDropProxyContentEncoding(ex)
 	if w.tmx != nil {
 		if w.tmx.chunkCount > 0 {
 			_, _ = w.tmx.chunks.Write([]byte("]"))

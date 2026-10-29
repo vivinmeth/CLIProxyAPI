@@ -57,4 +57,7 @@ func TestTMXCaptureSeesUncompressedResponse(t *testing.T) {
 	if string(captured) != stream {
 		t.Fatalf("captured %d bytes starting %q, want the plain stream", len(captured), captured[:min(len(captured), 16)])
 	}
+	if got := http.Header(exchange.ResponseHeaders).Get("Content-Encoding"); got != "" {
+		t.Fatalf("archived headers say Content-Encoding %q for a plain body", got)
+	}
 }

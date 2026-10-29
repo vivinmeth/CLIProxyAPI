@@ -19,9 +19,9 @@ separate clone at `~/workspace/vivinmeth/repos/CLIProxyAPI` is parked: don't wor
 working:
 
 - **`reset-soonest` routing:** `sdk/cliproxy/auth/selector_reset_soonest*.go`, plus wiring in
-  `conductor_selection.go`, `service_config.go`, `config_basic.go`. Within the top priority tier:
-  unobserved credentials first, then soonest weekly reset, then already-passed resets. It bypasses
-  the scheduler fast path on purpose. `../wiki/routing-reset-soonest.md`.
+  `conductor_selection.go`, `service_config.go`, `internal/config/config_types.go`. Within the top
+  priority tier: unobserved credentials first, then soonest weekly reset, then already-passed
+  resets. It bypasses the scheduler fast path on purpose. `../wiki/routing-reset-soonest.md`.
 - **Request log** (`internal/tmx/requestlog/`): usage-plugin hook → batched writes to Postgres
   `tmx.requests`. Routes `GET /v8/management/tmx/requests[/summary]` in
   `internal/api/server_management_tmx.go`; hooks in `server_management_v8.go`, `cmd/server/main.go`.
@@ -30,8 +30,9 @@ working:
   ingest. Hooks: `capture.Enabled()` in the request-log gates in
   `runtime/executor/helps/logging_helpers.go`, `sdk/api/handlers/handlers.go`, `handlers_errors.go`,
   `openai/openai_responses_websocket.go`, `middleware/request_logging.go`; the response writer calls
-  `tmxTee`/`tmxSubmit` (`middleware/response_writer_tmx.go`). Keep these when merging upstream.
-  `../wiki/archive-ingest.md`.
+  `tmxTee`/`tmxSubmit` (`middleware/response_writer_tmx.go`); `internal/api/server.go` registers
+  response compression before request logging, so capture sees plain bodies. Keep these when
+  merging upstream. `../wiki/archive-ingest.md`.
 - **Analytics** (`internal/tmx/archive/analytics*.go`): derived query layer in its own Postgres
   (`TMX_ANALYTICS_DSN`), fed by `tmx_archive.analytics_journal` written in the same transaction as
   ingest/replace/delete and capture. Routes `/tmx/analytics/{status,backfill,search}`;
