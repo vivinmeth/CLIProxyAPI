@@ -374,6 +374,12 @@ func codexHTTPRetryAfter(statusCode int, headers http.Header, body []byte, bodyR
 			delay := retryAt.Sub(now)
 			return &delay
 		}
+		if bodyRetryAfter == nil {
+			// An explicit immediate retry (0 or a past date) keeps upstream's meaning.
+			if immediate := parseRetryAfterHeader(headers, now); immediate != nil && *immediate == 0 {
+				return immediate
+			}
+		}
 		return bodyRetryAfter
 	}
 	var latest time.Time

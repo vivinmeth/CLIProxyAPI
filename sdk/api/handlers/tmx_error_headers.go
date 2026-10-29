@@ -26,6 +26,11 @@ func ErrorResponseHeaders(msg *interfaces.ErrorMessage, upstream bool) http.Head
 			out[http.CanonicalHeaderKey(key)] = append([]string(nil), values...)
 		}
 	}
+	if coreauth.HasTrustedRetryDeadline(msg.Error) {
+		// A trusted deadline that has passed, or a Home round with no hint, must not let a stale
+		// raw Retry-After through.
+		delete(out, "Retry-After")
+	}
 	if msg.Error != nil {
 		if computed := coreauth.SafeResponseHeaders(msg.Error).Values("Retry-After"); len(computed) > 0 {
 			out["Retry-After"] = computed
@@ -50,6 +55,11 @@ func ErrorEnvelopeHeaders(msg *interfaces.ErrorMessage) http.Header {
 	out := http.Header{}
 	for key, values := range msg.Addon {
 		out[http.CanonicalHeaderKey(key)] = values
+	}
+	if coreauth.HasTrustedRetryDeadline(msg.Error) {
+		if computed := coreauth.SafeResponseHeaders(msg.Error).Values("Retry-After"); len(computed) == 0 {
+			delete(out, "Retry-After")
+		}
 	}
 	if msg.Error != nil {
 		if computed := coreauth.SafeResponseHeaders(msg.Error).Values("Retry-After"); len(computed) > 0 && out.Get("Retry-After") != "" {
