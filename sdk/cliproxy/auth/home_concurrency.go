@@ -292,6 +292,9 @@ func SafeResponseHeaders(err error) http.Header {
 		}
 		return nil
 	}
+	if header := tmxTrustedRetryAfterHeader(err); header != nil { // tmx
+		return header
+	}
 	var trusted *trustedRetryAfterError
 	if errors.As(err, &trusted) && trusted != nil {
 		return trusted.SafeResponseHeaders()
