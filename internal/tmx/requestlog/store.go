@@ -51,6 +51,7 @@ var schemaNamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
 
 // Store owns the database handle and the background writer.
 type Store struct {
+	indexMu       sync.Mutex // one allowance-index build at a time (provider_cost.go)
 	db            *sql.DB
 	schema        string
 	retentionDays int

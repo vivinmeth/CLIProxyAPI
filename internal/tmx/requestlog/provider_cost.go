@@ -70,6 +70,8 @@ func (r *Row) applyProviderCost(pc *coreusage.ProviderCost, baseURL string) {
 // was interrupted leaves an INVALID index that IF NOT EXISTS would skip forever: it is dropped and
 // built again. Readings work without it, only slower.
 func (s *Store) ensureAllowanceIndex() {
+	s.indexMu.Lock() // two concurrent CONCURRENTLY builds deadlock on each other
+	defer s.indexMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	var valid *bool
