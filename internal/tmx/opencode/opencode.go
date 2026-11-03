@@ -423,18 +423,35 @@ func (s *Store) rolling(ctx context.Context, entry string, sc scope, w Window, n
 	return wr, err
 }
 
-// anchored replays the window chain over the last four window lengths: a window opens at the first
-// request after the previous one closed and lasts w.Hours. The open window, if any, is the reading.
+// anchoredLookback bounds how far back the window chain is replayed.
+const anchoredLookback = 31 * 24 * time.Hour
+
+// anchored replays the window chain: a window opens at the first request after the previous one
+// closed and lasts w.Hours. The replay starts at the last request that followed a gap of at least
+// one window length (such a request must open a window, whatever came before), else at the first
+// request of the lookback. The open window, if any, is the reading.
 func (s *Store) anchored(ctx context.Context, entry string, sc scope, w Window, now time.Time) (WindowReading, error) {
 	wr := WindowReading{Window: w.Name}
 	length := hours(w.Hours)
+	from := now.Add(-anchoredLookback)
+	var start sql.NullTime
+	if err := s.db.QueryRowContext(ctx, `SELECT max(ts) FROM (
+		SELECT ts, ts - lag(ts) OVER (ORDER BY ts) AS gap FROM `+s.schema+`.requests
+		WHERE `+rowFilter+sc.clause+` AND ts > $2 AND ts <= $3) t
+		WHERE gap IS NULL OR gap >= make_interval(secs => $5)`,
+		entry, from, now, sc.keys, length.Seconds()).Scan(&start); err != nil {
+		return wr, err
+	}
+	if !start.Valid {
+		return wr, nil // no usage in the lookback
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT ts, allowance_usd FROM `+s.schema+`.requests
-		WHERE `+rowFilter+sc.clause+` AND ts > $2 AND ts <= $3 ORDER BY ts`, entry, now.Add(-4*length), now, sc.keys)
+		WHERE `+rowFilter+sc.clause+` AND ts >= $2 AND ts <= $3 ORDER BY ts`, entry, start.Time, now, sc.keys)
 	if err != nil {
 		return wr, err
 	}
 	defer func() { _ = rows.Close() }()
-	var start time.Time
+	var open time.Time
 	var sum float64
 	for rows.Next() {
 		var ts time.Time
@@ -442,16 +459,16 @@ func (s *Store) anchored(ctx context.Context, entry string, sc scope, w Window, 
 		if err = rows.Scan(&ts, &v); err != nil {
 			return wr, err
 		}
-		if start.IsZero() || !ts.Before(start.Add(length)) {
-			start, sum = ts, 0
+		if open.IsZero() || !ts.Before(open.Add(length)) {
+			open, sum = ts, 0
 		}
 		sum += v
 	}
 	if err = rows.Err(); err != nil {
 		return wr, err
 	}
-	if !start.IsZero() && now.Before(start.Add(length)) {
-		end := start.Add(length).UTC()
+	if !open.IsZero() && now.Before(open.Add(length)) {
+		end := open.Add(length).UTC()
 		wr.UsedUSD, wr.ResetsAt = sum, &end
 	}
 	return wr, nil

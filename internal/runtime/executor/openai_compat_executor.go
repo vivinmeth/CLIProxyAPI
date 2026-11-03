@@ -119,6 +119,9 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 		err = statusErr{code: http.StatusUnauthorized, msg: "missing provider baseURL"}
 		return
 	}
+	if err = helps.TMXCodexClaudeUpstream(ctx, opts.SourceFormat.String(), baseModel); err != nil { // tmx
+		return
+	}
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -357,6 +360,9 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 
 	if baseURL == "" {
 		err = statusErr{code: http.StatusUnauthorized, msg: "missing provider baseURL"}
+		return nil, err
+	}
+	if err = helps.TMXCodexClaudeUpstream(ctx, opts.SourceFormat.String(), baseModel); err != nil { // tmx
 		return nil, err
 	}
 

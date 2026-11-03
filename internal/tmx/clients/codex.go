@@ -96,18 +96,31 @@ func ResolvesToClaude(id string, providers []string) bool {
 	if IsClaudeModel(id, providers) {
 		return true
 	}
-	id = strings.TrimSpace(id)
+	id = stripThinkingSuffix(strings.TrimSpace(id))
 	if id == "" {
 		return false
 	}
 	r := registry.GetGlobalRegistry()
-	if IsClaudeModel("", r.GetModelProviders(id)) {
+	providers = r.GetModelProviders(id)
+	if IsClaudeModel("", providers) {
 		return true
 	}
-	if info := r.GetModelInfo(id, ""); info != nil && strings.Contains(strings.ToLower(info.MetadataModelID), "claude") {
-		return true
+	// Every provider's registration: two entries can share an alias with different upstreams, and
+	// the registry's default info is only the last one registered.
+	for _, p := range append(providers, "") {
+		if info := r.GetModelInfo(id, p); info != nil && strings.Contains(strings.ToLower(info.MetadataModelID), "claude") {
+			return true
+		}
 	}
 	return false
+}
+
+// stripThinkingSuffix drops a trailing "(level)" thinking suffix ("review(high)" -> "review").
+func stripThinkingSuffix(id string) string {
+	if i := strings.LastIndex(id, "("); i > 0 && strings.HasSuffix(id, ")") {
+		return id[:i]
+	}
+	return id
 }
 
 // HiddenPrefixes are client model ids no model list shows: OpenCode Zen (pay as you go) is a

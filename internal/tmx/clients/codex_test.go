@@ -90,3 +90,24 @@ func TestFilterModelsForCodex(t *testing.T) {
 		t.Fatalf("plain list = %v", out)
 	}
 }
+
+func TestResolvesToClaudeSeesThroughAliases(t *testing.T) {
+	r := registry.GetGlobalRegistry()
+	// Two entries share the alias "shared": one maps it to Claude, the other (registered last) to GPT.
+	r.RegisterClient("tmx-alias-claude", "openai-compatible-or", []*registry.ModelInfo{{ID: "shared", MetadataModelID: "anthropic/claude-sonnet-5"}})
+	r.RegisterClient("tmx-alias-gpt", "openai-compatible-other", []*registry.ModelInfo{{ID: "shared", MetadataModelID: "gpt-6-luna"}})
+	r.RegisterClient("tmx-alias-review", "openai-compatible-or", []*registry.ModelInfo{{ID: "review", MetadataModelID: "anthropic/claude-sonnet-5"}})
+	t.Cleanup(func() {
+		for _, c := range []string{"tmx-alias-claude", "tmx-alias-gpt", "tmx-alias-review"} {
+			r.UnregisterClient(c)
+		}
+	})
+	for _, id := range []string{"shared", "review", "review(high)", "shared(xhigh)"} {
+		if !ResolvesToClaude(id, nil) {
+			t.Errorf("%s not seen as Claude", id)
+		}
+	}
+	if ResolvesToClaude("gpt-6-luna(high)", nil) {
+		t.Error("gpt-6-luna read as Claude")
+	}
+}
