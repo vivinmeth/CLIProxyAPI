@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/clients"
 	"net/http"
 	"net/url"
 	"sort"
@@ -313,7 +314,7 @@ func codexSpawnAgentModelsAndMarkdownForRequest(ctx context.Context, headers htt
 		return nil, ""
 	}
 
-	availableModels := registry.GetGlobalRegistry().GetAvailableModels("openai")
+	availableModels := clients.FilterModelsForCodex(registry.GetGlobalRegistry().GetAvailableModels("openai"), registry.GetGlobalRegistry().GetModelProviders) // tmx
 	lookup := func(modelID string) *registry.ModelInfo {
 		return registry.LookupModelInfo(modelID)
 	}

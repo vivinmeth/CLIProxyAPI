@@ -30,8 +30,9 @@ func registerCodexClaudeFixture(t *testing.T) {
 	})
 	r.RegisterClient("tmx-cc-codex", "codex", []*registry.ModelInfo{{ID: "gpt-6.1-sol", OwnedBy: "openai"}})
 	r.RegisterClient("tmx-cc-go", "opencode-go", []*registry.ModelInfo{{ID: "opencode-go/kimi-k3", OwnedBy: "opencode-go"}})
+	r.RegisterClient("tmx-cc-zen", "opencode-zen", []*registry.ModelInfo{{ID: "opencode-zen/glm-5.3", OwnedBy: "opencode-zen"}})
 	t.Cleanup(func() {
-		for _, id := range []string{"tmx-cc-claude", "tmx-cc-codex", "tmx-cc-go"} {
+		for _, id := range []string{"tmx-cc-claude", "tmx-cc-codex", "tmx-cc-go", "tmx-cc-zen"} {
 			r.UnregisterClient(id)
 		}
 	})
@@ -90,6 +91,9 @@ func TestTmxCodexModelListsHaveNoClaude(t *testing.T) {
 			if got["big-brain"] {
 				t.Errorf("Codex list has the Claude-served alias big-brain")
 			}
+			if got["opencode-zen/glm-5.3"] {
+				t.Errorf("Codex list has the hidden Zen model")
+			}
 			for _, want := range []string{"gpt-6.1-sol", "opencode-go/kimi-k3"} {
 				if !got[want] {
 					t.Errorf("Codex list lost %q: %v", want, ids)
@@ -114,10 +118,13 @@ func TestTmxClaudeCodeListKeepsClaude(t *testing.T) {
 	for _, id := range tmxModelIDs(t, rec.Body.Bytes()) {
 		got[id] = true
 	}
-	for _, want := range []string{"claude-opus-5-5", "big-brain"} {
+	for _, want := range []string{"claude-opus-5-5", "big-brain", "opencode-go/kimi-k3"} {
 		if !got[want] && !got["claude-fable-5-dd-"+reverse(want)] {
 			t.Errorf("Claude Code list lost %q: %v", want, got)
 		}
+	}
+	if got["opencode-zen/glm-5.3"] || got["claude-fable-5-dd-"+reverse("opencode-zen/glm-5.3")] {
+		t.Errorf("Claude Code list has the hidden Zen model: %v", got)
 	}
 }
 
@@ -147,7 +154,8 @@ func TestTmxCodexClaudeRequestsRefused(t *testing.T) {
 		{"responses via alias", "/v1/responses", tmxUAT3Codex, `{"model":"big-brain","input":"hi"}`},
 		{"responses thinking suffix", "/v1/responses", tmxUACodexCLI, `{"model":"claude-opus-5-5(high)","input":"hi"}`},
 		{"chat completions", "/v1/chat/completions", tmxUACodexCLI, `{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}]}`},
-		{"originator only", "/v1/responses", "", `{"model":"claude-opus-5-5","input":"hi"}`},
+		{"originator only", "/v1/chat/completions", "", `{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}]}`},
+		{"responses, any client", "/v1/responses", "SomeAgent/1.0", `{"model":"claude-opus-5-5","input":"hi"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var rec *httptest.ResponseRecorder

@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/clients"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/muse"
@@ -25,11 +26,12 @@ func tmxContributorBlocked(models ...string) *interfaces.ErrorMessage {
 
 // tmxProvidersForExecution is providersForExecution plus the owner's per-client rule (tokenmaxx
 // fork; internal/tmx/clients): a Codex client asking for a Claude model, by id, alias or any route
-// that resolves to the Claude provider, gets a 400 before routing. Claude work goes through Claude
-// Code.
-func (h *BaseAPIHandler) tmxProvidersForExecution(ctx context.Context, modelName, originalRequestedModel string, allowImageModel bool, routeDecision modelRouteDecision, execOptions modelExecutionOptions) ([]string, string, *interfaces.ErrorMessage) {
+// that resolves to the Claude provider (the final model, after "auto" resolves), gets a 400 before
+// routing. Any request on the Responses API counts as Codex's: no other client sends Claude models
+// there. Claude work goes through Claude Code.
+func (h *BaseAPIHandler) tmxProvidersForExecution(ctx context.Context, entryProtocol, modelName, originalRequestedModel string, allowImageModel bool, routeDecision modelRouteDecision, execOptions modelExecutionOptions) ([]string, string, *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
-	if errMsg != nil || !clients.IsCodex(tmxRequestHeaders(ctx)) {
+	if errMsg != nil || (entryProtocol != constant.OpenaiResponse && !clients.IsCodex(tmxRequestHeaders(ctx))) {
 		return providers, normalizedModel, errMsg
 	}
 	for _, m := range []string{originalRequestedModel, modelName, normalizedModel, routeDecision.Model} {

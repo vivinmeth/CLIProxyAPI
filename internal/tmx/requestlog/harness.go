@@ -3,6 +3,7 @@ package requestlog
 import (
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/clients"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/muse"
 )
 
@@ -37,6 +38,9 @@ func HarnessFor(source, userAgent string) (harness, clientMode string) {
 	case name == "codex-tui" || name == "codex_cli_rs" || name == "codex_vscode":
 		return "codex", "tui"
 	case strings.HasPrefix(name, "codex"):
+		return "codex", ""
+	case clients.IsCodexUserAgent(userAgent):
+		// Codex under another originator, e.g. T3's "T3 Code/0.166.0 (Ubuntu 24.4.0; x86_64) …".
 		return "codex", ""
 	case name == "opencode", name == "cursor", name == "aider", name == "nanx-app", name == "nanx-cli",
 		name == "gemini-cli", name == "pi":

@@ -10,6 +10,7 @@ func TestHarnessFor(t *testing.T) {
 		{"tmx-proxy", "claude-cli/2.1.304 (external, cli)", "claude-code", "cli"},
 		{"tmx-proxy", "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.163.0)", "codex", "exec"},
 		{"tmx-proxy", "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11", "codex", "tui"},
+		{"tmx-proxy", "T3 Code/0.166.0 (Ubuntu 24.4.0; x86_64) unknown (T3 Code; 0.1.7-nightly.20261102.4066)", "codex", ""},
 		{"tmx-proxy", "opencode/1.15.5", "opencode", ""},
 		{"tmx-proxy", "muse-build/1.4.11 (non-interactive; macos-aarch64; build abc)", "muse-code", "exec"},
 		{"tmx-proxy", "muse-build/1.4.11 (interactive; macos-aarch64; build abc)", "muse-code", "tui"},
