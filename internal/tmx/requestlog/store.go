@@ -191,6 +191,7 @@ func Open(ctx context.Context, dsn, schema string, retentionDays int) (*Store, e
 	go s.backfillAccounting()
 	go s.backfillHarness()
 	go s.backfillBilling()
+	go s.ensureAllowanceIndex() // provider_cost.go
 	go s.pricesLoop()
 	if err := s.loadKeyMachines(pingCtx); err != nil {
 		log.WithError(err).Warn("tmx request log: loading the key -> machine ledger failed")
@@ -284,9 +285,6 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS allowance_usd DOUBLE PRECISION`,
 		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS billing_source TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS warning TEXT NOT NULL DEFAULT ''`,
-		// The OpenCode Go readings (internal/tmx/opencode) scan only rows with allowance. Built
-		// concurrently: request-log writes never wait on it.
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS requests_allowance_idx ON ` + s.table() + ` (provider, ts) WHERE allowance_usd IS NOT NULL`,
 		`CREATE TABLE IF NOT EXISTS ` + s.schema + `.price_catalogs (
 			fetched_at TIMESTAMPTZ PRIMARY KEY,
 			source     TEXT NOT NULL,

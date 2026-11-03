@@ -31,6 +31,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // Window is one allowance window: Name (as shown in quota readings), Hours long, Share of the
@@ -204,8 +206,13 @@ func (s *Store) List(ctx context.Context) ([]Settings, error) {
 			return nil, err
 		}
 		var st Settings
-		if err = json.Unmarshal(raw, &st); err != nil || st.Normalize() != nil {
-			continue // stored in an older shape or before a stricter rule: skipped, not fatal
+		if err = json.Unmarshal(raw, &st); err == nil {
+			err = st.Normalize()
+		}
+		if err != nil {
+			// Stored in an older shape or before a stricter rule: skipped, not fatal, but said.
+			log.WithError(err).Warn("tmx opencode: a stored quota settings row is unusable; rerun scripts/opencode-sync.py")
+			continue
 		}
 		out = append(out, st)
 	}
