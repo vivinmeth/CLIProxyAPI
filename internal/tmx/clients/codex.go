@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"sync"
+	"sync/atomic"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
@@ -127,33 +127,49 @@ func stripThinkingSuffix(id string) string {
 	return id
 }
 
-// aliasTargets holds every upstream model each configured alias routes to, per
-// openai-compatibility entry: one entry can pool an alias over several upstream names, and the
-// registry keeps only the first one's metadata.
-var (
-	aliasMu      sync.RWMutex
-	aliasTargets = map[string]map[string][]string{} // entry -> client alias -> upstream names
-)
+// CompatModel is one configured model of an openai-compatibility entry: Name upstream, Alias as
+// clients see it ("" = Name).
+type CompatModel struct{ Name, Alias string }
 
-// SetAliasTargets replaces an openai-compatibility entry's alias -> upstream names (called when its
-// models are built from config).
-func SetAliasTargets(entry string, targets map[string][]string) {
-	entry = strings.ToLower(strings.TrimSpace(entry))
-	aliasMu.Lock()
-	defer aliasMu.Unlock()
-	if len(targets) == 0 {
-		delete(aliasTargets, entry)
-		return
-	}
-	aliasTargets[entry] = targets
+// CompatEntry is one enabled openai-compatibility entry: its prefix and models.
+type CompatEntry struct {
+	Prefix string
+	Models []CompatModel
 }
 
+// compatSource reads the live config's enabled openai-compatibility entries. One entry can pool an
+// alias over several upstream names and the registry keeps only the first one's metadata, so the
+// Claude check reads every target from the config itself: nothing to keep in step, nothing stale
+// after an entry is removed, disabled or emptied.
+var compatSource atomic.Pointer[func() []CompatEntry]
+
+// SetCompatSource installs the live-config reader (the SDK service, at start).
+func SetCompatSource(f func() []CompatEntry) {
+	if f == nil {
+		compatSource.Store(nil)
+		return
+	}
+	compatSource.Store(&f)
+}
+
+// aliasHasClaudeTarget reports whether a client id is a configured alias (bare or "<prefix>/")
+// with any Claude upstream.
 func aliasHasClaudeTarget(id string) bool {
-	aliasMu.RLock()
-	defer aliasMu.RUnlock()
-	for _, byAlias := range aliasTargets {
-		for _, name := range byAlias[id] {
-			if IsClaudeModel(name, nil) {
+	f := compatSource.Load()
+	if f == nil || id == "" {
+		return false
+	}
+	for _, e := range (*f)() {
+		prefix := strings.TrimSpace(e.Prefix)
+		for _, m := range e.Models {
+			alias := strings.TrimSpace(m.Alias)
+			if alias == "" {
+				alias = strings.TrimSpace(m.Name)
+			}
+			if alias == "" || !IsClaudeModel(m.Name, nil) {
+				continue
+			}
+			if id == alias || (prefix != "" && id == prefix+"/"+alias) {
 				return true
 			}
 		}

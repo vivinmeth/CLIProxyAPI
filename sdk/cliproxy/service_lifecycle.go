@@ -41,6 +41,7 @@ func (s *Service) Run(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	ctx, runCancel := context.WithCancel(ctx)
+	s.tmxInstallCompatSource() // tmx: live alias targets for the no-Claude-to-Codex rule (service_models_tmx.go)
 	s.cfgMu.Lock()
 	s.antigravityContext = ctx
 	s.cfgMu.Unlock()

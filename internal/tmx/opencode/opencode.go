@@ -199,6 +199,11 @@ func NewStore(ctx context.Context, db *sql.DB, schema string) (*Store, error) {
 	)`); err != nil {
 		return nil, fmt.Errorf("opencode anchors schema: %w", err)
 	}
+	// max_id: the highest request-log row id the stored start was computed from. A row inserted
+	// later (higher id) with an earlier timestamp means the chain was built without it.
+	if _, err := db.ExecContext(ctx, `ALTER TABLE `+s.schema+`.opencode_anchors ADD COLUMN IF NOT EXISTS max_id BIGINT NOT NULL DEFAULT 0`); err != nil {
+		return nil, fmt.Errorf("opencode anchors schema: %w", err)
+	}
 	return s, nil
 }
 
@@ -455,17 +460,36 @@ const anchorSettle = time.Hour
 // stored by the last read (opencode_anchors), and the last request that followed a gap of at least
 // one window length within the lookback (such a request must open a window, whatever came before).
 // With neither, it starts at the first request of the lookback (an estimate, corrected by the next
-// gap). The latest window start that closed at least anchorSettle ago is stored, so the chain
-// never drifts and late rows after it are still counted. The open window, if any, is the reading.
+// gap). The latest window start that closed at least anchorSettle ago is stored with the highest
+// row id seen, so the chain never drifts; a row logged later but timestamped before the stored
+// start (a long stream, a spool replay) invalidates it and the chain is rebuilt. The open window,
+// if any, is the reading.
 func (s *Store) anchored(ctx context.Context, entry, account string, sc scope, w Window, now time.Time) (WindowReading, error) {
 	wr := WindowReading{Window: w.Name}
 	length := hours(w.Hours)
 	from := now.Add(-anchoredLookback)
 	var stored, gap sql.NullTime
-	err := s.db.QueryRowContext(ctx, `SELECT start FROM `+s.schema+`.opencode_anchors
-		WHERE entry = $1 AND account = $2 AND "window" = $3 AND start <= $4`, entry, account, w.Name, now).Scan(&stored)
+	var storedMaxID, maxID int64
+	err := s.db.QueryRowContext(ctx, `SELECT start, max_id FROM `+s.schema+`.opencode_anchors
+		WHERE entry = $1 AND account = $2 AND "window" = $3 AND start <= $4`, entry, account, w.Name, now).Scan(&stored, &storedMaxID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return wr, err
+	}
+	if err = s.db.QueryRowContext(ctx, `SELECT COALESCE(max(id), 0) FROM `+s.schema+`.requests
+		WHERE `+rowFilter+sc.clause+` AND ts > $2 AND ts <= $3`, entry, from, now, sc.keys).Scan(&maxID); err != nil {
+		return wr, err
+	}
+	if stored.Valid {
+		// A row logged after the start was stored, but timestamped before it: the chain was built
+		// without it, so the stored start can't be trusted. Rebuild from the gap boundary.
+		var late bool
+		if err = s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM `+s.schema+`.requests
+			WHERE `+rowFilter+sc.clause+` AND id > $2 AND ts < $3)`, entry, storedMaxID, stored.Time, sc.keys).Scan(&late); err != nil {
+			return wr, err
+		}
+		if late {
+			stored = sql.NullTime{}
+		}
 	}
 	if err = s.db.QueryRowContext(ctx, `SELECT max(ts) FROM (
 		SELECT ts, ts - lag(ts) OVER (ORDER BY ts) AS gap FROM `+s.schema+`.requests
@@ -509,11 +533,11 @@ func (s *Store) anchored(ctx context.Context, entry, account string, sc scope, w
 	if !open.Add(length + anchorSettle).After(now) {
 		settled = open
 	}
-	if !settled.IsZero() && (!stored.Valid || settled.After(stored.Time)) {
-		if _, err = s.db.ExecContext(ctx, `INSERT INTO `+s.schema+`.opencode_anchors (entry, account, "window", start, updated_at)
-			VALUES ($1, $2, $3, $4, now()) ON CONFLICT (entry, account, "window")
-			DO UPDATE SET start = EXCLUDED.start, updated_at = now() WHERE `+s.schema+`.opencode_anchors.start < EXCLUDED.start`,
-			entry, account, w.Name, settled); err != nil {
+	if !settled.IsZero() && (!stored.Valid || !settled.Equal(stored.Time) || maxID != storedMaxID) {
+		if _, err = s.db.ExecContext(ctx, `INSERT INTO `+s.schema+`.opencode_anchors (entry, account, "window", start, max_id, updated_at)
+			VALUES ($1, $2, $3, $4, $5, now()) ON CONFLICT (entry, account, "window")
+			DO UPDATE SET start = EXCLUDED.start, max_id = EXCLUDED.max_id, updated_at = now()`,
+			entry, account, w.Name, settled, maxID); err != nil {
 			return wr, err
 		}
 	}

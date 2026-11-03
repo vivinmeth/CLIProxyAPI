@@ -342,3 +342,54 @@ func TestAnchoredWindowLateRow(t *testing.T) {
 		t.Fatalf("5h = %v resets %v; want 3 resetting %v", w.UsedUSD, w.ResetsAt, t0.Add(5*time.Hour))
 	}
 }
+
+// A row logged hours late, after its window's start was stored, rewinds the anchor
+// (pr-reviewer r2 S2: B 10:01, C 15:00, D 15:01 read at 16:02; then A at 10:00 arrives).
+func TestAnchoredWindowVeryLateRow(t *testing.T) {
+	dsn := os.Getenv("TMX_REQUESTLOG_TEST_DSN")
+	if dsn == "" {
+		t.Skip("TMX_REQUESTLOG_TEST_DSN not set")
+	}
+	ctx := context.Background()
+	schema := fmt.Sprintf("tmx_test_ocvl_%d", time.Now().UnixNano())
+	rl, err := requestlog.Open(ctx, dsn, schema, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = rl.DB().Exec("DROP SCHEMA " + schema + " CASCADE")
+		rl.Close()
+	})
+	store, err := opencode.NewStore(ctx, rl.DB(), schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := opencode.Settings{Entry: "opencode-go", Plan: "go", Plans: map[string]opencode.Plan{"go": {Pool: 60}}}
+	if err = st.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	insert := func(ts time.Time) {
+		t.Helper()
+		if _, err := rl.DB().ExecContext(ctx, `INSERT INTO `+schema+`.requests (ts, provider, model, outcome, allowance_usd)
+			VALUES ($1, 'openai-compatible-opencode-go', 'm', 'success', 1)`, ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t0 := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
+	insert(t0.Add(time.Minute))               // B
+	insert(t0.Add(5 * time.Hour))             // C
+	insert(t0.Add(5*time.Hour + time.Minute)) // D
+	if _, err = store.ReadAll(ctx, st, t0.Add(6*time.Hour+2*time.Minute)); err != nil {
+		t.Fatal(err) // stores 10:01 (closed at 15:01, settled by 16:01)
+	}
+	insert(t0) // A, logged six hours late
+	rs, err := store.ReadAll(ctx, st, t0.Add(6*time.Hour+3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// True chain: A opens 10:00-15:00 (A, B); C opens 15:00-20:00 (C, D).
+	w := rs[0].Windows[0]
+	if w.UsedUSD != 2 || w.ResetsAt == nil || !w.ResetsAt.Equal(t0.Add(10*time.Hour)) {
+		t.Fatalf("5h = %v resets %v; want 2 resetting %v", w.UsedUSD, w.ResetsAt, t0.Add(10*time.Hour))
+	}
+}

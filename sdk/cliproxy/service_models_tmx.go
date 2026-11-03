@@ -1,29 +1,31 @@
 package cliproxy
 
 import (
-	"strings"
-
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/clients"
 )
 
-// tmxNoteAliasTargets records every upstream name each alias of an openai-compatibility entry
-// routes to (tokenmaxx fork; internal/tmx/clients): an alias pooled over a Claude and a non-Claude
-// upstream must stay out of Codex lists, and the registry keeps only the first one's metadata.
-func tmxNoteAliasTargets(compat *config.OpenAICompatibility) {
-	if compat == nil {
-		return
+// tmxInstallCompatSource lets internal/tmx/clients read every alias target of the live config's
+// enabled openai-compatibility entries (tokenmaxx fork): an alias pooled over a Claude and a
+// non-Claude upstream, bare or prefixed, must stay out of Codex lists and requests.
+func (s *Service) tmxInstallCompatSource() {
+	clients.SetCompatSource(func() []clients.CompatEntry { return tmxCompatEntries(s.currentConfig()) })
+}
+
+func tmxCompatEntries(cfg *config.Config) []clients.CompatEntry {
+	if cfg == nil {
+		return nil
 	}
-	targets := map[string][]string{}
-	for _, m := range compat.Models {
-		name := strings.TrimSpace(m.Name)
-		alias := strings.TrimSpace(m.Alias)
-		if alias == "" {
-			alias = name
+	out := make([]clients.CompatEntry, 0, len(cfg.OpenAICompatibility))
+	for _, c := range cfg.OpenAICompatibility {
+		if c.Disabled {
+			continue
 		}
-		if alias != "" && name != "" {
-			targets[alias] = append(targets[alias], name)
+		e := clients.CompatEntry{Prefix: c.Prefix, Models: make([]clients.CompatModel, 0, len(c.Models))}
+		for _, m := range c.Models {
+			e.Models = append(e.Models, clients.CompatModel{Name: m.Name, Alias: m.Alias})
 		}
+		out = append(out, e)
 	}
-	clients.SetAliasTargets(compat.Name, targets)
+	return out
 }

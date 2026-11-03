@@ -886,7 +886,6 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 		info.SupportedOutputModalities = normalizeCompatConfigModalities(model.OutputModalities)
 		models = append(models, info)
 	}
-	tmxNoteAliasTargets(compat) // service_models_tmx.go
 	return models
 }
 
