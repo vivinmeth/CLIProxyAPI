@@ -39,7 +39,8 @@ var DefaultWindows = []Window{{"5h", 5, 0.2}, {"7d", 168, 0.5}, {"30d", 744, 1}}
 
 // Settings configure one OpenCode Go subscription.
 type Settings struct {
-	// Entry is the openai-compatibility entry name serving it (its rows' provider, lowercased).
+	// Entry is the openai-compatibility entry name serving it, lowercased. Its request-log rows carry
+	// provider "openai-compatible-<entry>" (the synthesized credential's provider).
 	Entry string `json:"entry"`
 	// Plan picks the cap table in Plans ("go", "go-plus", ...).
 	Plan string `json:"plan"`
@@ -216,7 +217,7 @@ func (s *Store) Readings(ctx context.Context, st Settings, now time.Time) ([]Mod
 		selects[i] = fmt.Sprintf("COALESCE(sum(allowance_usd) FILTER (WHERE ts > $%d), 0)", len(args))
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT model, `+strings.Join(selects, ", ")+` FROM `+s.schema+`.requests
-		WHERE lower(provider) = $1 AND allowance_usd IS NOT NULL AND ts > $2 AND ts <= $3 AND NOT shadowed
+		WHERE lower(provider) IN ($1, 'openai-compatible-' || $1) AND allowance_usd IS NOT NULL AND ts > $2 AND ts <= $3 AND NOT shadowed
 		GROUP BY model ORDER BY model`, args...)
 	if err != nil {
 		return nil, err

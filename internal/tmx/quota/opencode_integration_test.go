@@ -31,7 +31,7 @@ func TestQuotaOpenCodeAccounts(t *testing.T) {
 		}
 	}
 	ctx := context.Background()
-	if _, err := s.db.Exec(`INSERT INTO tmxq.requests (ts, provider, model, allowance_usd) VALUES ($1, 'opencode-go', 'kimi-k3', 1.5)`,
+	if _, err := s.db.Exec(`INSERT INTO tmxq.requests (ts, provider, model, allowance_usd) VALUES ($1, 'openai-compatible-opencode-go', 'kimi-k3', 1.5)`,
 		clock.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}

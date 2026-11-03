@@ -39,15 +39,15 @@ func TestReadingsFromRequestLog(t *testing.T) {
 		return r{ago, provider, model, allowance}
 	}
 	rows := []r{
-		row(time.Hour, "opencode-go", "kimi-k3", f(1)),         // in 5h, 7d, 30d
-		row(4*time.Hour, "opencode-go", "kimi-k3", f(0.5)),     // in 5h, 7d, 30d
-		row(6*time.Hour, "opencode-go", "kimi-k3", f(2)),       // 7d, 30d
-		row(10*24*time.Hour, "opencode-go", "kimi-k3", f(4)),   // 30d
-		row(40*24*time.Hour, "opencode-go", "kimi-k3", f(100)), // outside every window
-		row(time.Hour, "opencode-go", "glm-5.3", f(0.3)),       // no cap under the plan
-		row(time.Hour, "opencode-zen", "kimi-k3", nil),         // another entry, no allowance
-		row(time.Hour, "opencode-go", "kimi-k3", nil),          // a failed request: nothing used
-		row(-time.Hour, "opencode-go", "kimi-k3", f(50)),       // future clock skew: ignored
+		row(time.Hour, "openai-compatible-opencode-go", "kimi-k3", f(1)),     // in 5h, 7d, 30d
+		row(4*time.Hour, "openai-compatible-opencode-go", "kimi-k3", f(0.5)), // in 5h, 7d, 30d
+		row(6*time.Hour, "opencode-go", "kimi-k3", f(2)),                     // 7d, 30d
+		row(10*24*time.Hour, "opencode-go", "kimi-k3", f(4)),                 // 30d
+		row(40*24*time.Hour, "opencode-go", "kimi-k3", f(100)),               // outside every window
+		row(time.Hour, "opencode-go", "glm-5.3", f(0.3)),                     // no cap under the plan
+		row(time.Hour, "openai-compatible-opencode-zen", "kimi-k3", f(9)),    // another entry
+		row(time.Hour, "opencode-go", "kimi-k3", nil),                        // a failed request: nothing used
+		row(-time.Hour, "opencode-go", "kimi-k3", f(50)),                     // future clock skew: ignored
 	}
 	for _, x := range rows {
 		if _, err = rl.DB().ExecContext(ctx, `INSERT INTO `+schema+`.requests (ts, provider, model, outcome, allowance_usd)
