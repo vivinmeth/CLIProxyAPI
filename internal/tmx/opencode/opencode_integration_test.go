@@ -13,7 +13,7 @@ import (
 )
 
 // Readings over real request-log rows (TMX_REQUESTLOG_TEST_DSN, a throwaway Postgres).
-func TestReadingsFromRequestLog(t *testing.T) {
+func TestReadFromRequestLog(t *testing.T) {
 	dsn := os.Getenv("TMX_REQUESTLOG_TEST_DSN")
 	if dsn == "" {
 		t.Skip("TMX_REQUESTLOG_TEST_DSN not set")
@@ -33,25 +33,26 @@ func TestReadingsFromRequestLog(t *testing.T) {
 	type r struct {
 		ago             time.Duration
 		provider, model string
-		allowance       *float64
+		allowance, list *float64
 	}
-	row := func(ago time.Duration, provider, model string, allowance *float64) r {
-		return r{ago, provider, model, allowance}
-	}
+	goRows := "openai-compatible-opencode-go"
 	rows := []r{
-		row(time.Hour, "openai-compatible-opencode-go", "kimi-k3", f(1)),     // in 5h, 7d, 30d
-		row(4*time.Hour, "openai-compatible-opencode-go", "kimi-k3", f(0.5)), // in 5h, 7d, 30d
-		row(6*time.Hour, "opencode-go", "kimi-k3", f(2)),                     // 7d, 30d
-		row(10*24*time.Hour, "opencode-go", "kimi-k3", f(4)),                 // 30d
-		row(40*24*time.Hour, "opencode-go", "kimi-k3", f(100)),               // outside every window
-		row(time.Hour, "opencode-go", "glm-5.3", f(0.3)),                     // no cap under the plan
-		row(time.Hour, "openai-compatible-opencode-zen", "kimi-k3", f(9)),    // another entry
-		row(time.Hour, "opencode-go", "kimi-k3", nil),                        // a failed request: nothing used
-		row(-time.Hour, "opencode-go", "kimi-k3", f(50)),                     // future clock skew: ignored
+		// An older 5h window: opened 9h ago, closed 4h ago.
+		{9 * time.Hour, goRows, "kimi-k3", f(2), f(0.5)},
+		{6 * time.Hour, goRows, "kimi-k3", f(2), f(0.5)},
+		// The open window: first request 3h ago, so it resets 2h from now.
+		{3 * time.Hour, goRows, "kimi-k3", f(4), f(1)},
+		{time.Hour, goRows, "glm-5.3-flash", f(1), f(1)},
+		{2 * 24 * time.Hour, goRows, "kimi-k3", f(8), f(2)},     // 7d and 30d only
+		{20 * 24 * time.Hour, goRows, "kimi-k3", f(10), f(2.5)}, // 30d only
+		{40 * 24 * time.Hour, goRows, "kimi-k3", f(100), f(25)}, // outside every window
+		{time.Hour, "openai-compatible-opencode-zen", "kimi-k3", f(9), f(9)},
+		{time.Hour, goRows, "kimi-k3", nil, nil},        // a failed request: nothing used
+		{-time.Hour, goRows, "kimi-k3", f(50), f(12.5)}, // future clock skew: ignored
 	}
 	for _, x := range rows {
-		if _, err = rl.DB().ExecContext(ctx, `INSERT INTO `+schema+`.requests (ts, provider, model, outcome, allowance_usd)
-			VALUES ($1, $2, $3, 'success', $4)`, now.Add(-x.ago), x.provider, x.model, x.allowance); err != nil {
+		if _, err = rl.DB().ExecContext(ctx, `INSERT INTO `+schema+`.requests (ts, provider, model, outcome, allowance_usd, cost_usd, price_source)
+			VALUES ($1, $2, $3, 'success', $4, $5, 'opencode')`, now.Add(-x.ago), x.provider, x.model, x.allowance, x.list); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -59,39 +60,48 @@ func TestReadingsFromRequestLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	caps := map[string]float64{"kimi-k3": 15, "glm-5.3-flash": 60}
 	st, err := store.Put(ctx, opencode.Settings{Entry: "OpenCode-Go", Plan: "go",
-		Plans: map[string]map[string]float64{"go": {"kimi-k3": 15}, "go-plus": {"kimi-k3": 60}}})
+		Plans: map[string]opencode.Plan{"go": {Pool: 60, Caps: caps}, "go-plus": {Caps: caps}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	subs, err := store.List(ctx)
-	if err != nil || len(subs) != 1 || subs[0].Entry != "opencode-go" {
-		t.Fatalf("list = %+v %v", subs, err)
-	}
-	got, err := store.Readings(ctx, st, now)
+	got, err := store.Read(ctx, st, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0].Model != "glm-5.3" || got[1].Model != "kimi-k3" {
-		t.Fatalf("readings = %+v", got)
+	w := map[string]opencode.WindowReading{}
+	for _, x := range got.Windows {
+		w[x.Window] = x
 	}
-	k := got[1].Windows
-	for i, want := range []float64{1.5, 3.5, 7.5} {
-		if math.Abs(k[i].UsedUSD-want) > 1e-9 {
-			t.Errorf("kimi %s used %v, want %v", k[i].Window, k[i].UsedUSD, want)
-		}
+	near := func(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
+	// 5h: only the open window (4 + 1) of its 12 (20% of 60), resetting 2h from now.
+	if !near(w["5h"].UsedUSD, 5) || w["5h"].ResetsAt == nil || !w["5h"].ResetsAt.Equal(now.Add(2*time.Hour)) || !near(*w["5h"].UsedPct, 5/12.0*100) {
+		t.Errorf("5h = %+v (resets %v)", w["5h"], w["5h"].ResetsAt)
 	}
-	if *k[0].UsedPct != 50 || k[0].Status != opencode.StatusAllowed {
-		t.Errorf("kimi 5h = %v %s", *k[0].UsedPct, k[0].Status)
+	if !near(w["7d"].UsedUSD, 17) || w["7d"].ResetsAt != nil || !near(*w["7d"].UsedPct, 17/30.0*100) {
+		t.Errorf("7d = %+v", w["7d"])
 	}
-	if got[0].Windows[0].Status != opencode.StatusUnknownCap || got[0].Windows[0].UsedPct != nil {
-		t.Errorf("glm = %+v", got[0].Windows[0])
+	if !near(w["30d"].UsedUSD, 27) || w["30d"].Status != opencode.StatusAllowed {
+		t.Errorf("30d = %+v", w["30d"])
 	}
-	// Switching the plan is a setting: the same usage reads against Go Plus caps.
+	if got.PoolSource != opencode.PoolFromSettings || len(got.Models) != 2 {
+		t.Errorf("reading = %+v", got)
+	}
+	// Go Plus has no pool configured: taken from traffic (limit x allowance / list = 60 for both).
 	st.Plan = "go-plus"
-	got, _ = store.Readings(ctx, st, now)
-	if math.Abs(*got[1].Windows[2].UsedPct-12.5) > 1e-9 {
-		t.Errorf("go-plus 30d = %v, want 12.5", *got[1].Windows[2].UsedPct)
+	if got, _ = store.Read(ctx, st, now); got.PoolSource != opencode.PoolFromTraffic || got.PoolUSD == nil || *got.PoolUSD != 60 {
+		t.Errorf("go-plus pool = %v %s", got.PoolUSD, got.PoolSource)
+	}
+	// An unknown plan reads unknown, never a guess.
+	st.Plan = "go-max"
+	if got, _ = store.Read(ctx, st, now); got.PoolUSD != nil || got.Windows[0].Status != opencode.StatusUnknownCap || got.Windows[0].UsedPct != nil {
+		t.Errorf("unknown plan = %+v", got)
+	}
+	// Once the open window has closed, the 5h reading is zero with no reset time.
+	st.Plan = "go"
+	if got, _ = store.Read(ctx, st, now.Add(3*time.Hour)); got.Windows[0].UsedUSD != 0 || got.Windows[0].ResetsAt != nil {
+		t.Errorf("expired 5h = %+v", got.Windows[0])
 	}
 	if ok, errD := store.Delete(ctx, "opencode-go"); !ok || errD != nil {
 		t.Fatalf("delete = %v %v", ok, errD)

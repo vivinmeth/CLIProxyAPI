@@ -8,6 +8,7 @@ package gemini
 import (
 	"context"
 	"fmt"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/clients"
 	"net/http"
 	"strings"
 	"time"
@@ -49,7 +50,7 @@ func (h *GeminiAPIHandler) Models() []map[string]any {
 // GeminiModels handles the Gemini models listing endpoint.
 // It returns a JSON response containing available Gemini models and their specifications.
 func (h *GeminiAPIHandler) GeminiModels(c *gin.Context) {
-	rawModels := h.Models()
+	rawModels := clients.FilterModels(h.Models(), false) // tmx: hidden models (OpenCode Zen)
 	normalizedModels := make([]map[string]any, 0, len(rawModels))
 	defaultMethods := []string{"generateContent"}
 	for _, model := range rawModels {

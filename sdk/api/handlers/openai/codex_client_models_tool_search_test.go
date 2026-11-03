@@ -24,6 +24,7 @@ func (e *countingToolSearchExecutor) SupportsNativeToolSearch(a *auth.Auth, upst
 }
 
 func TestCodexClientModelsClaudeToolSearchFollowsSwitch(t *testing.T) {
+	tmxSkipCodexToClaude(t, "claude")
 	previous := responsesclaude.ClientToolSearchEnabled()
 	t.Cleanup(func() { responsesclaude.SetClientToolSearchEnabled(previous) })
 

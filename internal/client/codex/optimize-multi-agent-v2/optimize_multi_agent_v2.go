@@ -314,7 +314,7 @@ func codexSpawnAgentModelsAndMarkdownForRequest(ctx context.Context, headers htt
 		return nil, ""
 	}
 
-	availableModels := clients.FilterModelsForCodex(registry.GetGlobalRegistry().GetAvailableModels("openai"), registry.GetGlobalRegistry().GetModelProviders) // tmx
+	availableModels := clients.FilterModelsForCodex(registry.GetGlobalRegistry().GetAvailableModels("openai")) // tmx
 	lookup := func(modelID string) *registry.ModelInfo {
 		return registry.LookupModelInfo(modelID)
 	}

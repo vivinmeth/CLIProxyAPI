@@ -31,15 +31,27 @@ func tmxContributorBlocked(models ...string) *interfaces.ErrorMessage {
 // there. Claude work goes through Claude Code.
 func (h *BaseAPIHandler) tmxProvidersForExecution(ctx context.Context, entryProtocol, modelName, originalRequestedModel string, allowImageModel bool, routeDecision modelRouteDecision, execOptions modelExecutionOptions) ([]string, string, *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
-	if errMsg != nil || (entryProtocol != constant.OpenaiResponse && !clients.IsCodex(tmxRequestHeaders(ctx))) {
+	if errMsg != nil {
 		return providers, normalizedModel, errMsg
 	}
-	for _, m := range []string{originalRequestedModel, modelName, normalizedModel, routeDecision.Model} {
-		if m != "" && clients.IsClaudeModel(m, providers) {
-			return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: errors.New(clients.CodexClaudeErrorBody(originalRequestedModel))}
-		}
+	if errMsg = tmxCodexClaudeRefusal(ctx, entryProtocol, providers, originalRequestedModel, modelName, normalizedModel, routeDecision.Model); errMsg != nil {
+		return nil, "", errMsg
 	}
 	return providers, normalizedModel, nil
+}
+
+// tmxCodexClaudeRefusal is the per-client rule's check, also run before a plugin executor (which
+// skips provider resolution): the 400 for a Claude model asked for by a Codex or Responses client.
+func tmxCodexClaudeRefusal(ctx context.Context, entryProtocol string, providers []string, models ...string) *interfaces.ErrorMessage {
+	if entryProtocol != constant.OpenaiResponse && !clients.IsCodex(tmxRequestHeaders(ctx)) {
+		return nil
+	}
+	for _, m := range models {
+		if m != "" && clients.ResolvesToClaude(m, providers) {
+			return &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: errors.New(clients.CodexClaudeErrorBody(models[0]))}
+		}
+	}
+	return nil
 }
 
 // tmxRequestHeaders returns the inbound request's headers carried in ctx, or nil.

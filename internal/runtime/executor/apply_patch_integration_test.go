@@ -439,6 +439,7 @@ func TestApplyPatchHTTPGatewayErrorMatrix(t *testing.T) {
 	for _, provider := range []string{"custom-compat", "claude", "claude-oauth", "gemini", "gemini-interactions", "vertex", "antigravity", "devin", "xai", "meta", "kimi"} {
 		for _, mode := range []string{"nonstream", "stream", "eof"} {
 			t.Run(provider+"/"+mode, func(t *testing.T) {
+				tmxSkipCodexToClaude(t, provider)
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					body, errReadAll := io.ReadAll(r.Body)
 					if errReadAll != nil {

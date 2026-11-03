@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
 // codexUserAgent matches the user agent every Codex build sends, whatever originator it was given:
@@ -87,6 +89,27 @@ func CodexClaudeErrorBody(model string) string {
 	return string(body)
 }
 
+// ResolvesToClaude reports whether a client model id is a Claude model by any route: its id, the
+// providers given, the providers the registry has for it, or the upstream model it aliases (an
+// openai-compatibility alias "review" for "anthropic/claude-sonnet-5" counts).
+func ResolvesToClaude(id string, providers []string) bool {
+	if IsClaudeModel(id, providers) {
+		return true
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	r := registry.GetGlobalRegistry()
+	if IsClaudeModel("", r.GetModelProviders(id)) {
+		return true
+	}
+	if info := r.GetModelInfo(id, ""); info != nil && strings.Contains(strings.ToLower(info.MetadataModelID), "claude") {
+		return true
+	}
+	return false
+}
+
 // HiddenPrefixes are client model ids no model list shows: OpenCode Zen (pay as you go) is a
 // backend only until the owner picks models to expose. A request by name still routes when the
 // entry is enabled.
@@ -94,7 +117,7 @@ var HiddenPrefixes = []string{"opencode-zen/"}
 
 // Hidden reports whether a model id is left out of every model list.
 func Hidden(id string) bool {
-	lower := strings.ToLower(strings.TrimSpace(id))
+	lower := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(id)), "models/")
 	for _, p := range HiddenPrefixes {
 		if strings.HasPrefix(lower, p) {
 			return true
@@ -103,26 +126,29 @@ func Hidden(id string) bool {
 	return false
 }
 
+// modelID reads a list entry's id: "id", the Codex catalog's "slug", or Gemini's "name"
+// ("models/<id>").
+func modelID(m map[string]any) string {
+	for _, k := range []string{"id", "slug", "name"} {
+		if v, _ := m[k].(string); v != "" {
+			return strings.TrimPrefix(v, "models/")
+		}
+	}
+	return ""
+}
+
 // FilterModels drops hidden models from a model list, and Claude models too when the list is for a
-// Codex client. Each entry's "id" (or Codex catalog "slug") and "owned_by" are checked; providersOf,
-// when set, returns a model's registered providers.
-func FilterModels(models []map[string]any, codex bool, providersOf func(string) []string) []map[string]any {
+// Codex client.
+func FilterModels(models []map[string]any, codex bool) []map[string]any {
 	out := make([]map[string]any, 0, len(models))
 	for _, m := range models {
-		id, _ := m["id"].(string)
-		if id == "" {
-			id, _ = m["slug"].(string)
-		}
+		id := modelID(m)
 		if Hidden(id) {
 			continue
 		}
 		if codex {
 			owner, _ := m["owned_by"].(string)
-			var providers []string
-			if providersOf != nil && id != "" {
-				providers = providersOf(id)
-			}
-			if IsClaudeModel(id, append(providers, owner)) {
+			if ResolvesToClaude(id, []string{owner}) {
 				continue
 			}
 		}
@@ -132,6 +158,6 @@ func FilterModels(models []map[string]any, codex bool, providersOf func(string) 
 }
 
 // FilterModelsForCodex is FilterModels for a Codex client.
-func FilterModelsForCodex(models []map[string]any, providersOf func(string) []string) []map[string]any {
-	return FilterModels(models, true, providersOf)
+func FilterModelsForCodex(models []map[string]any) []map[string]any {
+	return FilterModels(models, true)
 }

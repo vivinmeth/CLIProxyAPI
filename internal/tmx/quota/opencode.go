@@ -8,10 +8,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// OpenCode Go readings (internal/tmx/opencode): one account per (entry, model), id
-// opencode:<entry>:<model>, windows from the subscription's settings, source "passive". Readings
-// carry no reset time (OpenCode's window anchors are unknown), so they never reach routing
-// (applyRouting skips windows without one): they are for the dashboard and history only.
+// OpenCode Go readings (internal/tmx/opencode): one account per subscription, id
+// opencode:<entry> (provider = the entry, label "OpenCode Go", plan = the configured plan), windows
+// from its settings, source "passive". The anchored 5-hour window carries its reset time; it still
+// never reaches routing: record() doesn't apply routing, and the routing seed only walks real
+// credentials. Readings are for the dashboard and history only.
 
 // OpenCode returns the OpenCode quota settings store, or nil.
 func (s *Service) OpenCode() *opencode.Store {
@@ -31,23 +32,21 @@ func (s *Service) tickOpenCode(ctx context.Context, now time.Time, seen map[stri
 		return
 	}
 	for _, st := range subs {
-		readings, errR := s.oc.Readings(ctx, st, now)
+		r, errR := s.oc.Read(ctx, st, now)
 		if errR != nil {
-			log.WithError(errR).Warnf("tmx quota: OpenCode readings for %s failed", st.Entry)
+			log.WithError(errR).Warnf("tmx quota: OpenCode reading for %s failed", st.Entry)
 			continue
 		}
-		for _, m := range readings {
-			id := opencode.AccountID(st.Entry, m.Model)
-			seen[id] = true
-			s.mu.Lock()
-			a := s.accountLocked(id)
-			a.present, a.Provider, a.Label, a.Plan = true, st.Entry, m.Model, st.Plan
-			s.mu.Unlock()
-			windows := make([]Window, 0, len(m.Windows))
-			for _, w := range m.Windows {
-				windows = append(windows, Window{Window: w.Window, UsedPct: w.UsedPct, Status: w.Status})
-			}
-			s.record(ctx, id, windows, "passive", now.UTC())
+		id := opencode.AccountID(st.Entry)
+		seen[id] = true
+		s.mu.Lock()
+		a := s.accountLocked(id)
+		a.present, a.Provider, a.Label, a.Plan = true, st.Entry, "OpenCode Go", st.Plan
+		s.mu.Unlock()
+		windows := make([]Window, 0, len(r.Windows))
+		for _, w := range r.Windows {
+			windows = append(windows, Window{Window: w.Window, UsedPct: w.UsedPct, ResetsAt: w.ResetsAt, Status: w.Status})
 		}
+		s.record(ctx, id, windows, "passive", now.UTC())
 	}
 }

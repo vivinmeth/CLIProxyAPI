@@ -21,8 +21,10 @@ func TestQuotaOpenCodeAccounts(t *testing.T) {
 	s.observer = obs
 	for _, stmt := range []string{
 		`DELETE FROM ` + s.table,
-		`CREATE TABLE IF NOT EXISTS tmxq.requests (id BIGSERIAL PRIMARY KEY, ts TIMESTAMPTZ NOT NULL, provider TEXT NOT NULL,
-			model TEXT NOT NULL, allowance_usd DOUBLE PRECISION, shadowed BOOLEAN NOT NULL DEFAULT FALSE)`,
+		`DROP TABLE IF EXISTS tmxq.requests`,
+		`CREATE TABLE tmxq.requests (id BIGSERIAL PRIMARY KEY, ts TIMESTAMPTZ NOT NULL, provider TEXT NOT NULL,
+			model TEXT NOT NULL, allowance_usd DOUBLE PRECISION, cost_usd DOUBLE PRECISION, price_source TEXT,
+			shadowed BOOLEAN NOT NULL DEFAULT FALSE)`,
 		`DELETE FROM tmxq.requests`,
 		`DELETE FROM tmxq.opencode_quota`,
 	} {
@@ -31,12 +33,13 @@ func TestQuotaOpenCodeAccounts(t *testing.T) {
 		}
 	}
 	ctx := context.Background()
+	t.Cleanup(func() { _, _ = s.db.Exec(`DELETE FROM tmxq.opencode_quota`) })
 	if _, err := s.db.Exec(`INSERT INTO tmxq.requests (ts, provider, model, allowance_usd) VALUES ($1, 'openai-compatible-opencode-go', 'kimi-k3', 1.5)`,
 		clock.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.OpenCode().Put(ctx, opencode.Settings{Entry: "opencode-go", Plan: "go",
-		Plans: map[string]map[string]float64{"go": {"kimi-k3": 15}}}); err != nil {
+		Plans: map[string]opencode.Plan{"go": {Pool: 60, Caps: map[string]float64{"kimi-k3": 15}}}}); err != nil {
 		t.Fatal(err)
 	}
 	s.tick(ctx)
@@ -47,21 +50,22 @@ func TestQuotaOpenCodeAccounts(t *testing.T) {
 	if _, ok := byID["claude-oc.json"]; !ok || len(byID) != 2 {
 		t.Fatalf("accounts = %+v", byID)
 	}
-	oc, ok := byID["opencode:opencode-go:kimi-k3"]
-	if !ok || oc.Provider != "opencode-go" || oc.Plan != "go" || oc.Label != "kimi-k3" || len(oc.Windows) != 3 {
+	oc, ok := byID["opencode:opencode-go"]
+	if !ok || oc.Provider != "opencode-go" || oc.Plan != "go" || oc.Label != "OpenCode Go" || len(oc.Windows) != 3 {
 		t.Fatalf("opencode account = %+v", oc)
 	}
 	for _, w := range oc.Windows {
-		if w.Window.Window == "5h" && (w.UsedPct == nil || *w.UsedPct != 50 || w.ResetsAt != nil) {
+		// 1.5 of the 5h window's 12 (20% of 60), resetting 4h from now (opened 1h ago).
+		if w.Window.Window == "5h" && (w.UsedPct == nil || *w.UsedPct != 12.5 || w.ResetsAt == nil || !w.ResetsAt.Equal(clock.Add(4*time.Hour))) {
 			t.Fatalf("5h window = %+v", w)
 		}
 	}
 	for _, id := range obs.ids {
-		if id == "opencode:opencode-go:kimi-k3" {
+		if id == "opencode:opencode-go" {
 			t.Fatal("an OpenCode reading reached routing")
 		}
 	}
-	hist, _, err := s.History(ctx, "opencode:opencode-go:kimi-k3", "", clock.Add(-time.Hour), clock.Add(time.Hour), 100)
+	hist, _, err := s.History(ctx, "opencode:opencode-go", "", clock.Add(-time.Hour), clock.Add(time.Hour), 100)
 	if err != nil || len(hist) != 3 {
 		t.Fatalf("history = %d %v", len(hist), err)
 	}
@@ -72,7 +76,7 @@ func TestQuotaOpenCodeAccounts(t *testing.T) {
 	clock = clock.Add(time.Minute)
 	s.tick(ctx)
 	for _, a := range s.Accounts() {
-		if a.AuthID == "opencode:opencode-go:kimi-k3" {
+		if a.AuthID == "opencode:opencode-go" {
 			t.Fatal("account kept after its settings were removed")
 		}
 	}

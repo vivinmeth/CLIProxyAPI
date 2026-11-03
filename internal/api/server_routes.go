@@ -693,7 +693,7 @@ func (s *Server) handleGrokModels(c *gin.Context) {
 		}
 		models = grokModelsFromHomeEntries(entries)
 	} else {
-		models = grokModelsFromRegistryInfos(registry.GetGlobalRegistry().GetAvailableModelInfos())
+		models = grokModelsFromRegistryInfos(tmxListedModelInfos(registry.GetGlobalRegistry().GetAvailableModelInfos()))
 	}
 	s.writeModelListResponse(c, "openai", grokbuild.BuildResponse(models))
 }

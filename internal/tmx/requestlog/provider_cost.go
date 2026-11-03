@@ -33,12 +33,12 @@ func (r *Row) applyProviderCost(pc *coreusage.ProviderCost, baseURL string) {
 		return
 	}
 	r.ChargedUSD, r.AllowanceUSD, r.BillingSource = pc.Charged, pc.Allowance, pc.BillingSource
-	switch pc.BillingSource {
-	case "go", "go-plus":
+	switch src := pc.BillingSource; {
+	case src == "go" || strings.HasPrefix(src, "go-"): // go, go-plus, and any later Go tier
 		r.Billing = BillingSubscription
-	case "free":
+	case src == "free":
 		r.Billing = BillingFree
-	case "balance", "byok":
+	case src == "balance" || src == "byok":
 		r.Billing = BillingAPIKey
 	}
 	if pc.BillingSource == "balance" && strings.Contains(strings.ToLower(baseURL), opencodeGoURLMarker) {

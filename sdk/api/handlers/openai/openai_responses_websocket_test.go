@@ -3535,6 +3535,7 @@ func TestResponsesWebsocketXAIWebsocketPassthroughKeepsNativeIncrementalRequest(
 }
 
 func TestResponsesWebsocketFullRequestCanRouteFromNativeWebsocketToBuiltInProvider(t *testing.T) {
+	tmxSkipCodexToClaude(t, "claude")
 	gin.SetMode(gin.TestMode)
 
 	const sourceModel = "codex-provider-route-source"
@@ -3625,6 +3626,7 @@ func TestResponsesWebsocketFullRequestCanRouteFromNativeWebsocketToBuiltInProvid
 }
 
 func TestResponsesWebsocketHidesProviderRouteAuthFailure(t *testing.T) {
+	tmxSkipCodexToClaude(t, "claude")
 	gin.SetMode(gin.TestMode)
 
 	const sourceModel = "codex-provider-route-failure-source"

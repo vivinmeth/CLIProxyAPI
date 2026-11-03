@@ -198,6 +198,7 @@ func TestApplyPatchBridgeLiveHTTPPreviewMatrix(t *testing.T) {
 		{"gemini", "gemini", true}, {"vertex", "gemini", true}, {"antigravity", "antigravity", true},
 	} {
 		t.Run(tc.provider, func(t *testing.T) {
+			tmxSkipCodexToClaude(t, tc.provider)
 			release := make(chan struct{})
 			requestBody := make(chan []byte, 1)
 			var releaseOnce sync.Once

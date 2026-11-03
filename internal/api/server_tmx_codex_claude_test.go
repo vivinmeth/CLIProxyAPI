@@ -31,8 +31,10 @@ func registerCodexClaudeFixture(t *testing.T) {
 	r.RegisterClient("tmx-cc-codex", "codex", []*registry.ModelInfo{{ID: "gpt-6.1-sol", OwnedBy: "openai"}})
 	r.RegisterClient("tmx-cc-go", "opencode-go", []*registry.ModelInfo{{ID: "opencode-go/kimi-k3", OwnedBy: "opencode-go"}})
 	r.RegisterClient("tmx-cc-zen", "opencode-zen", []*registry.ModelInfo{{ID: "opencode-zen/glm-5.3", OwnedBy: "opencode-zen"}})
+	// An openai-compatibility alias hiding a Claude upstream model behind a neutral name.
+	r.RegisterClient("tmx-cc-or", "openai-compatible-openrouter", []*registry.ModelInfo{{ID: "review", OwnedBy: "openrouter", MetadataModelID: "anthropic/claude-sonnet-5"}})
 	t.Cleanup(func() {
-		for _, id := range []string{"tmx-cc-claude", "tmx-cc-codex", "tmx-cc-go", "tmx-cc-zen"} {
+		for _, id := range []string{"tmx-cc-claude", "tmx-cc-codex", "tmx-cc-go", "tmx-cc-zen", "tmx-cc-or"} {
 			r.UnregisterClient(id)
 		}
 	})
@@ -68,12 +70,17 @@ func TestTmxCodexModelListsHaveNoClaude(t *testing.T) {
 		{"codex catalog, no UA", "/v1/models?client_version=0.166.0", ""},
 		{"plain list, codex_exec", "/v1/models", tmxUACodexCLI},
 		{"plain list, T3 Codex", "/v1/models", tmxUAT3Codex},
+		{"anthropic list, Codex UA", "/v1/models", tmxUACodexCLI + "|anthropic"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
 			req.Header.Set("Authorization", "Bearer test-key")
-			if tc.ua != "" {
-				req.Header.Set("User-Agent", tc.ua)
+			ua, anthropic := strings.CutSuffix(tc.ua, "|anthropic")
+			if ua != "" {
+				req.Header.Set("User-Agent", ua)
+			}
+			if anthropic {
+				req.Header.Set("Anthropic-Version", "2023-06-01")
 			}
 			rec := httptest.NewRecorder()
 			server.engine.ServeHTTP(rec, req)
@@ -83,6 +90,9 @@ func TestTmxCodexModelListsHaveNoClaude(t *testing.T) {
 			ids := tmxModelIDs(t, rec.Body.Bytes())
 			got := map[string]bool{}
 			for _, id := range ids {
+				if enc, ok := strings.CutPrefix(id, "claude-fable-5-dd-"); ok {
+					id = reverse(enc) // a Claude-format list cloaks non-Claude ids
+				}
 				got[id] = true
 				if strings.Contains(strings.ToLower(id), "claude") {
 					t.Errorf("Codex list has Claude model %q", id)
@@ -93,6 +103,9 @@ func TestTmxCodexModelListsHaveNoClaude(t *testing.T) {
 			}
 			if got["opencode-zen/glm-5.3"] {
 				t.Errorf("Codex list has the hidden Zen model")
+			}
+			if got["review"] {
+				t.Errorf("Codex list has the alias of a Claude upstream model")
 			}
 			for _, want := range []string{"gpt-6.1-sol", "opencode-go/kimi-k3"} {
 				if !got[want] {
@@ -156,6 +169,7 @@ func TestTmxCodexClaudeRequestsRefused(t *testing.T) {
 		{"chat completions", "/v1/chat/completions", tmxUACodexCLI, `{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}]}`},
 		{"originator only", "/v1/chat/completions", "", `{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}]}`},
 		{"responses, any client", "/v1/responses", "SomeAgent/1.0", `{"model":"claude-opus-5-5","input":"hi"}`},
+		{"alias of a Claude upstream", "/v1/responses", tmxUAT3Codex, `{"model":"review","input":"hi"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var rec *httptest.ResponseRecorder
@@ -184,5 +198,37 @@ func TestTmxCodexClaudeRequestsRefused(t *testing.T) {
 	rec = post("/v1/responses", tmxUAT3Codex, `{"model":"gpt-6.1-sol","input":"hi"}`)
 	if strings.Contains(rec.Body.String(), clients.CodexClaudeErrorCode) {
 		t.Fatalf("Codex request for a GPT model refused: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Zen stays out of the Gemini and Grok-shell lists too; the CPA capability catalog (not a Codex
+// format) keeps Claude.
+func TestTmxOtherListsHideZen(t *testing.T) {
+	registerCodexClaudeFixture(t)
+	server := newTestServer(t)
+	get := func(path, ua string) string {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer test-key")
+		req.Header.Set("X-Goog-Api-Key", "test-key")
+		if ua != "" {
+			req.Header.Set("User-Agent", ua)
+		}
+		rec := httptest.NewRecorder()
+		server.engine.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status %d: %s", path, rec.Code, rec.Body.String())
+		}
+		return rec.Body.String()
+	}
+	for _, body := range []string{get("/v1beta/models", ""), get("/v1/models", "grok-shell/1.0.70")} {
+		if strings.Contains(body, "opencode-zen/") {
+			t.Errorf("list shows Zen: %.300s", body)
+		}
+		if !strings.Contains(body, "opencode-go/kimi-k3") {
+			t.Errorf("list lost the Go model: %.300s", body)
+		}
+	}
+	if body := get("/v1/models?client_version=cpa", ""); !strings.Contains(body, "claude-opus-5-5") || strings.Contains(body, "opencode-zen/") {
+		t.Errorf("cpa catalog = %.300s", body)
 	}
 }

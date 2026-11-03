@@ -7,7 +7,7 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// tmxProviderCost reads OpenCode's cost fields from a usage object (tokenmaxx fork;
+// tmxProviderCost reads OpenCode's cost fields from an OpenAI-style usage object (tokenmaxx fork;
 // sdk/cliproxy/usage.ProviderCost). Only a usage object carrying an "opencode" object counts, so
 // other upstreams that send a bare usage.cost (OpenRouter) keep being priced from the catalog.
 func tmxProviderCost(usageNode gjson.Result) *usage.ProviderCost {

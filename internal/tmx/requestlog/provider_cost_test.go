@@ -59,3 +59,14 @@ func TestRowsWithoutProviderCostUnchanged(t *testing.T) {
 		t.Fatalf("row without reported cost was priced: %+v", row)
 	}
 }
+
+func TestLaterGoTiersBillAsSubscription(t *testing.T) {
+	for src, want := range map[string]string{"go": BillingSubscription, "go-plus": BillingSubscription,
+		"go-teams": BillingSubscription, "free": BillingFree, "byok": BillingAPIKey, "balance": BillingAPIKey, "gold": BillingAPIKey} {
+		row := rowFromRecord(context.Background(), coreusage.Record{Provider: "opencode-go", Model: "m", AuthType: "apikey",
+			Detail: coreusage.Detail{ProviderCost: &coreusage.ProviderCost{BillingSource: src}}})
+		if row.Billing != want {
+			t.Errorf("billing_source %q -> %q, want %q", src, row.Billing, want)
+		}
+	}
+}

@@ -39,10 +39,3 @@ func TestOtherUpstreamsKeepCatalogPricing(t *testing.T) {
 		t.Fatal("Claude usage without opencode got a ProviderCost")
 	}
 }
-
-func TestClaudeUsageReadsOpenCodeCost(t *testing.T) {
-	d := ParseClaudeUsage([]byte(`{"usage":{"input_tokens":5,"output_tokens":1,"cost":0.02,"opencode":{"billing_source":"balance","list_cost":0.02}}}`))
-	if d.ProviderCost == nil || d.ProviderCost.BillingSource != "balance" || *d.ProviderCost.Charged != 0.02 || d.ProviderCost.Allowance != nil {
-		t.Fatalf("ProviderCost = %+v", d.ProviderCost)
-	}
-}

@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/opencode"
@@ -10,10 +11,10 @@ import (
 )
 
 // OpenCode Go quota settings (tokenmaxx fork; internal/tmx/opencode): the plan and its per-model
-// monthly caps, per openai-compatibility entry. Readings appear in /tmx/quota/current as accounts
-// opencode:<entry>:<model>.
+// limits and pool, per openai-compatibility entry. Readings appear in /tmx/quota/current as accounts
+// opencode:<entry>.
 //
-//	GET    /tmx/opencode/quota            every stored subscription
+//	GET    /tmx/opencode/quota            every stored subscription, with its live reading (per-model use)
 //	PUT    /tmx/opencode/quota            one subscription (body: opencode.Settings), replaced
 //	DELETE /tmx/opencode/quota?entry=…    drop one
 func registerTMXOpenCodeRoutes(v8 *gin.RouterGroup) {
@@ -30,7 +31,16 @@ func registerTMXOpenCodeRoutes(v8 *gin.RouterGroup) {
 		if subs == nil {
 			subs = []opencode.Settings{}
 		}
-		c.JSON(http.StatusOK, gin.H{"subscriptions": subs, "default_windows": opencode.DefaultWindows})
+		readings := make([]opencode.Reading, 0, len(subs))
+		for _, sub := range subs {
+			r, errR := st.Read(c.Request.Context(), sub, time.Now())
+			if errR != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": errR.Error()})
+				return
+			}
+			readings = append(readings, r)
+		}
+		c.JSON(http.StatusOK, gin.H{"subscriptions": subs, "readings": readings, "default_windows": opencode.DefaultWindows})
 	})
 	v8.PUT("/tmx/opencode/quota", func(c *gin.Context) {
 		st := tmxOpenCodeStore(c)

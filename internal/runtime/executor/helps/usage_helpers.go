@@ -1330,7 +1330,6 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 		detail.ReasoningTokens,
 		detail.TotalTokens,
 	)
-	detail.ProviderCost = tmxProviderCost(usageNode) // tmx
 	return detail
 }
 

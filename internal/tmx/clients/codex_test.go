@@ -3,6 +3,8 @@ package clients
 import (
 	"net/http"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
 func TestIsCodex(t *testing.T) {
@@ -72,14 +74,19 @@ func TestFilterModelsForCodex(t *testing.T) {
 		{"id": "big-brain", "owned_by": "x"},
 		{"id": "opencode-go/glm-5.3", "owned_by": "opencode-go"},
 	}
-	providers := func(id string) []string {
-		if id == "big-brain" {
-			return []string{"claude"}
-		}
-		return nil
-	}
-	out := FilterModelsForCodex(in, providers)
+	in = append(in, map[string]any{"id": "opencode-zen/glm-5.3"}, map[string]any{"name": "models/opencode-zen/kimi-k3"})
+	r := registry.GetGlobalRegistry()
+	r.RegisterClient("tmx-clients-claude", "claude", []*registry.ModelInfo{{ID: "big-brain"}})
+	// An openai-compatibility alias whose upstream model is Claude (name -> MetadataModelID).
+	r.RegisterClient("tmx-clients-or", "openrouter", []*registry.ModelInfo{{ID: "review", MetadataModelID: "anthropic/claude-sonnet-5"}})
+	t.Cleanup(func() { r.UnregisterClient("tmx-clients-claude"); r.UnregisterClient("tmx-clients-or") })
+	in = append(in, map[string]any{"id": "review", "owned_by": "openrouter"})
+	out := FilterModelsForCodex(in)
 	if len(out) != 2 || out[0]["id"] != "gpt-6.1-sol" || out[1]["id"] != "opencode-go/glm-5.3" {
-		t.Fatalf("got %v", out)
+		t.Fatalf("codex list = %v", out)
+	}
+	// Not for Codex: Claude stays, Zen still goes.
+	if out := FilterModels(in, false); len(out) != 6 {
+		t.Fatalf("plain list = %v", out)
 	}
 }
