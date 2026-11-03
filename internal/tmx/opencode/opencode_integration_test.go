@@ -393,3 +393,68 @@ func TestAnchoredWindowVeryLateRow(t *testing.T) {
 		t.Fatalf("5h = %v resets %v; want 2 resetting %v", w.UsedUSD, w.ResetsAt, t0.Add(10*time.Hour))
 	}
 }
+
+// Commits out of order: a delayed replay holds a lower id uncommitted while a later live row commits
+// and a read runs; once the delayed row commits, the next read counts it (pr-reviewer r3 S2).
+func TestAnchoredWindowOutOfOrderCommit(t *testing.T) {
+	dsn := os.Getenv("TMX_REQUESTLOG_TEST_DSN")
+	if dsn == "" {
+		t.Skip("TMX_REQUESTLOG_TEST_DSN not set")
+	}
+	ctx := context.Background()
+	schema := fmt.Sprintf("tmx_test_ocoo_%d", time.Now().UnixNano())
+	rl, err := requestlog.Open(ctx, dsn, schema, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = rl.DB().Exec("DROP SCHEMA " + schema + " CASCADE")
+		rl.Close()
+	})
+	store, err := opencode.NewStore(ctx, rl.DB(), schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := opencode.Settings{Entry: "opencode-go", Plan: "go", Plans: map[string]opencode.Plan{"go": {Pool: 60}}}
+	if err = st.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	ins := `INSERT INTO ` + schema + `.requests (ts, provider, model, outcome, allowance_usd)
+		VALUES ($1, 'openai-compatible-opencode-go', 'm', 'success', 1)`
+	t0 := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
+	for _, ts := range []time.Time{t0.Add(time.Minute), t0.Add(5 * time.Hour), t0.Add(5*time.Hour + time.Minute)} {
+		if _, err = rl.DB().ExecContext(ctx, ins, ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = store.ReadAll(ctx, st, t0.Add(6*time.Hour+2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	// The delayed replay of A (10:00) takes the lower id and stays open.
+	tx, err := rl.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.ExecContext(ctx, ins, t0); err != nil {
+		t.Fatal(err)
+	}
+	// A live row E (16:01) commits first, and a read runs while A is still uncommitted.
+	if _, err = rl.DB().ExecContext(ctx, ins, t0.Add(6*time.Hour+time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.ReadAll(ctx, st, t0.Add(6*time.Hour+3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	rs, err := store.ReadAll(ctx, st, t0.Add(6*time.Hour+4*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// True chain: A 10:00-15:00 (A, B); C 15:00-20:00 (C, D, E).
+	w := rs[0].Windows[0]
+	if w.UsedUSD != 3 || w.ResetsAt == nil || !w.ResetsAt.Equal(t0.Add(10*time.Hour)) {
+		t.Fatalf("5h = %v resets %v; want 3 resetting %v", w.UsedUSD, w.ResetsAt, t0.Add(10*time.Hour))
+	}
+}

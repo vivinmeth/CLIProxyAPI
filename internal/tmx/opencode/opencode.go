@@ -187,8 +187,8 @@ func NewStore(ctx context.Context, db *sql.DB, schema string) (*Store, error) {
 	)`); err != nil {
 		return nil, fmt.Errorf("opencode quota schema: %w", err)
 	}
-	// The start of each account's latest anchored window, so the chain continues from it on every
-	// read (and across restarts) instead of being rebuilt from a lookback.
+	// Each account's latest provable window start, used when the lookback holds none (long traffic
+	// without a pause), across restarts too.
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS `+s.schema+`.opencode_anchors (
 		entry      TEXT NOT NULL,
 		account    TEXT NOT NULL,
@@ -197,11 +197,6 @@ func NewStore(ctx context.Context, db *sql.DB, schema string) (*Store, error) {
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 		PRIMARY KEY (entry, account, "window")
 	)`); err != nil {
-		return nil, fmt.Errorf("opencode anchors schema: %w", err)
-	}
-	// max_id: the highest request-log row id the stored start was computed from. A row inserted
-	// later (higher id) with an earlier timestamp means the chain was built without it.
-	if _, err := db.ExecContext(ctx, `ALTER TABLE `+s.schema+`.opencode_anchors ADD COLUMN IF NOT EXISTS max_id BIGINT NOT NULL DEFAULT 0`); err != nil {
 		return nil, fmt.Errorf("opencode anchors schema: %w", err)
 	}
 	return s, nil
@@ -450,57 +445,47 @@ func (s *Store) rolling(ctx context.Context, entry string, sc scope, w Window, n
 // anchoredLookback bounds how far back the window chain is replayed.
 const anchoredLookback = 31 * 24 * time.Hour
 
-// anchorSettle is how long after a window closed its start is trusted enough to store: a request
-// that began earlier but was logged later (a long stream, a spool replay) can still move the chain
-// until then, so only settled starts are stored and the rest is replayed on every read.
-const anchorSettle = time.Hour
-
 // anchored replays the window chain: a window opens at the first request after the previous one
-// closed and lasts w.Hours. The replay starts at the later of two known window starts: the one
-// stored by the last read (opencode_anchors), and the last request that followed a gap of at least
-// one window length within the lookback (such a request must open a window, whatever came before).
-// With neither, it starts at the first request of the lookback (an estimate, corrected by the next
-// gap). The latest window start that closed at least anchorSettle ago is stored with the highest
-// row id seen, so the chain never drifts; a row logged later but timestamped before the stored
-// start (a long stream, a spool replay) invalidates it and the chain is rebuilt. The open window,
-// if any, is the reading.
+// closed and lasts w.Hours. The replay starts at a provable window start: the latest request with no
+// request in the w.Hours before it (it must open a window, whatever came before). That is re-checked
+// against committed rows on every read, so a request logged late (a long stream, a spool replay,
+// commits out of order) moves the chain as soon as it is visible. The provable start found is
+// stored (opencode_anchors) and used only when the lookback holds none, i.e. after more than 31
+// days of traffic without a w.Hours pause; with neither, the replay starts at the lookback's first
+// request (an estimate). The open window, if any, is the reading.
 func (s *Store) anchored(ctx context.Context, entry, account string, sc scope, w Window, now time.Time) (WindowReading, error) {
 	wr := WindowReading{Window: w.Name}
 	length := hours(w.Hours)
 	from := now.Add(-anchoredLookback)
-	var stored, gap sql.NullTime
-	var storedMaxID, maxID int64
-	err := s.db.QueryRowContext(ctx, `SELECT start, max_id FROM `+s.schema+`.opencode_anchors
-		WHERE entry = $1 AND account = $2 AND "window" = $3 AND start <= $4`, entry, account, w.Name, now).Scan(&stored, &storedMaxID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return wr, err
-	}
-	if err = s.db.QueryRowContext(ctx, `SELECT COALESCE(max(id), 0) FROM `+s.schema+`.requests
-		WHERE `+rowFilter+sc.clause+` AND ts > $2 AND ts <= $3`, entry, from, now, sc.keys).Scan(&maxID); err != nil {
-		return wr, err
-	}
-	if stored.Valid {
-		// A row logged after the start was stored, but timestamped before it: the chain was built
-		// without it, so the stored start can't be trusted. Rebuild from the gap boundary.
-		var late bool
-		if err = s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM `+s.schema+`.requests
-			WHERE `+rowFilter+sc.clause+` AND id > $2 AND ts < $3)`, entry, storedMaxID, stored.Time, sc.keys).Scan(&late); err != nil {
-			return wr, err
-		}
-		if late {
-			stored = sql.NullTime{}
-		}
-	}
-	if err = s.db.QueryRowContext(ctx, `SELECT max(ts) FROM (
+	// lag() also sees the w.Hours before the lookback, so a request whose predecessor sits just
+	// outside it isn't taken for a provable start.
+	var proven sql.NullTime
+	if err := s.db.QueryRowContext(ctx, `SELECT max(ts) FROM (
 		SELECT ts, ts - lag(ts) OVER (ORDER BY ts) AS gap FROM `+s.schema+`.requests
 		WHERE `+rowFilter+sc.clause+` AND ts > $2 AND ts <= $3) t
-		WHERE gap IS NULL OR gap >= make_interval(secs => $5)`,
-		entry, from, now, sc.keys, length.Seconds()).Scan(&gap); err != nil {
+		WHERE ts > $6 AND (gap IS NULL OR gap >= make_interval(secs => $5))`,
+		entry, from.Add(-length), now, sc.keys, length.Seconds(), from).Scan(&proven); err != nil {
 		return wr, err
 	}
-	start := gap
-	if stored.Valid && (!start.Valid || stored.Time.After(start.Time)) {
-		start = stored
+	start := proven
+	if proven.Valid {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO `+s.schema+`.opencode_anchors (entry, account, "window", start, updated_at)
+			VALUES ($1, $2, $3, $4, now()) ON CONFLICT (entry, account, "window")
+			DO UPDATE SET start = EXCLUDED.start, updated_at = now()`, entry, account, w.Name, proven.Time); err != nil {
+			return wr, err
+		}
+	} else {
+		err := s.db.QueryRowContext(ctx, `SELECT start FROM `+s.schema+`.opencode_anchors
+			WHERE entry = $1 AND account = $2 AND "window" = $3 AND start <= $4`, entry, account, w.Name, now).Scan(&start)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return wr, err
+		}
+	}
+	if !start.Valid {
+		if err := s.db.QueryRowContext(ctx, `SELECT min(ts) FROM `+s.schema+`.requests
+			WHERE `+rowFilter+sc.clause+` AND ts > $2 AND ts <= $3`, entry, from, now, sc.keys).Scan(&start); err != nil {
+			return wr, err
+		}
 	}
 	if !start.Valid {
 		return wr, nil // no usage in the lookback and nothing stored
@@ -511,7 +496,7 @@ func (s *Store) anchored(ctx context.Context, entry, account string, sc scope, w
 		return wr, err
 	}
 	defer func() { _ = rows.Close() }()
-	open, settled := start.Time, time.Time{}
+	open := start.Time
 	var sum float64
 	for rows.Next() {
 		var ts time.Time
@@ -520,26 +505,12 @@ func (s *Store) anchored(ctx context.Context, entry, account string, sc scope, w
 			return wr, err
 		}
 		if !ts.Before(open.Add(length)) {
-			if !open.Add(length + anchorSettle).After(now) {
-				settled = open
-			}
 			open, sum = ts, 0
 		}
 		sum += v
 	}
 	if err = rows.Err(); err != nil {
 		return wr, err
-	}
-	if !open.Add(length + anchorSettle).After(now) {
-		settled = open
-	}
-	if !settled.IsZero() && (!stored.Valid || !settled.Equal(stored.Time) || maxID != storedMaxID) {
-		if _, err = s.db.ExecContext(ctx, `INSERT INTO `+s.schema+`.opencode_anchors (entry, account, "window", start, max_id, updated_at)
-			VALUES ($1, $2, $3, $4, $5, now()) ON CONFLICT (entry, account, "window")
-			DO UPDATE SET start = EXCLUDED.start, max_id = EXCLUDED.max_id, updated_at = now()`,
-			entry, account, w.Name, settled, maxID); err != nil {
-			return wr, err
-		}
 	}
 	if now.Before(open.Add(length)) {
 		end := open.Add(length).UTC()
