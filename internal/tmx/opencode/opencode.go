@@ -445,13 +445,18 @@ func (s *Store) rolling(ctx context.Context, entry string, sc scope, w Window, n
 // anchoredLookback bounds how far back the window chain is replayed.
 const anchoredLookback = 31 * 24 * time.Hour
 
+// anchorSettle is how long after a window closed its start is trusted enough to store: a request
+// that began earlier but was logged later (a long stream, a spool replay) can still move the chain
+// until then, so only settled starts are stored and the rest is replayed on every read.
+const anchorSettle = time.Hour
+
 // anchored replays the window chain: a window opens at the first request after the previous one
 // closed and lasts w.Hours. The replay starts at the later of two known window starts: the one
 // stored by the last read (opencode_anchors), and the last request that followed a gap of at least
 // one window length within the lookback (such a request must open a window, whatever came before).
 // With neither, it starts at the first request of the lookback (an estimate, corrected by the next
-// gap). The latest window start the replay finds is stored, so the chain never drifts. The open
-// window, if any, is the reading.
+// gap). The latest window start that closed at least anchorSettle ago is stored, so the chain
+// never drifts and late rows after it are still counted. The open window, if any, is the reading.
 func (s *Store) anchored(ctx context.Context, entry, account string, sc scope, w Window, now time.Time) (WindowReading, error) {
 	wr := WindowReading{Window: w.Name}
 	length := hours(w.Hours)
@@ -482,7 +487,7 @@ func (s *Store) anchored(ctx context.Context, entry, account string, sc scope, w
 		return wr, err
 	}
 	defer func() { _ = rows.Close() }()
-	open := start.Time
+	open, settled := start.Time, time.Time{}
 	var sum float64
 	for rows.Next() {
 		var ts time.Time
@@ -491,6 +496,9 @@ func (s *Store) anchored(ctx context.Context, entry, account string, sc scope, w
 			return wr, err
 		}
 		if !ts.Before(open.Add(length)) {
+			if !open.Add(length + anchorSettle).After(now) {
+				settled = open
+			}
 			open, sum = ts, 0
 		}
 		sum += v
@@ -498,11 +506,14 @@ func (s *Store) anchored(ctx context.Context, entry, account string, sc scope, w
 	if err = rows.Err(); err != nil {
 		return wr, err
 	}
-	if !stored.Valid || !open.Equal(stored.Time) {
+	if !open.Add(length + anchorSettle).After(now) {
+		settled = open
+	}
+	if !settled.IsZero() && (!stored.Valid || settled.After(stored.Time)) {
 		if _, err = s.db.ExecContext(ctx, `INSERT INTO `+s.schema+`.opencode_anchors (entry, account, "window", start, updated_at)
 			VALUES ($1, $2, $3, $4, now()) ON CONFLICT (entry, account, "window")
 			DO UPDATE SET start = EXCLUDED.start, updated_at = now() WHERE `+s.schema+`.opencode_anchors.start < EXCLUDED.start`,
-			entry, account, w.Name, open); err != nil {
+			entry, account, w.Name, settled); err != nil {
 			return wr, err
 		}
 	}

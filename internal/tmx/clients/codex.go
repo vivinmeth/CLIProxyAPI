@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
@@ -100,6 +101,9 @@ func ResolvesToClaude(id string, providers []string) bool {
 	if id == "" {
 		return false
 	}
+	if aliasHasClaudeTarget(id) || aliasHasClaudeTarget(stripThinkingSuffix(strings.TrimSpace(id))) {
+		return true
+	}
 	r := registry.GetGlobalRegistry()
 	providers = r.GetModelProviders(id)
 	if IsClaudeModel("", providers) {
@@ -121,6 +125,40 @@ func stripThinkingSuffix(id string) string {
 		return id[:i]
 	}
 	return id
+}
+
+// aliasTargets holds every upstream model each configured alias routes to, per
+// openai-compatibility entry: one entry can pool an alias over several upstream names, and the
+// registry keeps only the first one's metadata.
+var (
+	aliasMu      sync.RWMutex
+	aliasTargets = map[string]map[string][]string{} // entry -> client alias -> upstream names
+)
+
+// SetAliasTargets replaces an openai-compatibility entry's alias -> upstream names (called when its
+// models are built from config).
+func SetAliasTargets(entry string, targets map[string][]string) {
+	entry = strings.ToLower(strings.TrimSpace(entry))
+	aliasMu.Lock()
+	defer aliasMu.Unlock()
+	if len(targets) == 0 {
+		delete(aliasTargets, entry)
+		return
+	}
+	aliasTargets[entry] = targets
+}
+
+func aliasHasClaudeTarget(id string) bool {
+	aliasMu.RLock()
+	defer aliasMu.RUnlock()
+	for _, byAlias := range aliasTargets {
+		for _, name := range byAlias[id] {
+			if IsClaudeModel(name, nil) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // HiddenPrefixes are client model ids no model list shows: OpenCode Zen (pay as you go) is a

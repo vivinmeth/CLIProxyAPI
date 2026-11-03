@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/clients"
+	"github.com/tidwall/gjson"
 )
 
 // tmxRefusal is the request-scoped 400 for a Claude upstream model asked for by a Codex client.
@@ -32,4 +33,10 @@ func TMXCodexClaudeUpstream(ctx context.Context, sourceFormat, upstreamModel str
 		return nil
 	}
 	return tmxRefusal{body: clients.CodexClaudeErrorBody(upstreamModel)}
+}
+
+// TMXCodexClaudeOutbound is TMXCodexClaudeUpstream on the final outbound body (after payload
+// rules, which can rewrite "model"): read-only, so the payload rules stay the last word on content.
+func TMXCodexClaudeOutbound(ctx context.Context, sourceFormat string, body []byte) error {
+	return TMXCodexClaudeUpstream(ctx, sourceFormat, gjson.GetBytes(body, "model").String())
 }
