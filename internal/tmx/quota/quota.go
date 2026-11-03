@@ -34,6 +34,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/durability"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/opencode"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/spool"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -240,6 +241,8 @@ type Service struct {
 
 	mu       sync.Mutex
 	accounts map[string]*account
+
+	oc *opencode.Store // OpenCode Go settings and readings (opencode.go); nil when unavailable
 }
 
 var (
@@ -322,6 +325,11 @@ func newService(ctx context.Context, db *sql.DB, schema string, fetch Fetcher, o
 	}
 	if err := s.loadLatest(ctx); err != nil {
 		return nil, err
+	}
+	if oc, err := opencode.NewStore(ctx, db, schema); err != nil {
+		log.WithError(err).Warn("tmx quota: OpenCode readings off")
+	} else {
+		s.oc = oc
 	}
 	s.seedRouting()
 	name := "quota"
@@ -461,6 +469,7 @@ func (s *Service) tick(ctx context.Context) {
 			s.poll(ctx, spec, auth, a, planDue)
 		}
 	}
+	s.tickOpenCode(ctx, now, seen)
 }
 
 // passiveFresh: the headers were observed within one poll interval, carry at least one window,

@@ -53,6 +53,7 @@ func registerTMXManagementRoutes(v8 *gin.RouterGroup, fetcher quota.Fetcher, mgr
 	v8.GET("/tmx/quota/current", tmxQuotaCurrent)
 	v8.GET("/tmx/quota/history", tmxQuotaHistory)
 	v8.POST("/tmx/quota/poll", tmxQuotaPoll)
+	registerTMXOpenCodeRoutes(v8) // server_management_tmx_opencode.go
 }
 
 // tmxPoolBuild is the /tmx/pool projection (also what the pool history recorder stores).

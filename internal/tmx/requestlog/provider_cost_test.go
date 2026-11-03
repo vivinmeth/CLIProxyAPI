@@ -34,7 +34,7 @@ func TestRowFromRecordUsesOpenCodeCost(t *testing.T) {
 func TestGoBilledToBalanceIsFlagged(t *testing.T) {
 	rec := coreusage.Record{Provider: "opencode-go", Model: "glm-5.3", AuthType: "apikey",
 		BaseURL: "https://opencode.ai/inference/go/openai/v1",
-		Detail: coreusage.Detail{ProviderCost: &coreusage.ProviderCost{Charged: f64(0.03), ListCost: f64(0.03), BillingSource: "balance"}}}
+		Detail:  coreusage.Detail{ProviderCost: &coreusage.ProviderCost{Charged: f64(0.03), ListCost: f64(0.03), BillingSource: "balance"}}}
 	row := rowFromRecord(context.Background(), rec)
 	if row.Warning != WarningGoBilledToBalance || row.Billing != BillingAPIKey {
 		t.Fatalf("warning %q billing %q", row.Warning, row.Billing)
