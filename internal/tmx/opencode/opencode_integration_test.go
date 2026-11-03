@@ -247,3 +247,50 @@ func TestAnchoredWindowLongChain(t *testing.T) {
 		t.Fatalf("5h = %v, resets %v; want 0.10 resetting %v", w.UsedUSD, w.ResetsAt, t0.Add(35*time.Hour))
 	}
 }
+
+// Steady traffic longer than the lookback: once a window start is known (stored by earlier reads),
+// the chain continues from it and never re-anchors on the lookback's first row (council r4, Sol).
+func TestAnchoredWindowContinuesPastLookback(t *testing.T) {
+	dsn := os.Getenv("TMX_REQUESTLOG_TEST_DSN")
+	if dsn == "" {
+		t.Skip("TMX_REQUESTLOG_TEST_DSN not set")
+	}
+	ctx := context.Background()
+	schema := fmt.Sprintf("tmx_test_ocl_%d", time.Now().UnixNano())
+	rl, err := requestlog.Open(ctx, dsn, schema, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = rl.DB().Exec("DROP SCHEMA " + schema + " CASCADE")
+		rl.Close()
+	})
+	store, err := opencode.NewStore(ctx, rl.DB(), schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := opencode.Settings{Entry: "opencode-go", Plan: "go", Plans: map[string]opencode.Plan{"go": {Pool: 60}}}
+	if err = st.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	// $0.10 every hour for 800 hours (33 days, never a 5h gap); the proxy reads every hour as it goes.
+	var last opencode.WindowReading
+	for h := 0; h <= 800; h++ {
+		if _, err = rl.DB().ExecContext(ctx, `INSERT INTO `+schema+`.requests (ts, provider, model, outcome, allowance_usd)
+			VALUES ($1, 'openai-compatible-opencode-go', 'm', 'success', 0.1)`, t0.Add(time.Duration(h)*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if h%10 == 0 || h >= 790 {
+			rs, errR := store.ReadAll(ctx, st, t0.Add(time.Duration(h)*time.Hour+time.Minute))
+			if errR != nil {
+				t.Fatal(errR)
+			}
+			last = rs[0].Windows[0]
+		}
+	}
+	// Windows open every 5h from hour 0: hour 800 opens one, resetting at hour 805.
+	if math.Abs(last.UsedUSD-0.1) > 1e-9 || last.ResetsAt == nil || !last.ResetsAt.Equal(t0.Add(805*time.Hour)) {
+		t.Fatalf("5h at hour 800 = %v, resets %v; want 0.10 resetting %v", last.UsedUSD, last.ResetsAt, t0.Add(805*time.Hour))
+	}
+}

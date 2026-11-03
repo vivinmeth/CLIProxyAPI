@@ -187,6 +187,18 @@ func NewStore(ctx context.Context, db *sql.DB, schema string) (*Store, error) {
 	)`); err != nil {
 		return nil, fmt.Errorf("opencode quota schema: %w", err)
 	}
+	// The start of each account's latest anchored window, so the chain continues from it on every
+	// read (and across restarts) instead of being rebuilt from a lookback.
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS `+s.schema+`.opencode_anchors (
+		entry      TEXT NOT NULL,
+		account    TEXT NOT NULL,
+		"window"   TEXT NOT NULL,
+		start      TIMESTAMPTZ NOT NULL,
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		PRIMARY KEY (entry, account, "window")
+	)`); err != nil {
+		return nil, fmt.Errorf("opencode anchors schema: %w", err)
+	}
 	return s, nil
 }
 
@@ -345,7 +357,7 @@ func (s *Store) read(ctx context.Context, st Settings, account, plan string, sc 
 	for _, w := range st.Windows {
 		var wr WindowReading
 		if w.Anchored {
-			wr, err = s.anchored(ctx, st.Entry, sc, w, now)
+			wr, err = s.anchored(ctx, st.Entry, account, sc, w, now)
 		} else {
 			wr, err = s.rolling(ctx, st.Entry, sc, w, now)
 		}
@@ -434,23 +446,35 @@ func (s *Store) rolling(ctx context.Context, entry string, sc scope, w Window, n
 const anchoredLookback = 31 * 24 * time.Hour
 
 // anchored replays the window chain: a window opens at the first request after the previous one
-// closed and lasts w.Hours. The replay starts at the last request that followed a gap of at least
-// one window length (such a request must open a window, whatever came before), else at the first
-// request of the lookback. The open window, if any, is the reading.
-func (s *Store) anchored(ctx context.Context, entry string, sc scope, w Window, now time.Time) (WindowReading, error) {
+// closed and lasts w.Hours. The replay starts at the later of two known window starts: the one
+// stored by the last read (opencode_anchors), and the last request that followed a gap of at least
+// one window length within the lookback (such a request must open a window, whatever came before).
+// With neither, it starts at the first request of the lookback (an estimate, corrected by the next
+// gap). The latest window start the replay finds is stored, so the chain never drifts. The open
+// window, if any, is the reading.
+func (s *Store) anchored(ctx context.Context, entry, account string, sc scope, w Window, now time.Time) (WindowReading, error) {
 	wr := WindowReading{Window: w.Name}
 	length := hours(w.Hours)
 	from := now.Add(-anchoredLookback)
-	var start sql.NullTime
-	if err := s.db.QueryRowContext(ctx, `SELECT max(ts) FROM (
+	var stored, gap sql.NullTime
+	err := s.db.QueryRowContext(ctx, `SELECT start FROM `+s.schema+`.opencode_anchors
+		WHERE entry = $1 AND account = $2 AND "window" = $3 AND start <= $4`, entry, account, w.Name, now).Scan(&stored)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return wr, err
+	}
+	if err = s.db.QueryRowContext(ctx, `SELECT max(ts) FROM (
 		SELECT ts, ts - lag(ts) OVER (ORDER BY ts) AS gap FROM `+s.schema+`.requests
 		WHERE `+rowFilter+sc.clause+` AND ts > $2 AND ts <= $3) t
 		WHERE gap IS NULL OR gap >= make_interval(secs => $5)`,
-		entry, from, now, sc.keys, length.Seconds()).Scan(&start); err != nil {
+		entry, from, now, sc.keys, length.Seconds()).Scan(&gap); err != nil {
 		return wr, err
 	}
+	start := gap
+	if stored.Valid && (!start.Valid || stored.Time.After(start.Time)) {
+		start = stored
+	}
 	if !start.Valid {
-		return wr, nil // no usage in the lookback
+		return wr, nil // no usage in the lookback and nothing stored
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT ts, allowance_usd FROM `+s.schema+`.requests
 		WHERE `+rowFilter+sc.clause+` AND ts >= $2 AND ts <= $3 ORDER BY ts`, entry, start.Time, now, sc.keys)
@@ -458,7 +482,7 @@ func (s *Store) anchored(ctx context.Context, entry string, sc scope, w Window, 
 		return wr, err
 	}
 	defer func() { _ = rows.Close() }()
-	var open time.Time
+	open := start.Time
 	var sum float64
 	for rows.Next() {
 		var ts time.Time
@@ -466,7 +490,7 @@ func (s *Store) anchored(ctx context.Context, entry string, sc scope, w Window, 
 		if err = rows.Scan(&ts, &v); err != nil {
 			return wr, err
 		}
-		if open.IsZero() || !ts.Before(open.Add(length)) {
+		if !ts.Before(open.Add(length)) {
 			open, sum = ts, 0
 		}
 		sum += v
@@ -474,7 +498,15 @@ func (s *Store) anchored(ctx context.Context, entry string, sc scope, w Window, 
 	if err = rows.Err(); err != nil {
 		return wr, err
 	}
-	if !open.IsZero() && now.Before(open.Add(length)) {
+	if !stored.Valid || !open.Equal(stored.Time) {
+		if _, err = s.db.ExecContext(ctx, `INSERT INTO `+s.schema+`.opencode_anchors (entry, account, "window", start, updated_at)
+			VALUES ($1, $2, $3, $4, now()) ON CONFLICT (entry, account, "window")
+			DO UPDATE SET start = EXCLUDED.start, updated_at = now() WHERE `+s.schema+`.opencode_anchors.start < EXCLUDED.start`,
+			entry, account, w.Name, open); err != nil {
+			return wr, err
+		}
+	}
+	if now.Before(open.Add(length)) {
 		end := open.Add(length).UTC()
 		wr.UsedUSD, wr.ResetsAt = sum, &end
 	}
