@@ -33,12 +33,12 @@ func registerTMXOpenCodeRoutes(v8 *gin.RouterGroup) {
 		}
 		readings := make([]opencode.Reading, 0, len(subs))
 		for _, sub := range subs {
-			r, errR := st.Read(c.Request.Context(), sub, time.Now())
+			rs, errR := st.ReadAll(c.Request.Context(), sub, time.Now())
 			if errR != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": errR.Error()})
 				return
 			}
-			readings = append(readings, r)
+			readings = append(readings, rs...)
 		}
 		c.JSON(http.StatusOK, gin.H{"subscriptions": subs, "readings": readings, "default_windows": opencode.DefaultWindows})
 	})

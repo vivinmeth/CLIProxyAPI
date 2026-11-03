@@ -54,16 +54,30 @@ type Plan struct {
 	Caps map[string]float64 `json:"caps"`
 }
 
-// Settings configure one OpenCode Go subscription.
+// Account is one OpenCode account in the entry's pool: its plan (default: Settings.Plan) and the
+// fingerprints of every key it has had (requestlog.KeyFingerprint, the rows' auth_label
+// "key:<12 hex>"), so a rotated key keeps the account's history and its open 5-hour window.
+type Account struct {
+	Name string   `json:"name"`
+	Plan string   `json:"plan,omitempty"`
+	Keys []string `json:"keys"`
+}
+
+// Unassigned names the reading of an entry's rows whose key no account lists.
+const Unassigned = "unassigned"
+
+// Settings configure one OpenCode Go entry: its accounts (one per key in the pool) and plans.
 type Settings struct {
 	// Entry is the openai-compatibility entry name serving it, lowercased. Its request-log rows carry
 	// provider "openai-compatible-<entry>" (the synthesized credential's provider).
 	Entry string `json:"entry"`
-	// Plan picks one of Plans ("go", "go-plus", ...).
+	// Plan picks one of Plans ("go", "go-plus", ...) for accounts that name none.
 	Plan string `json:"plan"`
 	// Windows default to DefaultWindows when empty.
 	Windows []Window        `json:"windows,omitempty"`
 	Plans   map[string]Plan `json:"plans"`
+	// Accounts split the entry's rows by key. None: the entry reads as one account.
+	Accounts []Account `json:"accounts,omitempty"`
 }
 
 // Normalize lowercases names, fills default windows and validates. It returns an error for a
@@ -111,6 +125,32 @@ func (s *Settings) Normalize() error {
 		plans[name] = Plan{Pool: p.Pool, Caps: caps}
 	}
 	s.Plans = plans
+	names, keys := map[string]bool{}, map[string]string{}
+	for i := range s.Accounts {
+		a := &s.Accounts[i]
+		a.Name = strings.ToLower(strings.TrimSpace(a.Name))
+		a.Plan = strings.ToLower(strings.TrimSpace(a.Plan))
+		if a.Name == "" || a.Name == Unassigned || names[a.Name] {
+			return fmt.Errorf("account %d: name empty, %q or repeated", i, Unassigned)
+		}
+		names[a.Name] = true
+		if a.Plan == "" {
+			a.Plan = s.Plan
+		}
+		if len(a.Keys) == 0 {
+			return fmt.Errorf("account %s: no key fingerprints", a.Name)
+		}
+		for j, k := range a.Keys {
+			k = strings.TrimSpace(k)
+			if !strings.HasPrefix(k, "key:") || len(k) != 16 {
+				return fmt.Errorf("account %s: %q is not a key fingerprint (key:<12 hex>)", a.Name, k)
+			}
+			if other, dup := keys[k]; dup {
+				return fmt.Errorf("key %s is in accounts %s and %s", k, other, a.Name)
+			}
+			keys[k], a.Keys[j] = a.Name, k
+		}
+	}
 	return nil
 }
 
@@ -229,9 +269,10 @@ type ModelUse struct {
 	Requests     int     `json:"requests"`
 }
 
-// Reading is one subscription's state.
+// Reading is one account's state.
 type Reading struct {
 	Entry      string          `json:"entry"`
+	Account    string          `json:"account,omitempty"` // "" when the entry has no accounts
 	Plan       string          `json:"plan"`
 	PoolUSD    *float64        `json:"pool_usd"`
 	PoolSource string          `json:"pool_source,omitempty"` // settings | traffic | "" (unknown)
@@ -239,13 +280,54 @@ type Reading struct {
 	Models     []ModelUse      `json:"models"`
 }
 
-// rowFilter selects st's rows that carry allowance: $1 is the entry.
+// rowFilter selects an entry's rows that carry allowance: $1 is the entry, $4 the key fingerprints
+// (auth_label) of the account read, matched (keyIn) or excluded (keyOut, the unassigned rows).
 const rowFilter = `provider IN ($1, 'openai-compatible-' || $1) AND allowance_usd IS NOT NULL AND NOT shadowed`
 
-// Read computes st's reading at now.
-func (s *Store) Read(ctx context.Context, st Settings, now time.Time) (Reading, error) {
-	r := Reading{Entry: st.Entry, Plan: st.Plan}
-	models, err := s.modelUse(ctx, st, now)
+const (
+	keyAny = ` AND $4::text[] IS NOT NULL`
+	keyIn  = ` AND auth_label = ANY($4::text[])`
+	keyOut = ` AND NOT (auth_label = ANY($4::text[]))`
+)
+
+type scope struct {
+	clause string
+	keys   []string
+}
+
+// ReadAll computes every account's reading at now: one per configured account, plus Unassigned
+// when rows of keys no account lists used allowance inside the longest window. An entry without
+// accounts reads as one.
+func (s *Store) ReadAll(ctx context.Context, st Settings, now time.Time) ([]Reading, error) {
+	if len(st.Accounts) == 0 {
+		r, err := s.read(ctx, st, "", st.Plan, scope{keyAny, []string{}}, now)
+		return []Reading{r}, err
+	}
+	var all []string
+	out := make([]Reading, 0, len(st.Accounts)+1)
+	for _, a := range st.Accounts {
+		all = append(all, a.Keys...)
+		r, err := s.read(ctx, st, a.Name, a.Plan, scope{keyIn, a.Keys}, now)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	r, err := s.read(ctx, st, Unassigned, st.Plan, scope{keyOut, all}, now)
+	if err != nil {
+		return nil, err
+	}
+	if len(r.Models) > 0 {
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// read computes one account's reading.
+func (s *Store) read(ctx context.Context, st Settings, account, plan string, sc scope, now time.Time) (Reading, error) {
+	r := Reading{Entry: st.Entry, Account: account, Plan: plan}
+	st.Plan = plan
+	models, err := s.modelUse(ctx, st, sc, now)
 	if err != nil {
 		return r, err
 	}
@@ -256,9 +338,9 @@ func (s *Store) Read(ctx context.Context, st Settings, now time.Time) (Reading, 
 	for _, w := range st.Windows {
 		var wr WindowReading
 		if w.Anchored {
-			wr, err = s.anchored(ctx, st.Entry, w, now)
+			wr, err = s.anchored(ctx, st.Entry, sc, w, now)
 		} else {
-			wr, err = s.rolling(ctx, st.Entry, w, now)
+			wr, err = s.rolling(ctx, st.Entry, sc, w, now)
 		}
 		if err != nil {
 			return r, err
@@ -314,11 +396,11 @@ func poolFor(st Settings, models []ModelUse) (float64, string) {
 	return math.Round(mid*100) / 100, PoolFromTraffic
 }
 
-func (s *Store) modelUse(ctx context.Context, st Settings, now time.Time) ([]ModelUse, error) {
+func (s *Store) modelUse(ctx context.Context, st Settings, sc scope, now time.Time) ([]ModelUse, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT model, sum(allowance_usd),
 		COALESCE(sum(cost_usd) FILTER (WHERE price_source = 'opencode'), 0), count(*)
-		FROM `+s.schema+`.requests WHERE `+rowFilter+` AND ts > $2 AND ts <= $3 GROUP BY model ORDER BY model`,
-		st.Entry, now.Add(-st.longest()), now)
+		FROM `+s.schema+`.requests WHERE `+rowFilter+sc.clause+` AND ts > $2 AND ts <= $3 GROUP BY model ORDER BY model`,
+		st.Entry, now.Add(-st.longest()), now, sc.keys)
 	if err != nil {
 		return nil, err
 	}
@@ -334,20 +416,20 @@ func (s *Store) modelUse(ctx context.Context, st Settings, now time.Time) ([]Mod
 	return out, rows.Err()
 }
 
-func (s *Store) rolling(ctx context.Context, entry string, w Window, now time.Time) (WindowReading, error) {
+func (s *Store) rolling(ctx context.Context, entry string, sc scope, w Window, now time.Time) (WindowReading, error) {
 	wr := WindowReading{Window: w.Name}
 	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(sum(allowance_usd), 0) FROM `+s.schema+`.requests
-		WHERE `+rowFilter+` AND ts > $2 AND ts <= $3`, entry, now.Add(-hours(w.Hours)), now).Scan(&wr.UsedUSD)
+		WHERE `+rowFilter+sc.clause+` AND ts > $2 AND ts <= $3`, entry, now.Add(-hours(w.Hours)), now, sc.keys).Scan(&wr.UsedUSD)
 	return wr, err
 }
 
 // anchored replays the window chain over the last four window lengths: a window opens at the first
 // request after the previous one closed and lasts w.Hours. The open window, if any, is the reading.
-func (s *Store) anchored(ctx context.Context, entry string, w Window, now time.Time) (WindowReading, error) {
+func (s *Store) anchored(ctx context.Context, entry string, sc scope, w Window, now time.Time) (WindowReading, error) {
 	wr := WindowReading{Window: w.Name}
 	length := hours(w.Hours)
 	rows, err := s.db.QueryContext(ctx, `SELECT ts, allowance_usd FROM `+s.schema+`.requests
-		WHERE `+rowFilter+` AND ts > $2 AND ts <= $3 ORDER BY ts`, entry, now.Add(-4*length), now)
+		WHERE `+rowFilter+sc.clause+` AND ts > $2 AND ts <= $3 ORDER BY ts`, entry, now.Add(-4*length), now, sc.keys)
 	if err != nil {
 		return wr, err
 	}
@@ -375,6 +457,11 @@ func (s *Store) anchored(ctx context.Context, entry string, w Window, now time.T
 	return wr, nil
 }
 
-// AccountID names a subscription's quota account: stable across key rotation (the entry name, not
-// the credential's id, which hashes the key).
-func AccountID(entry string) string { return "opencode:" + entry }
+// AccountID names an account's quota account: opencode:<entry>[:<account>]. Stable across key
+// rotation (names, not the credential's id, which hashes the key).
+func AccountID(entry, account string) string {
+	if account == "" {
+		return "opencode:" + entry
+	}
+	return "opencode:" + entry + ":" + account
+}

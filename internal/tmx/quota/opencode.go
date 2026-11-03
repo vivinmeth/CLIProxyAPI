@@ -8,8 +8,9 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// OpenCode Go readings (internal/tmx/opencode): one account per subscription, id
-// opencode:<entry> (provider = the entry, label "OpenCode Go", plan = the configured plan), windows
+// OpenCode Go readings (internal/tmx/opencode): one quota account per OpenCode account, id
+// opencode:<entry>:<account> (opencode:<entry> without accounts; provider = the entry, label
+// "OpenCode Go · <account>", plan = the account's plan), windows
 // from its settings, source "passive". The anchored 5-hour window carries its reset time; it still
 // never reaches routing: record() doesn't apply routing, and the routing seed only walks real
 // credentials. Readings are for the dashboard and history only.
@@ -32,21 +33,27 @@ func (s *Service) tickOpenCode(ctx context.Context, now time.Time, seen map[stri
 		return
 	}
 	for _, st := range subs {
-		r, errR := s.oc.Read(ctx, st, now)
+		readings, errR := s.oc.ReadAll(ctx, st, now)
 		if errR != nil {
-			log.WithError(errR).Warnf("tmx quota: OpenCode reading for %s failed", st.Entry)
+			log.WithError(errR).Warnf("tmx quota: OpenCode readings for %s failed", st.Entry)
 			continue
 		}
-		id := opencode.AccountID(st.Entry)
-		seen[id] = true
-		s.mu.Lock()
-		a := s.accountLocked(id)
-		a.present, a.Provider, a.Label, a.Plan = true, st.Entry, "OpenCode Go", st.Plan
-		s.mu.Unlock()
-		windows := make([]Window, 0, len(r.Windows))
-		for _, w := range r.Windows {
-			windows = append(windows, Window{Window: w.Window, UsedPct: w.UsedPct, ResetsAt: w.ResetsAt, Status: w.Status})
+		for _, r := range readings {
+			id := opencode.AccountID(st.Entry, r.Account)
+			label := "OpenCode Go"
+			if r.Account != "" {
+				label += " · " + r.Account
+			}
+			seen[id] = true
+			s.mu.Lock()
+			a := s.accountLocked(id)
+			a.present, a.Provider, a.Label, a.Plan = true, st.Entry, label, r.Plan
+			s.mu.Unlock()
+			windows := make([]Window, 0, len(r.Windows))
+			for _, w := range r.Windows {
+				windows = append(windows, Window{Window: w.Window, UsedPct: w.UsedPct, ResetsAt: w.ResetsAt, Status: w.Status})
+			}
+			s.record(ctx, id, windows, "passive", now.UTC())
 		}
-		s.record(ctx, id, windows, "passive", now.UTC())
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/opencode"
 	"io"
 	"math"
 	"mime"
@@ -1191,6 +1192,8 @@ func newOpenAICompatStatusError(status int, headers http.Header, body []byte) st
 		code:       status,
 		msg:        string(body),
 		retryAfter: openAICompatRetryAfter(status, headers, body, time.Now()),
+		// tmx: an OpenCode Go usage limit covers the whole account, not one model.
+		credentialScoped: opencode.IsAccountLimit(status, body),
 	}
 }
 
