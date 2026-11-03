@@ -360,7 +360,7 @@ func rowFromRecord(ctx context.Context, record coreusage.Record) Row {
 		ResponseModel:   strings.TrimSpace(record.ResponseModel),
 		AuthID:          strings.TrimSpace(record.AuthID),
 		AuthIndex:       strings.TrimSpace(record.AuthIndex),
-		AuthLabel:       strings.TrimSpace(record.Source),
+		AuthLabel:       safeAuthLabel(record), // tmx: never a raw key (authlabel.go)
 		AuthType:        strings.TrimSpace(record.AuthType),
 		APIKeyHash:      hashAPIKey(record.APIKey),
 		Machine:         MachineFromKey(record.APIKey),
