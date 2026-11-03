@@ -110,6 +110,8 @@ type Detail struct {
 	// tokenmaxx fork: both price differently.
 	CacheWrite1hTokens int64
 	ResponseSpeed      string
+	// ProviderCost is the cost the upstream itself reported (OpenCode); nil when none.
+	ProviderCost *ProviderCost
 }
 
 type requestedModelAliasContextKey struct{}

@@ -43,6 +43,9 @@ type priceSnapshot struct {
 
 // priceRow fills r's cost columns from snap (nil snap leaves the row pending).
 func priceRow(r *Row, snap *priceSnapshot) {
+	if r.providerPriced() {
+		return // the upstream reported the cost (provider_cost.go); a catalog never overrides it
+	}
 	if snap == nil {
 		return
 	}

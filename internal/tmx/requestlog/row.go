@@ -94,6 +94,16 @@ type Row struct {
 	// Billing says what the cost was: subscription (API-equivalent, paid by a plan), api_key
 	// (real spend), local (free, own hardware), free (a free tier); "" when unknown.
 	Billing string `json:"billing"`
+	// Provider-reported cost (OpenCode Go / Zen; provider_cost.go): ChargedUSD is what the
+	// pay-as-you-go balance was charged, AllowanceUSD the Go allowance used (dollars of the model's
+	// monthly limit), BillingSource OpenCode's billing_source. NULL / "" for other providers. Such a
+	// row's cost_usd is OpenCode's list_cost (price_source "opencode"), never re-priced.
+	ChargedUSD    *float64 `json:"charged_usd"`
+	AllowanceUSD  *float64 `json:"allowance_usd"`
+	BillingSource string   `json:"billing_source"`
+	// Warning flags a row worth a look: "go_billed_to_balance" (a Go request charged to the balance,
+	// i.e. Extra Usage is on); "" otherwise.
+	Warning string `json:"warning"`
 	// Provenance: "tmx-proxy" for proxied calls, "extern:<harness>" for imported sessions.
 	Source  string `json:"source"`
 	Machine string `json:"machine"`
@@ -380,6 +390,7 @@ func rowFromRecord(ctx context.Context, record coreusage.Record) Row {
 		row.Harness, row.ClientMode = muse.Harness, muse.ClientMode(meta.UserAgent, meta.ClientID)
 	}
 	row.Billing = BillingFor(row.AuthType, row.Provider)
+	row.applyProviderCost(detail.ProviderCost, record.BaseURL)
 	// Raw provider-shaped columns above are kept as reported; the normalised ones come from
 	// upstream's accounting (cache_read and reasoning_tokens take its values).
 	row.applyBreakdown(detail.TokenBreakdown)

@@ -279,6 +279,11 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS requests_price_pending_idx ON ` + s.table() + ` (id)
 			WHERE price_source IS NULL OR price_source = 'unpriced'`,
+		// v5: provider-reported cost (OpenCode; provider_cost.go).
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS charged_usd DOUBLE PRECISION`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS allowance_usd DOUBLE PRECISION`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS billing_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE ` + s.table() + ` ADD COLUMN IF NOT EXISTS warning TEXT NOT NULL DEFAULT ''`,
 		`CREATE TABLE IF NOT EXISTS ` + s.schema + `.price_catalogs (
 			fetched_at TIMESTAMPTZ PRIMARY KEY,
 			source     TEXT NOT NULL,
@@ -653,7 +658,8 @@ var columnNames = []string{"ts", "request_id", "trace_id", "session_id", "provid
 	"reasoning_effort", "service_tier", "uncached_input", "cache_write", "output_non_reasoning",
 	"accounting_quality", "source", "machine", "import_ref", "shadowed", "harness", "client_mode",
 	"cache_write_1h", "speed", "cost_input", "cost_cache_read", "cost_cache_write", "cost_output", "cost_usd",
-	"priced_as", "price_source", "priced_at", "row_key", "billing"}
+	"priced_as", "price_source", "priced_at", "row_key", "billing",
+	"charged_usd", "allowance_usd", "billing_source", "warning"}
 
 func rowFields(r *Row) []any {
 	return []any{&r.TS, &r.RequestID, &r.TraceID, &r.SessionID, &r.Provider, &r.Executor,
@@ -664,7 +670,8 @@ func rowFields(r *Row) []any {
 		&r.ReasoningEffort, &r.ServiceTier, &r.UncachedInput, &r.CacheWrite, &r.OutputNonReasoning,
 		&r.AccountingQuality, &r.Source, &r.Machine, &r.importRefPtr, &r.Shadowed, &r.Harness, &r.ClientMode,
 		&r.CacheWrite1h, &r.Speed, &r.CostInput, &r.CostCacheRead, &r.CostCacheWrite, &r.CostOutput, &r.CostUSD,
-		&r.PricedAs, &r.PriceSource, &r.PricedAt, &r.rowKeyPtr, &r.Billing}
+		&r.PricedAs, &r.PriceSource, &r.PricedAt, &r.rowKeyPtr, &r.Billing,
+		&r.ChargedUSD, &r.AllowanceUSD, &r.BillingSource, &r.Warning}
 }
 
 var insertColumns = strings.Join(columnNames, ", ")

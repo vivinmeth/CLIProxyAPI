@@ -1219,6 +1219,7 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 	if detail.TotalTokens == 0 {
 		detail.TotalTokens = detail.TokenBreakdown.TotalTokens
 	}
+	detail.ProviderCost = tmxProviderCost(usageNode) // tmx
 	return detail
 }
 
@@ -1329,6 +1330,7 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 		detail.ReasoningTokens,
 		detail.TotalTokens,
 	)
+	detail.ProviderCost = tmxProviderCost(usageNode) // tmx
 	return detail
 }
 
