@@ -123,14 +123,20 @@ func Build(ctx context.Context, auths []*auth.Auth, counts map[string]int, accou
 		}
 		windows := map[string]quota.Current{}
 		var passive []quota.Window
+		source := "passive"
 		switch a.Provider {
 		case "claude":
 			passive = quota.ParseClaudeSignals(a.Quota.Signals)
 		case "codex":
 			passive = quota.ParseCodexSignals(a.Quota.Signals, a.Quota.ObservedAt)
+		default:
+			// OpenCode Go: the usage API's windows, as routing sees them (no response headers).
+			if strings.HasPrefix(a.Provider, "openai-compatible-") {
+				passive, source = quota.ParseTmxQuotaSignals(a.Quota.Signals), "polled"
+			}
 		}
 		for _, window := range passive {
-			windows[window.Window] = quota.Current{Window: window, ObservedAt: a.Quota.ObservedAt, Source: "passive", Stale: window.ResetsAt != nil && !window.ResetsAt.After(now)}
+			windows[window.Window] = quota.Current{Window: window, ObservedAt: a.Quota.ObservedAt, Source: source, Stale: window.ResetsAt != nil && !window.ResetsAt.After(now)}
 		}
 		if account, ok := latest[a.ID]; ok {
 			if account.Plan != "" {

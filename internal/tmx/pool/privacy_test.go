@@ -57,3 +57,23 @@ func TestPoolCarriesQuotaAuthIndex(t *testing.T) {
 		t.Fatalf("payload=%s", raw)
 	}
 }
+
+// An OpenCode credential shows the usage API's windows routing keeps on it (no response headers).
+func TestPoolShowsPolledOpenCodeWindows(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	const provider = "openai-compatible-opencode-go"
+	m := auth.NewManager(nil, &auth.ResetSoonestSelector{}, nil)
+	if _, err := m.Register(context.Background(), &auth.Auth{ID: "oc", Provider: provider, Status: auth.StatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	used := 42.0
+	m.ApplyQuotaObservation("oc", provider, []auth.QuotaWindowObservation{
+		{Window: "7d", UsedPercent: &used, ResetsAt: now.Add(96 * time.Hour), Status: "allowed", ObservedAt: now}})
+	a, _ := m.GetByID("oc")
+	s := Build(context.Background(), []*auth.Auth{a}, nil, nil, nil, "")
+	ws := s.Credentials[0].Windows
+	if len(ws) != 1 || ws[0].Window.Window != "7d" || ws[0].UsedPct == nil || *ws[0].UsedPct != 42 ||
+		ws[0].ResetsAt == nil || !ws[0].ResetsAt.Equal(now.Add(96*time.Hour)) || ws[0].Source != "polled" {
+		t.Fatalf("windows = %+v", ws)
+	}
+}

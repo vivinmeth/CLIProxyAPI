@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -94,6 +95,27 @@ func ParseOpenCodeUsage(body []byte) ([]Window, error) {
 		out = append(out, Window{Window: m.window, UsedPct: &pct, ResetsAt: &reset, Status: openCodeStatus(v.Status, pct)})
 	}
 	return out, nil
+}
+
+// ParseTmxQuotaSignals reads the polled windows routing keeps on an OpenCode credential
+// (coreauth.TmxQuotaSignalPrefix: X-Tmx-Quota-<window>-Reset, -Used-Percent, -Status), for the pool
+// view, which knows credentials rather than quota accounts.
+func ParseTmxQuotaSignals(signals map[string]string) []Window {
+	var out []Window
+	for _, m := range openCodeMeters {
+		base := coreauth.TmxQuotaSignalPrefix + m.window + "-"
+		unix, err := strconv.ParseInt(signals[base+"Reset"], 10, 64)
+		if err != nil {
+			continue
+		}
+		reset := time.Unix(unix, 0).UTC()
+		w := Window{Window: m.window, ResetsAt: &reset, Status: signals[base+"Status"]}
+		if v, errPct := strconv.ParseFloat(signals[base+"Used-Percent"], 64); errPct == nil {
+			w.UsedPct = &v
+		}
+		out = append(out, w)
+	}
+	return out
 }
 
 // openCodeStatus: "rate-limited" is OpenCode refusing the account; "ok" (or an estimate) is graded
