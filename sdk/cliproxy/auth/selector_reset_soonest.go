@@ -111,6 +111,9 @@ func weeklyResetAtForModel(auth *Auth, now time.Time, model string) (time.Time, 
 	if resetAt, ok := parseQuotaResetTimestamp(quotaSignalValue(signals, devinWeeklyResetSignal)); ok {
 		candidates = append(candidates, resetAt)
 	}
+	if resetAt, ok := parseQuotaResetTimestamp(quotaSignalValue(signals, tmxQuotaWeeklyResetSignal)); ok { // tmx
+		candidates = append(candidates, resetAt)
+	}
 	if len(candidates) == 0 {
 		return time.Time{}, false
 	}

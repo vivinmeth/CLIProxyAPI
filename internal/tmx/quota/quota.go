@@ -13,7 +13,7 @@
 // take (it is down) goes to a durable on-disk spool and reaches the table later with its original
 // ts; a window counts as written only once its row is in the table. Codex accounts are polled at
 // chatgpt.com/backend-api/wham/usage (plan from the same payload); Codex API-key accounts are skipped.
-// Meta Muse Code accounts: see meta.go.
+// Meta Muse Code accounts: see meta.go. OpenCode Go accounts (usage API plus allowance): opencode.go.
 package quota
 
 import (
@@ -216,6 +216,8 @@ type account struct {
 	// present: the account was in the auth manager (and tracked) at the last tick. Removed or
 	// disabled accounts keep their history but drop out of Accounts().
 	present bool
+	// ocPoll: an OpenCode account's last good usage read (opencode.go); nil until one succeeds.
+	ocPoll *openCodePoll
 }
 
 // Service collects and stores quota snapshots.
@@ -412,6 +414,7 @@ func (s *Service) tick(ctx context.Context) {
 	s.seedRouting()
 	now := s.now()
 	seen := map[string]bool{}
+	auths := s.fetch.TmxAuths()
 	defer func() {
 		s.mu.Lock()
 		for id, a := range s.accounts {
@@ -419,7 +422,7 @@ func (s *Service) tick(ctx context.Context) {
 		}
 		s.mu.Unlock()
 	}()
-	for _, auth := range s.fetch.TmxAuths() {
+	for _, auth := range auths {
 		spec, provider, ok := specFor(auth)
 		if !ok {
 			continue
@@ -469,7 +472,7 @@ func (s *Service) tick(ctx context.Context) {
 			s.poll(ctx, spec, auth, a, planDue)
 		}
 	}
-	s.tickOpenCode(ctx, now, seen)
+	s.tickOpenCode(ctx, now, seen, auths)
 }
 
 // passiveFresh: the headers were observed within one poll interval, carry at least one window,

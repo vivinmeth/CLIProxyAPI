@@ -20,7 +20,7 @@ func rankingKey(a *Auth, now time.Time, model string) (int, time.Time) {
 	}
 	// A reset that rolled over isn't a never-observed login deserving a probe.
 	if a != nil {
-		keys := append(claudeWeeklyResetNames(a.Quota.Signals, model), devinWeeklyResetSignal)
+		keys := append(claudeWeeklyResetNames(a.Quota.Signals, model), devinWeeklyResetSignal, tmxQuotaWeeklyResetSignal)
 		for _, slot := range []string{"Primary", "Secondary"} {
 			if codexWeeklyWindow(a.Quota.Signals, slot) {
 				keys = append(keys, "X-Codex-"+slot+"-Reset-At")
@@ -71,6 +71,21 @@ func overQuotaThreshold(a *Auth, now time.Time, model string, v tmxAdmissionView
 		}
 		base := "X-Codex-" + slot + "-"
 		windows = append(windows, window{base + "Used-Percent", base + "Reset-At", base + "Reset-After-Seconds", 100, threshold})
+	}
+	for _, name := range tmxQuotaWindows {
+		threshold := v.seven
+		if name == "5h" {
+			threshold = v.five
+		}
+		base := TmxQuotaSignalPrefix + name + "-"
+		windows = append(windows, window{base + "Used-Percent", base + "Reset", "", 100, threshold})
+		// The provider itself says the window is spent (OpenCode Go "rate-limited"): last resort
+		// until that window resets, however low its rounded percent reads.
+		if strings.EqualFold(quotaSignalValue(known, base+"Status"), "rejected") {
+			if reset, ok := parseQuotaResetTimestamp(quotaSignalValue(known, base+"Reset")); ok && reset.After(now) {
+				return true
+			}
+		}
 	}
 	for _, w := range windows {
 		// Utilization belongs to its observed reset window, and stops applying at rollover.

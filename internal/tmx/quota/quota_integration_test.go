@@ -24,6 +24,14 @@ type fakeFetcher struct {
 	headers map[string]string
 	// codexUsage is served for the Codex usage URL; empty means 404.
 	codexUsage string
+	// routes answer exact URLs before anything else.
+	routes     map[string]fakeRoute
+	headersFor map[string]map[string]string // headers of the last call to each URL
+}
+
+type fakeRoute struct {
+	status int
+	body   string
 }
 
 func (f *fakeFetcher) TmxAuths() []*coreauth.Auth {
@@ -41,6 +49,13 @@ func (f *fakeFetcher) TmxFetch(_ context.Context, _ *coreauth.Auth, url string, 
 	defer f.mu.Unlock()
 	f.calls[url]++
 	f.headers = headers
+	if f.headersFor == nil {
+		f.headersFor = map[string]map[string]string{}
+	}
+	f.headersFor[url] = headers
+	if r, ok := f.routes[url]; ok {
+		return r.status, []byte(r.body), nil
+	}
 	if url == codexUsageURL {
 		if f.codexUsage == "" {
 			return 404, nil, nil

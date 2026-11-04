@@ -9,10 +9,12 @@
 // GoUsageLimitError with Retry-After until the window ends. The 5-hour window starts at the first
 // request after the previous one ended (Retry-After pointed 5 h after the first request).
 //
-// Readings here: the sum of allowance_usd (request log) over each window, divided by the window's
-// share of the pool. The 5-hour window is anchored at first use, so it has a reset time; the weekly
-// and monthly anchors are unknown, so those are rolling sums (an upper bound) without one. Readings
-// are for the dashboard: they never cool a model down. Cooldown comes from OpenCode's own 429.
+// Readings here are the estimate from this proxy's own traffic: the sum of allowance_usd (request
+// log) over each window, divided by the window's share of the pool. The 5-hour window is anchored at
+// first use, so it has a reset time; 7d and 30d are rolling sums (an upper bound) without one.
+// OpenCode's usage API gives the real windows (weekly from Monday 00:00 UTC, monthly from the
+// subscription date); internal/tmx/quota polls it and uses this estimate between polls and as the
+// fallback. Readings never cool a model down: cooldown comes from OpenCode's own 429.
 //
 // Settings (plan, windows, per-plan pool and per-model limits) are configuration, kept in
 // <schema>.opencode_quota rather than in the proxy config so an older image never meets an unknown
@@ -433,6 +435,32 @@ func (s *Store) modelUse(ctx context.Context, st Settings, sc scope, now time.Ti
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// AllowanceSince is the allowance one account (Reading.Account; "" for an entry without accounts)
+// used in (since, now]: what the proxy saw after OpenCode's last usage reading.
+func (s *Store) AllowanceSince(ctx context.Context, st Settings, account string, since, now time.Time) (float64, error) {
+	sc := scope{keyAny, []string{}}
+	if account != "" {
+		var keys, all []string
+		for _, a := range st.Accounts {
+			all = append(all, a.Keys...)
+			if a.Name == account {
+				keys = a.Keys
+			}
+		}
+		sc = scope{keyIn, keys}
+		if account == Unassigned {
+			sc = scope{keyOut, all}
+		}
+		if sc.keys == nil {
+			sc.keys = []string{}
+		}
+	}
+	var used float64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(sum(allowance_usd), 0) FROM `+s.schema+`.requests
+		WHERE `+rowFilter+sc.clause+` AND ts > $2 AND ts <= $3`, st.Entry, since, now, sc.keys).Scan(&used)
+	return used, err
 }
 
 func (s *Store) rolling(ctx context.Context, entry string, sc scope, w Window, now time.Time) (WindowReading, error) {

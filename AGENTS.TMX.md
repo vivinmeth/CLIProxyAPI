@@ -65,7 +65,9 @@ working:
   the spawn-agent catalog; upstream tests skip via `tmxSkipCodexToClaude`); Zen hidden from lists;
   OpenCode cost fields in `helps/usage_tmx.go` → request-log columns (`provider_cost.go`), masked
   `auth_label` (`authlabel.go`); `GoUsageLimitError` credential-scoped in the compat executor;
-  per-account allowance readings (`tmx.opencode_quota`, `/tmx/opencode/quota`). `../wiki/opencode.md`.
+  per-account allowance readings (`tmx.opencode_quota`, `/tmx/opencode/quota`); OpenCode's usage API polled
+  per account (`internal/tmx/quota/opencode.go`, routing signals `X-Tmx-Quota-*` in
+  `tmx_quota_signals.go` / `tmx_reset_ranking.go`). `../wiki/opencode.md`.
 - **Durable spool** (`internal/tmx/spool/`, registry `internal/tmx/durability/`): writers that
   can't reach Postgres append to an fsynced spool under `<archive spool volume>/durable/<writer>`
   and replay; refused items go to `deadletter/`. `GET /v8/management/tmx/durability`. New writers

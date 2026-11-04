@@ -46,6 +46,24 @@ func (m *Manager) ClearQuotaSignals(authID string) bool {
 	return changed
 }
 
+// TmxQuotaSignalPrefix names the signals of a polled window on a credential whose responses carry
+// no quota headers (OpenCode Go): X-Tmx-Quota-<window>-Reset (unix), -Used-Percent (0-100), -Status.
+const TmxQuotaSignalPrefix = "X-Tmx-Quota-"
+
+// tmxQuotaWindows are the windows those signals carry; 7d is the weekly one reset-soonest ranks by.
+var tmxQuotaWindows = []string{"5h", "7d", "30d"}
+
+const tmxQuotaWeeklyResetSignal = TmxQuotaSignalPrefix + "7d-Reset"
+
+func tmxQuotaWindow(name string) bool {
+	for _, w := range tmxQuotaWindows {
+		if w == name {
+			return true
+		}
+	}
+	return false
+}
+
 // QuotaWindowObservation is an external (usage API or restored history) window.
 // UsedPercent uses the API's 0..100 scale, unlike Claude's passive fraction.
 type QuotaWindowObservation struct {
@@ -103,7 +121,11 @@ func (m *Manager) ApplyQuotaObservation(authID, provider string, windows []Quota
 				continue
 			}
 		default:
-			continue
+			// OpenCode Go's usage API (internal/tmx/quota/opencode.go), on its compat credential.
+			if !strings.HasPrefix(strings.ToLower(provider), "openai-compatible-") || !tmxQuotaWindow(w.Window) {
+				continue
+			}
+			prefix = TmxQuotaSignalPrefix + w.Window + "-"
 		}
 		fields := map[string]string{}
 		resetKey := prefix + "Reset"
@@ -116,6 +138,8 @@ func (m *Manager) ApplyQuotaObservation(authID, provider string, windows []Quota
 				minutes = "10080"
 			}
 			fields[prefix+"Window-Minutes"] = minutes
+		} else if strings.HasPrefix(prefix, TmxQuotaSignalPrefix) {
+			utilKey = prefix + "Used-Percent"
 		}
 		fields[resetKey] = strconv.FormatInt(w.ResetsAt.Unix(), 10)
 		if w.UsedPercent != nil && !math.IsNaN(*w.UsedPercent) && !math.IsInf(*w.UsedPercent, 0) && *w.UsedPercent >= 0 && *w.UsedPercent <= 100 {
