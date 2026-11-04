@@ -31,8 +31,9 @@ import (
 // schema). It counts every client of the account (another proxy, OpenCode's app), so it wins.
 // Between polls the reading is the last poll plus the allowance this proxy logged since
 // (internal/tmx/opencode), source passive, so a burst shows before the next poll. When the API is
-// unreachable, gone (404) or answers another shape, poll_error says so and each window falls back to
-// the allowance estimate once the last good poll's window has reset (at once without one).
+// gone (404, 403) or answers another shape, poll_error says so and every window reads the allowance
+// estimate at once; a transient error (network, 5xx, 429) keeps the last good poll until each
+// window's reset.
 //
 // Polled readings reach routing on the account's credential (reset-soonest ranks by the weekly
 // reset; a rate-limited window makes the credential a last resort). They never create a cooldown:
@@ -61,7 +62,8 @@ func (s *Service) OpenCode() *opencode.Store {
 }
 
 // ParseOpenCodeUsage maps OpenCode's usage reply to windows. percent is a whole number (0 means
-// under 1%, still a reading). A missing meter, percent or reset is an error (the API changed).
+// under 1%, still a reading). A missing meter, percent or reset, or a status other than ok and
+// rate-limited, is an error (the API changed).
 func ParseOpenCodeUsage(body []byte) ([]Window, error) {
 	var p struct {
 		Usage map[string]*struct {
@@ -83,6 +85,10 @@ func ParseOpenCodeUsage(body []byte) ([]Window, error) {
 		if err != nil {
 			return nil, fmt.Errorf("usage.%s.resetsAt: %w", m.key, err)
 		}
+		status := strings.TrimSpace(v.Status)
+		if status != "ok" && status != "rate-limited" {
+			return nil, fmt.Errorf("usage.%s.status %q is neither ok nor rate-limited", m.key, v.Status)
+		}
 		pct := *v.Percent
 		reset = reset.UTC()
 		out = append(out, Window{Window: m.window, UsedPct: &pct, ResetsAt: &reset, Status: openCodeStatus(v.Status, pct)})
@@ -90,8 +96,8 @@ func ParseOpenCodeUsage(body []byte) ([]Window, error) {
 	return out, nil
 }
 
-// openCodeStatus: "rate-limited" is OpenCode refusing the account; anything else (it sends "ok")
-// is graded by percent, never as rejected: only OpenCode says a window is spent.
+// openCodeStatus: "rate-limited" is OpenCode refusing the account; "ok" (or an estimate) is graded
+// by percent, never as rejected: only OpenCode says a window is spent.
 func openCodeStatus(status string, pct float64) string {
 	switch {
 	case strings.EqualFold(strings.TrimSpace(status), "rate-limited"):
@@ -226,7 +232,8 @@ func (s *Service) tickOpenCode(ctx context.Context, now time.Time, seen map[stri
 }
 
 // openCodePollDueLocked: never polled, an interval (plus jitter) since the last poll, or a polled
-// window has reset (at most every pollNowMinGap); never while paused or polling.
+// window has reset since the last poll (once: a failed re-read waits for the interval); never while
+// paused or polling.
 func (s *Service) openCodePollDueLocked(a *account, now time.Time) bool {
 	if a.polling != nil || now.Before(a.pauseUntil) {
 		return false
@@ -240,7 +247,7 @@ func (s *Service) openCodePollDueLocked(a *account, now time.Time) bool {
 	}
 	if a.ocPoll != nil && since >= pollNowMinGap {
 		for _, w := range a.ocPoll.windows {
-			if w.ResetsAt != nil && !w.ResetsAt.After(now) {
+			if w.ResetsAt != nil && !w.ResetsAt.After(now) && a.LastPollAt.Before(*w.ResetsAt) {
 				return true
 			}
 		}
@@ -258,7 +265,9 @@ func (s *Service) pollOpenCode(ctx context.Context, id string, cred *coreauth.Au
 		return s.fetchOpenCodeUsage(readCtx, cred)
 	})
 	var windows []Window
-	pollErr, pause := "", time.Duration(0)
+	// gone: the API is missing or answers another shape, so the last good poll is dropped and every
+	// window reads the allowance estimate (a transient error keeps it until each window's reset).
+	pollErr, pause, gone := "", time.Duration(0), false
 	const fallback = "; showing the allowance estimate"
 	switch {
 	case err != nil:
@@ -268,14 +277,14 @@ func (s *Service) pollOpenCode(ctx context.Context, id string, cred *coreauth.Au
 	case status == 401:
 		pollErr, pause = "unauthorized (401)", openCodeGonePause
 	case status == 403:
-		pollErr, pause = "no Go usage for this key (403)"+fallback, openCodeGonePause
+		pollErr, pause, gone = "no Go usage for this key (403)"+fallback, openCodeGonePause, true
 	case status == 404:
-		pollErr, pause = "usage API not found (404)"+fallback, openCodeGonePause
+		pollErr, pause, gone = "usage API not found (404)"+fallback, openCodeGonePause, true
 	case status < 200 || status >= 300:
 		pollErr = fmt.Sprintf("status %d", status)
 	default:
 		if windows, err = ParseOpenCodeUsage(body); err != nil {
-			pollErr = "unexpected usage reply: " + err.Error() + fallback
+			pollErr, gone = "unexpected usage reply: "+err.Error()+fallback, true
 		}
 	}
 	s.mu.Lock()
@@ -285,6 +294,8 @@ func (s *Service) pollOpenCode(ctx context.Context, id string, cred *coreauth.Au
 	}
 	if pollErr == "" {
 		a.ocPoll = &openCodePoll{at: now, windows: windows}
+	} else if gone {
+		a.ocPoll = nil
 	}
 	s.mu.Unlock()
 	if pollErr != "" {

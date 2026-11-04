@@ -55,6 +55,27 @@ var tmxQuotaWindows = []string{"5h", "7d", "30d"}
 
 const tmxQuotaWeeklyResetSignal = TmxQuotaSignalPrefix + "7d-Reset"
 
+// tmxClearUnpolledSignals is ClearObservationSignals for a response of a provider without quota
+// headers, except that a compat credential keeps its polled X-Tmx-Quota-* windows: they come from a
+// usage API, not from responses, and the next poll replaces them.
+func (q *QuotaState) tmxClearUnpolledSignals(provider string) bool {
+	if q == nil || !strings.HasPrefix(strings.ToLower(provider), "openai-compatible-") {
+		return q.ClearObservationSignals()
+	}
+	changed := false
+	for key := range q.Signals {
+		if !strings.HasPrefix(key, TmxQuotaSignalPrefix) {
+			delete(q.Signals, key)
+			delete(q.SignalObservedAt, key)
+			changed = true
+		}
+	}
+	if len(q.Signals) == 0 {
+		return q.ClearObservationSignals() || changed
+	}
+	return changed
+}
+
 func tmxQuotaWindow(name string) bool {
 	for _, w := range tmxQuotaWindows {
 		if w == name {

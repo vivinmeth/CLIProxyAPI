@@ -46,6 +46,9 @@ func TestParseOpenCodeUsage(t *testing.T) {
 		`{"usage":{"rolling":{"status":"ok","resetsAt":"x"},"weekly":{},"monthly":{}}}`,
 		`{"usage":{"rolling":{"status":"ok","percent":2,"resetsAt":"soon"},"weekly":{"percent":1,"resetsAt":"2026-11-09T00:00:00Z"},"monthly":{"percent":1,"resetsAt":"2026-11-09T00:00:00Z"}}}`,
 		`{"usage":{"rolling":{"percent":-1,"resetsAt":"2026-11-04T08:36:27Z"},"weekly":{"percent":1,"resetsAt":"2026-11-09T00:00:00Z"},"monthly":{"percent":1,"resetsAt":"2026-11-09T00:00:00Z"}}}`,
+		// A status OpenCode's schema doesn't have (or none) is a changed API.
+		`{"usage":{"rolling":{"status":"limited","percent":2,"resetsAt":"2026-11-04T08:36:27Z"},"weekly":{"status":"ok","percent":1,"resetsAt":"2026-11-09T00:00:00Z"},"monthly":{"status":"ok","percent":1,"resetsAt":"2026-11-09T00:00:00Z"}}}`,
+		`{"usage":{"rolling":{"percent":2,"resetsAt":"2026-11-04T08:36:27Z"},"weekly":{"status":"ok","percent":1,"resetsAt":"2026-11-09T00:00:00Z"},"monthly":{"status":"ok","percent":1,"resetsAt":"2026-11-09T00:00:00Z"}}}`,
 	} {
 		if _, err = ParseOpenCodeUsage([]byte(bad)); err == nil {
 			t.Fatalf("accepted %s", bad)
@@ -129,5 +132,27 @@ func TestOpenCodeCredentials(t *testing.T) {
 	st.Accounts = nil
 	if got = openCodeCredentials(auths, st); len(got) != 1 || got[""].ID != "a" {
 		t.Fatalf("credentials without accounts = %+v", got)
+	}
+}
+
+// A polled window that has reset brings the next poll forward once; a failed re-read then waits for
+// the interval instead of retrying every tick.
+func TestOpenCodePollDueAfterReset(t *testing.T) {
+	now := time.Date(2026, 11, 4, 8, 40, 0, 0, time.UTC)
+	s := &Service{pollEvery: 10 * time.Minute}
+	reset := time.Date(2026, 11, 4, 8, 36, 27, 0, time.UTC)
+	a := &account{Account: Account{AuthID: "opencode:opencode-go:account-1"},
+		ocPoll: &openCodePoll{windows: []Window{{Window: "5h", ResetsAt: &reset}}}}
+	last := reset.Add(-5 * time.Minute)
+	a.LastPollAt = &last
+	if !s.openCodePollDueLocked(a, now) {
+		t.Fatal("a reset since the last poll did not bring the poll forward")
+	}
+	last = reset.Add(time.Minute) // a poll after the reset failed (kept the old window)
+	if s.openCodePollDueLocked(a, now) {
+		t.Fatal("polling again every tick after a failed re-read")
+	}
+	if !s.openCodePollDueLocked(a, last.Add(11*time.Minute)) {
+		t.Fatal("the interval no longer polls")
 	}
 }

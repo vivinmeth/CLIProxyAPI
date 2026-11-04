@@ -31,7 +31,7 @@ func (q *QuotaState) ObserveResponseHeadersForProvider(provider string, headers 
 		return false
 	}
 	if !ProviderSupportsQuotaObservation(provider) {
-		return q.ClearObservationSignals()
+		return q.tmxClearUnpolledSignals(provider) // tmx: keeps polled OpenCode windows
 	}
 	next := collectQuotaSignals(provider, headers)
 	if len(next) == 0 {

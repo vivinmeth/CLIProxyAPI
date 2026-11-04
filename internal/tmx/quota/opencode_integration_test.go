@@ -202,8 +202,8 @@ func TestQuotaOpenCodePolled(t *testing.T) {
 	expect(ws, "7d", 52, "2026-11-09T00:00:00Z", "passive")
 	expect(ws, "30d", 105, "2026-12-03T13:32:12Z", "passive")
 
-	// The API goes away (404 on both paths): poll_error, back-off, and the last poll still anchors
-	// each window until its reset.
+	// The API goes away (404 on both paths): poll_error, back-off, and every window reads the
+	// allowance estimate at once ($9 of the 7d window's 30, rolling: no reset).
 	f.routes[zen] = fakeRoute{404, `{}`}
 	f.routes[inference] = fakeRoute{404, `{}`}
 	clock = clock.Add(15 * time.Minute)
@@ -212,7 +212,7 @@ func TestQuotaOpenCodePolled(t *testing.T) {
 	if !strings.Contains(a1.PollError, "404") || f.calls[inference] != 1 || a1.NextPollAt == nil || a1.NextPollAt.Before(clock.Add(59*time.Minute)) {
 		t.Fatalf("after 404: %+v calls %v", a1, f.calls)
 	}
-	expect(ws, "7d", 52, "2026-11-09T00:00:00Z", "passive")
+	expect(ws, "7d", 30, "", "passive")
 	// Past the polled 5h reset, that window is the allowance estimate again.
 	clock = time.Date(2026, 11, 4, 8, 40, 0, 0, time.UTC)
 	s.tick(ctx)
@@ -220,7 +220,7 @@ func TestQuotaOpenCodePolled(t *testing.T) {
 	if w := ws["5h"]; w.Source != "passive" || (w.ResetsAt != nil && w.ResetsAt.Format(time.RFC3339) == "2026-11-04T08:36:27Z") {
 		t.Fatalf("5h past its polled reset = %+v", w)
 	}
-	expect(ws, "7d", 52, "2026-11-09T00:00:00Z", "passive")
+	expect(ws, "7d", 30, "", "passive")
 
 	// The second path answers: polled again (back-off over), readings replaced.
 	f.routes[inference] = fakeRoute{200, strings.ReplaceAll(openCodeUsageReply, `"percent":42`, `"percent":55`)}

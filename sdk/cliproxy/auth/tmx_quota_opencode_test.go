@@ -54,6 +54,14 @@ func TestExternalQuotaOpenCodeWindowsRoute(t *testing.T) {
 	if got := pick(); got != "oc-b" {
 		t.Fatalf("picked %s, want the sooner weekly reset", got)
 	}
+	// An ordinary OpenCode response (no quota headers) keeps the polled windows.
+	m.MarkResult(context.Background(), Result{AuthID: "oc-b", Provider: provider, Model: "kimi-k3", Success: true})
+	if b, _ := m.GetByID("oc-b"); b.Quota.Signals["X-Tmx-Quota-7d-Reset"] == "" {
+		t.Fatalf("a response dropped the polled windows: %v", b.Quota.Signals)
+	}
+	if got := pick(); got != "oc-b" {
+		t.Fatalf("picked %s after a response, want the sooner weekly reset", got)
+	}
 	// OpenCode says oc-b's 5h window is spent (its rounded percent may read low): oc-a first.
 	apply("oc-b", 24*time.Hour, 99, "rejected")
 	if got := pick(); got != "oc-a" {
