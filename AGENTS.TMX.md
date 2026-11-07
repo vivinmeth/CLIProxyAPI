@@ -77,8 +77,8 @@ working:
   `quota_signals.go`); the quota service records them as their own windows (`image_1d`) from the
   response headers on usage records (`internal/tmx/quota/imagegen.go`, a usage plugin; never fed
   to routing). Image request details: `usage.Record.Image` (`sdk/cliproxy/usage/tmx_image_detail.go`),
-  set through `UsageReporter.SetImageDetail` (`helps/image_detail_tmx.go`; hooks in
-  `codex_openai_images.go` direct paths and `publishCodexImageToolUsage`), stored as
+  set through `UsageReporter.SetImageDetail` (`helps/image_detail_tmx.go`; hooks in the direct
+  `/images` paths of `codex_openai_images.go`), stored as
   `tmx.requests.image_detail` (JSONB, NULL on other rows). Harness `tmx-image` in
   `requestlog/harness.go`. `../wiki/image-generation.md`.
 - **Durable spool** (`internal/tmx/spool/`, registry `internal/tmx/durability/`): writers that

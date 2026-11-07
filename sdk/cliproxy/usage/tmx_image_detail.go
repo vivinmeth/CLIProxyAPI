@@ -5,7 +5,7 @@ package usage
 // Requested fields are as sent upstream and empty when the client left them out; returned
 // fields describe the first image, ReturnedCount all of them.
 type ImageDetail struct {
-	Operation           string `json:"op"` // generate | edit (auto when a Responses tool leaves it open)
+	Operation           string `json:"op"` // generate | edit
 	RequestedSize       string `json:"requested_size,omitempty"`
 	RequestedQuality    string `json:"requested_quality,omitempty"`
 	RequestedBackground string `json:"requested_background,omitempty"`

@@ -150,37 +150,6 @@ func (o *ImageStreamObserver) observeLine(line []byte) bool {
 	return true
 }
 
-// ImageToolDetail reads an image_generation tool call from a Responses request body and its
-// response.completed event: the tool's options as requested, its image_generation_call outputs
-// as returned. Nil when the body declares no such tool.
-func ImageToolDetail(body, completed []byte) *usage.ImageDetail {
-	var tool gjson.Result
-	for _, t := range gjson.GetBytes(body, "tools").Array() {
-		if t.Get("type").String() == "image_generation" {
-			tool = t
-			break
-		}
-	}
-	if !tool.Exists() {
-		return nil
-	}
-	d := &usage.ImageDetail{Operation: firstImageString(imageString(tool, "action"), "auto")}
-	d.RequestedSize = imageString(tool, "size")
-	d.RequestedQuality = imageString(tool, "quality")
-	d.RequestedBackground = imageString(tool, "background")
-	d.RequestedFormat = imageString(tool, "output_format")
-	for _, item := range gjson.GetBytes(completed, "response.output").Array() {
-		if item.Get("type").String() != "image_generation_call" {
-			continue
-		}
-		d.ReturnedCount++
-		if d.ReturnedCount == 1 {
-			setReturned(d, item)
-		}
-	}
-	return d
-}
-
 func setReturned(d *usage.ImageDetail, node gjson.Result) {
 	d.ReturnedSize = imageString(node, "size")
 	d.ReturnedQuality = imageString(node, "quality")
@@ -194,13 +163,4 @@ func imageString(node gjson.Result, path string) string {
 		return ""
 	}
 	return strings.TrimSpace(v.String())
-}
-
-func firstImageString(values ...string) string {
-	for _, v := range values {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }

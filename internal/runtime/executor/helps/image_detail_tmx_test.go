@@ -47,22 +47,6 @@ func TestImageStreamObserverAcrossChunks(t *testing.T) {
 	}
 }
 
-func TestImageToolDetail(t *testing.T) {
-	body := []byte(`{"model":"gpt-5.4-mini","tools":[{"type":"web_search"},{"type":"image_generation","action":"edit","size":"1024x1024","quality":"high","output_format":"png"}]}`)
-	completed := []byte(`{"type":"response.completed","response":{"output":[{"type":"message"},{"type":"image_generation_call","result":"AAAA","size":"1024x1024","quality":"medium","background":"opaque","output_format":"png"}]}}`)
-	d := ImageToolDetail(body, completed)
-	if d == nil || d.Operation != "edit" || d.RequestedSize != "1024x1024" || d.RequestedQuality != "high" ||
-		d.ReturnedCount != 1 || d.ReturnedQuality != "medium" || d.ReturnedBackground != "opaque" {
-		t.Fatalf("tool detail = %+v", d)
-	}
-	if ImageToolDetail([]byte(`{"tools":[{"type":"web_search"}]}`), completed) != nil {
-		t.Fatal("no image tool must give nil")
-	}
-	if d := ImageToolDetail([]byte(`{"tools":[{"type":"image_generation"}]}`), []byte(`{}`)); d.Operation != "auto" || d.ReturnedCount != 0 {
-		t.Fatalf("open tool = %+v", d)
-	}
-}
-
 func TestReporterCarriesImageDetail(t *testing.T) {
 	r := &UsageReporter{model: "gpt-5.4-mini"}
 	main := r.buildRecord(usage.Detail{InputTokens: 5}, false)
