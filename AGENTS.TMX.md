@@ -68,6 +68,13 @@ working:
   per-account allowance readings (`tmx.opencode_quota`, `/tmx/opencode/quota`); OpenCode's usage API polled
   per account (`internal/tmx/quota/opencode.go`, routing signals `X-Tmx-Quota-*` in
   `tmx_quota_signals.go` / `tmx_reset_ranking.go`). `../wiki/opencode.md`.
+- **Image generation / Codex ChatGPT mode** (`internal/tmx/codexchatgpt/`): answers Codex's
+  ChatGPT-backend calls when it runs with a synthetic ChatGPT login (analytics, empty connectors MCP
+  at `/backend-api/ps/mcp`, refresh stub `/backend-api/tmx/oauth/token`); routes in
+  `internal/api/server_tmx_codexchatgpt.go` (hook in `server_routes.go`), archive skip
+  `middleware.TMXSkipCapture`. Image-limit quota headers (`X-Codex-Active-Limit: imagegen*`) are kept
+  out of the credential's coding windows: `sdk/cliproxy/auth/tmx_quota_imagegen.go` (hook in
+  `quota_signals.go`). Harness `tmx-image` in `requestlog/harness.go`. `../wiki/image-generation.md`.
 - **Durable spool** (`internal/tmx/spool/`, registry `internal/tmx/durability/`): writers that
   can't reach Postgres append to an fsynced spool under `<archive spool volume>/durable/<writer>`
   and replay; refused items go to `deadletter/`. `GET /v8/management/tmx/durability`. New writers
