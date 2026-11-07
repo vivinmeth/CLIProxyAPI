@@ -74,7 +74,13 @@ working:
   `internal/api/server_tmx_codexchatgpt.go` (hook in `server_routes.go`), archive skip
   `middleware.TMXSkipCapture`. Image-limit quota headers (`X-Codex-Active-Limit: imagegen*`) are kept
   out of the credential's coding windows: `sdk/cliproxy/auth/tmx_quota_imagegen.go` (hook in
-  `quota_signals.go`). Harness `tmx-image` in `requestlog/harness.go`. `../wiki/image-generation.md`.
+  `quota_signals.go`); the quota service records them as their own windows (`image_1d`) from the
+  response headers on usage records (`internal/tmx/quota/imagegen.go`, a usage plugin; never fed
+  to routing). Image request details: `usage.Record.Image` (`sdk/cliproxy/usage/tmx_image_detail.go`),
+  set through `UsageReporter.SetImageDetail` (`helps/image_detail_tmx.go`; hooks in
+  `codex_openai_images.go` direct paths and `publishCodexImageToolUsage`), stored as
+  `tmx.requests.image_detail` (JSONB, NULL on other rows). Harness `tmx-image` in
+  `requestlog/harness.go`. `../wiki/image-generation.md`.
 - **Durable spool** (`internal/tmx/spool/`, registry `internal/tmx/durability/`): writers that
   can't reach Postgres append to an fsynced spool under `<archive spool volume>/durable/<writer>`
   and replay; refused items go to `deadletter/`. `GET /v8/management/tmx/durability`. New writers
