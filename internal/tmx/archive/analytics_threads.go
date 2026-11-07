@@ -137,7 +137,10 @@ var threadViewsSQL = []string{
 				-- a shell command that reads; one that writes (redirect, tee, cp, mv, sed -i, heredoc)
 				-- creates or edits the skill
 				OR (lower(i.name) IN ('bash', 'shell', 'exec', 'js', 'exec_command', 'local_shell_call', 'run_terminal_cmd')
-					AND i.data::text !~ '(>|\mtee\M|\mcp\M|\mmv\M|\minstall\M|sed -i|<<)'))
+					-- JavaScript arrows and comparisons in Codex wrappers are not shell redirects.
+					AND (CASE WHEN lower(i.name) IN ('exec', 'js')
+						THEN regexp_replace(i.data::text, '=>|>=', '', 'g') ELSE i.data::text END)
+						!~ '(>|\mtee\M|\mcp\M|\mmv\M|\minstall\M|sed -i|<<)'))
 	) x JOIN sessions s ON s.id = x.session_id
 	WHERE s.shadowed_by IS NULL AND x.skill ~ '^[A-Za-z0-9][A-Za-z0-9._:-]*$'`,
 }

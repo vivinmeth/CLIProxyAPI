@@ -18,8 +18,11 @@ func TestCodexSkillsAndThreadContext(t *testing.T) {
 		`{"type":"custom_tool_call","name":"exec","input":"const r = await tools.exec_command({cmd: 'cat /h/skills/full-send/SKILL.md'}); text(r);"}`,
 		`{"type":"custom_tool_call","name":"js","input":"await tools.exec_command({cmd: 'cat /h/skills/go/SKILL.md'})"}`,
 		`{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cat /h/skills/environ/SKILL.md\"}"}`,
+		`{"type":"custom_tool_call","name":"exec","input":"await Promise.all(paths.map(p => tools.exec_command({cmd: 'cat /h/skills/pr-reviewer/SKILL.md'})))"}`,
+		`{"type":"custom_tool_call","name":"js","input":"if (Date.now() >= 0) text(await tools.exec_command({cmd: 'cat /h/skills/full-stop/SKILL.md'}))"}`,
 		`{"type":"custom_tool_call","name":"exec","input":"await tools.exec_command({cmd: 'cat > /h/skills/created/SKILL.md'})"}`,
 		`{"type":"custom_tool_call","name":"js","input":"await tools.exec_command({cmd: 'tee /h/skills/edited/SKILL.md'})"}`,
+		`{"type":"custom_tool_call","name":"exec","input":"await Promise.all(paths.map(p => tools.exec_command({cmd: 'cat > /h/skills/arrow-write/SKILL.md'})))"}`,
 	}
 	var msgs []MessageIngest
 	for i, body := range bodies {
@@ -36,8 +39,8 @@ func TestCodexSkillsAndThreadContext(t *testing.T) {
 	drain(t, an)
 	if n := count(t, an, `SELECT count(*) FROM skill_invocations k JOIN sessions s ON s.id=k.session_id
 		JOIN session_threads st ON st.session_id=s.id JOIN threads t ON t.id=st.thread_id
-		WHERE t.id='t3:skill-thread' AND s.harness='codex' AND k.via='file'`); n != 3 {
-		t.Fatalf("Codex skills linked to thread = %d, want 3", n)
+		WHERE t.id='t3:skill-thread' AND s.harness='codex' AND k.via='file'`); n != 5 {
+		t.Fatalf("Codex skills linked to thread = %d, want 5", n)
 	}
 	var prompt, reasoning string
 	if err := an.db.QueryRow(`SELECT u.text, r.text FROM skill_invocations k
