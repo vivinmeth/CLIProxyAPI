@@ -244,7 +244,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 
 		asset, remoteHash, err := fetchLatestAsset(ctx, client, releaseURL)
 		if err != nil {
-			if localFileMissing {
+			if localFileMissing && tmxUpstreamFallbackAllowed(panelRepository) { // tmx
 				log.WithError(err).Warn("failed to fetch latest management release information, trying fallback page")
 				if ensureFallbackManagementHTML(ctx, client, localPath) {
 					return nil, nil
@@ -260,9 +260,9 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			return nil, nil
 		}
 
-		data, downloadedHash, err := downloadAsset(ctx, client, asset.BrowserDownloadURL)
+		data, downloadedHash, err := tmxDownloadAsset(ctx, client, asset.BrowserDownloadURL) // tmx
 		if err != nil {
-			if localFileMissing {
+			if localFileMissing && tmxUpstreamFallbackAllowed(panelRepository) { // tmx
 				log.WithError(err).Warn("failed to download management asset, trying fallback page")
 				if ensureFallbackManagementHTML(ctx, client, localPath) {
 					return nil, nil

@@ -85,6 +85,10 @@ working:
   can't reach Postgres append to an fsynced spool under `<archive spool volume>/durable/<writer>`
   and replay; refused items go to `deadletter/`. `GET /v8/management/tmx/durability`. New writers
   call `durability.Register(name, fn)`. `../wiki/durability-spool.md`.
+- **Panel updater** (`internal/managementasset/updater_tmx.go`, two `// tmx` hooks in `updater.go`):
+  the `cpamc.router-for.me` fallback runs only when `panel-github-repository` is upstream's, and
+  the release asset download gets a 2-minute timeout and 3 tries. Without it, a slow GitHub download
+  after a restart served upstream's panel instead of ours (2026-11-07). `../wiki/ui-ledger-and-releases.md`.
 
 ## Done
 
