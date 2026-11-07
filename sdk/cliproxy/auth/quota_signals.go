@@ -34,6 +34,7 @@ func (q *QuotaState) ObserveResponseHeadersForProvider(provider string, headers 
 		return q.tmxClearUnpolledSignals(provider) // tmx: keeps polled OpenCode windows
 	}
 	next := collectQuotaSignals(provider, headers)
+	next = tmxDropImageLimitWindows(provider, next) // tmx: tmx_quota_imagegen.go
 	if len(next) == 0 {
 		return false
 	}
