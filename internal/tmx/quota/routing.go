@@ -11,7 +11,7 @@ func (s *Service) applyRouting(id, provider string, windows []Window, at time.Ti
 	}
 	observations := make([]coreauth.QuotaWindowObservation, 0, len(windows))
 	for _, w := range windows {
-		if w.ResetsAt == nil {
+		if w.ResetsAt == nil || IsImageWindow(w.Window) { // image limits never feed routing
 			continue
 		}
 		observations = append(observations, coreauth.QuotaWindowObservation{Window: w.Window, UsedPercent: w.UsedPct, ResetsAt: *w.ResetsAt, Status: w.Status, ObservedAt: at})

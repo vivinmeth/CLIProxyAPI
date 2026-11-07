@@ -24,6 +24,7 @@ func (s *Service) FlushPassiveContext(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
+	s.recordImageLimits(ctx)
 	for _, a := range s.fetch.TmxAuths() {
 		spec, _, ok := specFor(a)
 		if !ok || a.Quota.ObservedAt.IsZero() {

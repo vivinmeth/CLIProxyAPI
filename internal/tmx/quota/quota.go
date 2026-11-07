@@ -245,6 +245,9 @@ type Service struct {
 	accounts map[string]*account
 
 	oc *opencode.Store // OpenCode Go settings and readings (opencode.go); nil when unavailable
+
+	imageMu      sync.Mutex
+	imagePending []imageReading // Codex image-limit readings for the next tick (imagegen.go)
 }
 
 var (
@@ -473,6 +476,7 @@ func (s *Service) tick(ctx context.Context) {
 		}
 	}
 	s.tickOpenCode(ctx, now, seen, auths)
+	s.recordImageLimits(ctx)
 }
 
 // passiveFresh: the headers were observed within one poll interval, carry at least one window,
@@ -511,7 +515,8 @@ func (s *Service) pollDueLocked(a *account, passiveWindows []Window, fresh bool,
 		covered[w.Window] = true
 	}
 	for name, cur := range a.current {
-		if !covered[name] && cur.ResetsAt != nil && !cur.ResetsAt.After(now) {
+		// Image limits come only from image responses (imagegen.go); a poll can't refresh them.
+		if !covered[name] && !IsImageWindow(name) && cur.ResetsAt != nil && !cur.ResetsAt.After(now) {
 			return true
 		}
 	}
