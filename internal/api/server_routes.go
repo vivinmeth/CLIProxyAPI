@@ -128,6 +128,7 @@ func (s *Server) setupRoutes() {
 		codexDirect.POST("/responses/compact", openaiResponsesHandlers.Compact)
 		codexDirect.POST("/alpha/search", s.codexAlphaSearch)
 	}
+	s.registerTMXCodexChatGPTRoutes() // tmx: server_tmx_codexchatgpt.go
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")

@@ -21,6 +21,15 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+const tmxSkipCaptureKey = "tmx.capture.skip"
+
+// TMXSkipCapture marks a route's exchanges as not archived: for endpoints the proxy answers
+// itself that carry no model traffic (Codex analytics and MCP stubs, internal/tmx/codexchatgpt).
+func TMXSkipCapture(c *gin.Context) {
+	c.Set(tmxSkipCaptureKey, true)
+	c.Next()
+}
+
 type tmxCapture struct {
 	group      *capture.Group
 	body       *capture.Body
@@ -114,7 +123,7 @@ func (w *ResponseWriterWrapper) tmxDiscard() {
 // tmxSubmit hands the finished exchange to the archive. It runs at the start of Finalize, while
 // the gin context and every spooled source are still available, and copies what it needs.
 func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
-	if c == nil || !capture.Enabled() || w.requestInfo == nil {
+	if c == nil || !capture.Enabled() || w.requestInfo == nil || c.GetBool(tmxSkipCaptureKey) {
 		if w.tmx != nil {
 			w.tmx.body.Release()
 			w.tmx.chunks.Release()

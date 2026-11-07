@@ -43,7 +43,7 @@ func HarnessFor(source, userAgent string) (harness, clientMode string) {
 		// Codex under another originator, e.g. T3's "T3 Code/0.166.0 (Ubuntu 24.4.0; x86_64) …".
 		return "codex", ""
 	case name == "opencode", name == "cursor", name == "aider", name == "nanx-app", name == "nanx-cli",
-		name == "gemini-cli", name == "pi":
+		name == "gemini-cli", name == "pi", name == "tmx-image": // tmx-image: scripts/tmx-image (wiki/image-generation.md)
 		return name, ""
 	case name == "curl", name == "python-requests", strings.HasPrefix(name, "python-httpx"),
 		strings.HasPrefix(name, "node-fetch"), name == "axios", name == "go-http-client":

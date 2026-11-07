@@ -15,6 +15,7 @@ func TestHarnessFor(t *testing.T) {
 		{"tmx-proxy", "muse-build/1.4.11 (non-interactive; macos-aarch64; build abc)", "muse-code", "exec"},
 		{"tmx-proxy", "muse-build/1.4.11 (interactive; macos-aarch64; build abc)", "muse-code", "tui"},
 		{"tmx-proxy", "curl/8.7.1", "script", ""},
+		{"tmx-proxy", "tmx-image/1 (claude-code)", "tmx-image", ""},
 		{"tmx-proxy", "SomethingElse/1", "other", ""},
 		{"tmx-proxy", "", "", ""},
 		{"extern:opencode", "opencode/1.2.3", "opencode", ""},
