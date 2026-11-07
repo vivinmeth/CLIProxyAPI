@@ -189,6 +189,12 @@ func (an *analytics) refreshLinks(force bool) {
 		return
 	}
 	start := time.Now()
+	// Capture can be extracted before the request log is flushed. Retry attribution after
+	// request rows arrive, and at startup for sessions extracted by earlier versions.
+	if err := an.refreshProxyAttribution(); err != nil {
+		an.setErr(fmt.Errorf("refresh proxy attribution: %w", err))
+		return // keep the dirty refs so the next refresh retries
+	}
 	var err error
 	if d.full {
 		_, err = an.db.ExecContext(an.ctx, linkUpsert(`SELECT id FROM requests UNION SELECT request_id FROM request_sessions`))
@@ -202,6 +208,25 @@ func (an *analytics) refreshLinks(force bool) {
 	full := d.full
 	d.reset()
 	log.Debugf("tmx analytics: request_sessions updated (full=%v) in %s", full, time.Since(start).Round(time.Millisecond))
+}
+
+// Only fill missing labels, using the exact captured trace. Retries may produce several
+// request rows: conflicting labels remain unknown rather than guessing a harness or machine.
+func (an *analytics) refreshProxyAttribution() error {
+	_, err := an.db.ExecContext(an.ctx, `WITH labels AS (
+		SELECT s.id, r.harness, r.machine FROM sessions s
+		CROSS JOIN LATERAL (
+			SELECT CASE WHEN count(DISTINCT NULLIF(r.harness, '')) = 1 THEN min(NULLIF(r.harness, '')) END AS harness,
+				CASE WHEN count(DISTINCT NULLIF(r.machine, '')) = 1 THEN min(NULLIF(r.machine, '')) END AS machine
+			FROM requests r WHERE r.trace_id = s.trace_id AND r.trace_id <> ''
+		) r
+		WHERE s.kind = 'proxy' AND s.trace_id <> '' AND (s.harness = '' OR s.machine = '')
+	)
+	UPDATE sessions s SET harness = COALESCE(NULLIF(s.harness, ''), l.harness, ''),
+		machine = COALESCE(NULLIF(s.machine, ''), l.machine, '')
+	FROM labels l WHERE s.id = l.id
+		AND ((s.harness = '' AND l.harness IS NOT NULL) OR (s.machine = '' AND l.machine IS NOT NULL))`)
+	return err
 }
 
 // updateLinks rewrites the links the changes in d can move. The affected requests are looked up

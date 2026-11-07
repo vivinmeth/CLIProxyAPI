@@ -88,6 +88,10 @@ var threadSchemaSQL = []string{
 
 // threadViewsSQL don't need the requests mirror; thread_usage (in analyticsViewsSQL) does.
 var threadViewsSQL = []string{
+	// Tool search inserts this notice as user text; it is not a user request.
+	`CREATE VIEW user_prompts AS SELECT * FROM items
+		WHERE role = 'user' AND kind = 'text' AND btrim(text) <> ''
+			AND btrim(text) !~ '^Tool loaded[.](\s|$)'`,
 	// Subagent sessions are imported as "<parent>:<agent>": their parent session.
 	`CREATE VIEW session_tree AS
 	SELECT s.id AS session_id, p.id AS parent_session_id
@@ -132,7 +136,7 @@ var threadViewsSQL = []string{
 			AND (lower(i.name) IN ('read', 'read_file', 'view')
 				-- a shell command that reads; one that writes (redirect, tee, cp, mv, sed -i, heredoc)
 				-- creates or edits the skill
-				OR (lower(i.name) IN ('bash', 'shell', 'exec_command', 'local_shell_call', 'run_terminal_cmd')
+				OR (lower(i.name) IN ('bash', 'shell', 'exec', 'js', 'exec_command', 'local_shell_call', 'run_terminal_cmd')
 					AND i.data::text !~ '(>|\mtee\M|\mcp\M|\mmv\M|\minstall\M|sed -i|<<)'))
 	) x JOIN sessions s ON s.id = x.session_id
 	WHERE s.shadowed_by IS NULL AND x.skill ~ '^[A-Za-z0-9][A-Za-z0-9._:-]*$'`,

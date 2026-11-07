@@ -296,7 +296,7 @@ func (an *analytics) ensureViews(ctx context.Context) error {
 	defer func() { _ = tx.Rollback() }()
 	// Dependents first: thread_usage reads session_usage.
 	stmts := append([]string{`DROP VIEW IF EXISTS pr_outcomes, pr_tasks, pr_sessions, pr_threads, pr_commit_links,
-		tasks, commit_tasks, session_tasks, thread_roots, thread_usage, skill_invocations, session_threads, session_tree`},
+		tasks, commit_tasks, session_tasks, thread_roots, thread_usage, skill_invocations, user_prompts, session_threads, session_tree`},
 		threadSchemaSQL...)
 	stmts = append(stmts, commitSchemaSQL...)
 	stmts = append(stmts, prSchemaSQL...)
