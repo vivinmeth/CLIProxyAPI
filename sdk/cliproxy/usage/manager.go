@@ -78,6 +78,8 @@ type Record struct {
 	Detail      Detail
 	// ResponseHeaders stores a snapshot of upstream response headers for usage sinks.
 	ResponseHeaders http.Header
+	// Image is set on image generation and edit records (tmx: tmx_image_detail.go).
+	Image *ImageDetail
 }
 
 // FailureStreamTruncatedCode marks a locally synthesized failure for an

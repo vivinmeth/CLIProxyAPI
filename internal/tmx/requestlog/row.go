@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -118,8 +119,13 @@ type Row struct {
 	// RowKey identifies a proxied row across write retries (unique; empty for imported rows).
 	RowKey string `json:"row_key,omitempty"`
 
+	// ImageDetail: what an image generation or edit asked for and got back (image_detail
+	// JSONB column); nil (NULL) on every other row.
+	ImageDetail *coreusage.ImageDetail `json:"image_detail,omitempty"`
+
 	importRefPtr *string // scan/insert target for the nullable import_ref column
 	rowKeyPtr    *string // ... and row_key
+	imageRaw     []byte  // ... and image_detail
 }
 
 // syncImportRef maps ImportRef to the nullable column (empty = NULL, so the unique index only
@@ -132,6 +138,10 @@ func (r *Row) syncImportRef() {
 	if r.RowKey != "" {
 		key := r.RowKey
 		r.rowKeyPtr = &key
+	}
+	r.imageRaw = nil
+	if r.ImageDetail != nil {
+		r.imageRaw, _ = json.Marshal(r.ImageDetail)
 	}
 	if r.ImportRef == "" {
 		r.importRefPtr = nil
@@ -147,6 +157,13 @@ func (r *Row) loadImportRef() {
 	}
 	if r.rowKeyPtr != nil {
 		r.RowKey = *r.rowKeyPtr
+	}
+	r.ImageDetail = nil
+	if len(r.imageRaw) > 0 {
+		var d coreusage.ImageDetail
+		if json.Unmarshal(r.imageRaw, &d) == nil {
+			r.ImageDetail = &d
+		}
 	}
 }
 
@@ -384,6 +401,7 @@ func rowFromRecord(ctx context.Context, record coreusage.Record) Row {
 		ServiceTier:     tier,
 		CacheWrite1h:    detail.CacheWrite1hTokens,
 		Speed:           strings.TrimSpace(detail.ResponseSpeed),
+		ImageDetail:     record.Image.Clone(),
 	}
 	// Muse's x-client-id ("tbh:<surface>") names the harness even when the user agent doesn't.
 	if muse.IsClient(meta.UserAgent, meta.ClientID) {

@@ -364,6 +364,8 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 	if errPrepare != nil {
 		return resp, errPrepare
 	}
+	image := helps.ImageRequestDetail(helps.ImageOperation(endpointPath), body) // tmx
+	reporter.SetImageDetail(image)                                              // tmx
 	httpReq.Body = io.NopCloser(bytes.NewReader(body))
 	httpReq.ContentLength = int64(len(body))
 	httpReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
@@ -405,6 +407,8 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 		return resp, err
 	}
 
+	helps.ObserveImagesResponse(image, data) // tmx
+	reporter.SetImageDetail(image)           // tmx
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
 	reporter.EnsurePublished(ctx)
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
@@ -436,6 +440,8 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 	if errPrepare != nil {
 		return nil, errPrepare
 	}
+	imageStream := &helps.ImageStreamObserver{Detail: helps.ImageRequestDetail(helps.ImageOperation(endpointPath), body)} // tmx
+	reporter.SetImageDetail(imageStream.Detail)                                                                           // tmx
 	httpReq.Body = io.NopCloser(bytes.NewReader(body))
 	httpReq.ContentLength = int64(len(body))
 	httpReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
@@ -494,6 +500,9 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 				helps.AppendAPIResponseChunk(ctx, e.cfg, chunk)
 				for _, line := range bytes.Split(chunk, []byte("\n")) {
 					streamUsage.ObserveOpenAIStream(bytes.TrimSpace(line))
+				}
+				if imageStream.Write(chunk) { // tmx
+					reporter.SetImageDetail(imageStream.Detail)
 				}
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:

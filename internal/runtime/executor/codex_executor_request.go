@@ -732,6 +732,7 @@ func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReport
 		return
 	}
 	reporter.EnsurePublished(ctx)
+	reporter.SetImageDetail(helps.ImageToolDetail(body, completedData)) // tmx: only the image record carries it
 	reporter.PublishAdditionalModel(ctx, codexImageGenerationToolModel(body), detail)
 }
 

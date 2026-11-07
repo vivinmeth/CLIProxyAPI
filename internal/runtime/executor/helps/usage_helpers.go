@@ -70,6 +70,8 @@ type UsageReporter struct {
 	// upstreamModel holds the canonical upstream model expected to be served when
 	// it differs from the requested model (e.g. local Kimi model mappings).
 	upstreamModel string
+
+	tmxImageState // tmx: image request detail (image_detail_tmx.go)
 }
 
 type usageExecutor interface {
@@ -712,6 +714,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		Failed:               failed,
 		Fail:                 fail,
 		Detail:               detail,
+		Image:                r.imageDetail(), // tmx
 	}
 }
 
