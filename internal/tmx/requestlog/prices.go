@@ -3,12 +3,12 @@ package requestlog
 // List-price cost per row (tokenmaxx fork). Every row is priced when its tokens are written, with
 // the catalog snapshot loaded at that moment, and keeps that cost: a later price change or a model
 // leaving the catalog never rewrites history. Snapshots of the models.dev catalog are kept in
-// <schema>.price_catalogs (fetched daily; the latest is loaded at start), so pricing works offline
+// <schema>.price_catalogs (fetched hourly; the latest is loaded at start), so pricing works offline
 // and every row's priced_at names the snapshot that priced it. Snapshots are never deleted; a
 // fetch identical to the latest stored one (same source and catalog) is not stored again.
 //
 // Rows written while no catalog is loaded stay NULL (price_source IS NULL) and are priced by the
-// hourly pass; rows of models the catalog doesn't know are "unpriced" and retried once a day. A
+// hourly pass; rows of models the catalog doesn't know are "unpriced" and retried after each fetch. A
 // retry only takes a list price: an "unpriced" row is never given an estimate (pricing.IsEstimate),
 // so an estimate added later prices new traffic only.
 
@@ -30,7 +30,7 @@ import (
 
 const (
 	pricesCatalogURL = "https://models.dev/api.json"
-	pricesFetchEvery = 24 * time.Hour
+	pricesFetchEvery = time.Hour
 	pricesPassEvery  = time.Hour
 	pricesBatch      = 2000
 )
@@ -70,7 +70,7 @@ func priceRow(r *Row, snap *priceSnapshot) {
 
 func (s *Store) priceSnap() *priceSnapshot { return s.prices.Load() }
 
-// pricesLoop loads the latest stored snapshot, refreshes it from models.dev once a day and prices
+// pricesLoop loads the latest stored snapshot, refreshes it from models.dev once an hour and prices
 // pending rows every hour.
 func (s *Store) pricesLoop() {
 	ctx := context.Background()

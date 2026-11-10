@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -199,6 +200,67 @@ func TestPriceCatalogsKeptAndDeduped(t *testing.T) {
 	c, ok := loaded.cat.Price(pricing.Usage{Provider: "claude", Model: "claude-opus-5-5", Uncached: 1_000_000})
 	if !ok || math.Abs(c.Total-36) > 1e-9 {
 		t.Fatalf("latest catalog price = %+v %v", c, ok)
+	}
+}
+
+// The hourly loop discovers a newly listed model from a stored catalog younger than a day,
+// retries unpriced history, and leaves rows that already have a price alone.
+func TestPricesLoopRefreshesNewModelHourly(t *testing.T) {
+	s, schema := openPricedStore(t)
+	ctx := context.Background()
+	var body atomic.Value
+	body.Store(`{"anthropic":{"models":{"claude-opus-5-5":{"cost":{"input":4,"output":20}}}}}`)
+	var fetches atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fetches.Add(1)
+		_, _ = w.Write([]byte(body.Load().(string)))
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("TMX_PRICES_CATALOG_URL", srv.URL)
+	old, err := s.fetchSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Microsecond)
+	if _, err = s.db.Exec(`UPDATE `+schema+`.price_catalogs SET fetched_at = $1`, oldAt); err != nil {
+		t.Fatal(err)
+	}
+	old.fetchedAt, old.checkedAt = oldAt, oldAt
+	s.prices.Store(old)
+	s.write([]Row{
+		{TS: time.Now(), TraceID: "new-model", Provider: "claude", Model: "claude-fable-5-2", Outcome: OutcomeSuccess,
+			UncachedInput: 1_000_000, CacheRead: 1_000_000, CacheWrite: 1_000_000, OutputNonReasoning: 1_000_000},
+		{TS: time.Now(), TraceID: "priced", Provider: "claude", Model: "claude-opus-5-5", Outcome: OutcomeSuccess, UncachedInput: 1_000_000},
+	})
+	if cost, _, src := costOf(t, s, `trace_id = 'new-model'`); cost != nil || src != "unpriced" {
+		t.Fatalf("before listing: cost=%v source=%q", cost, src)
+	}
+	body.Store(`{"anthropic":{"models":{"claude-opus-5-5":{"cost":{"input":10,"output":50}},"claude-fable-5-2":{"cost":{"input":8,"output":40,"cache_read":0.2,"cache_write":10}}}}}`)
+	t.Setenv("TMX_PRICES", "on")
+	// A closed stop channel lets the real loop run its startup pass without an hourly wait.
+	loop := &Store{db: s.db, schema: schema, stopPrices: make(chan struct{})}
+	close(loop.stopPrices)
+	loop.pricesLoop()
+	if got := fetches.Load(); got != 2 {
+		t.Fatalf("catalog fetched %d times, want initial fetch plus hourly refresh", got)
+	}
+	if cost, as, src := costOf(t, s, `trace_id = 'new-model'`); cost == nil || math.Abs(*cost-58.2) > 1e-9 || as != "anthropic/claude-fable-5-2" || src != "models.dev" {
+		t.Fatalf("after listing: cost=%v priced_as=%q source=%q", cost, as, src)
+	}
+	if cost, _, _ := costOf(t, s, `trace_id = 'priced'`); cost == nil || *cost != 4 {
+		t.Fatalf("already priced row changed: %v", cost)
+	}
+	var pricedAt time.Time
+	if err := s.db.QueryRow(`SELECT priced_at FROM ` + s.table() + ` WHERE trace_id = 'new-model'`).Scan(&pricedAt); err != nil {
+		t.Fatal(err)
+	}
+	if snap := loop.priceSnap(); !pricedAt.Equal(snap.fetchedAt) || !snap.fetchedAt.After(oldAt) {
+		t.Fatalf("row snapshot %s, catalog snapshot %s, old %s", pricedAt, snap.fetchedAt, oldAt)
+	}
+	// A restart with a fresh stored snapshot does not fetch again.
+	loop.pricesLoop()
+	if got := fetches.Load(); got != 2 {
+		t.Fatalf("fresh snapshot fetched again: %d requests", got)
 	}
 }
 
