@@ -782,8 +782,16 @@ func withClaudeAdvisorToolBeta(betas string) string {
 		}
 	}
 	insertAt := len(parts)
+	afterContextManagement := false
 	for index, beta := range parts {
-		if beta == claudeAdvancedToolUseBeta ||
+		if beta == "context-management-2025-06-27" {
+			afterContextManagement = true
+		}
+		// Claude Code 2.1.321 moved thinking-token-count behind the constant
+		// betas and sends advisor-tool ahead of it there; older helper profiles
+		// keep thinking-token-count early, ahead of context-management.
+		if (afterContextManagement && beta == claudeThinkingTokenCountBeta) ||
+			beta == claudeAdvancedToolUseBeta ||
 			beta == claudeEffortBeta ||
 			beta == claudeServerSideFallbackBeta ||
 			beta == claudeFallbackCreditBeta ||

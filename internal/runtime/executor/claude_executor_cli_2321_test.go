@@ -84,3 +84,11 @@ func TestComputeFingerprintMatchesClaudeCode2321Capture(t *testing.T) {
 		t.Fatalf("computeFingerprint() = %q, want 20d", got)
 	}
 }
+
+func TestWithClaudeAdvisorToolBetaKeepsClaudeCode2321Order(t *testing.T) {
+	in := "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24"
+	want := "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24"
+	if got := withClaudeAdvisorToolBeta(in); got != want {
+		t.Fatalf("withClaudeAdvisorToolBeta() =\n%s\nwant\n%s", got, want)
+	}
+}
