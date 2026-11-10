@@ -268,7 +268,7 @@ func metaString(auth *coreauth.Auth, key string) string {
 
 func claudeHeaders() map[string]string {
 	return map[string]string{
-		"User-Agent":     "claude-cli/2.1.280 (external, cli)",
+		"User-Agent":     quota.ClaudeCLIUserAgent,
 		"Authorization":  "Bearer $TOKEN$",
 		"Content-Type":   "application/json",
 		"Accept":         "application/json",

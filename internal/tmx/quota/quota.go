@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/durability"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/opencode"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/spool"
@@ -54,8 +55,12 @@ const (
 	claudeProfileURL = "https://api.anthropic.com/api/oauth/profile"
 )
 
+// ClaudeCLIUserAgent is the Claude Code user agent the executor presents, so the
+// quota and reset pollers move with the fingerprint baseline instead of keeping a copy.
+var ClaudeCLIUserAgent = "claude-cli/" + helps.DefaultClaudeVersion(nil) + " (external, cli)"
+
 var claudeHeaders = map[string]string{
-	"User-Agent":     "claude-cli/2.1.280 (external, cli)",
+	"User-Agent":     ClaudeCLIUserAgent,
 	"Authorization":  "Bearer $TOKEN$",
 	"Content-Type":   "application/json",
 	"Accept":         "application/json",
