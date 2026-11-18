@@ -155,6 +155,51 @@ func TestMetaExecutor_RefusesContributorModels(t *testing.T) {
 	}
 }
 
+func TestMetaExecutor_RefusesPayloadContributorOverride(t *testing.T) {
+	t.Setenv("TMX_META_CONTRIBUTOR", "")
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
+	defer server.Close()
+	exec := NewMetaExecutor(&config.Config{
+		Payload: config.PayloadConfig{Override: []config.PayloadRule{{
+			Models: []config.PayloadModelRule{{Name: "muse-wonder-1.0", Protocol: "meta"}},
+			Params: map[string]any{"model": "Muse-Wonder-1.0-Contributor(high)"},
+		}}},
+	})
+	auth := &cliproxyauth.Auth{Provider: "meta", Attributes: map[string]string{"api_key": "k", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{Model: "muse-wonder-1.0", Payload: []byte(`{"model":"muse-wonder-1.0","input":"hi"}`)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")}
+	_, errExec := exec.Execute(context.Background(), auth, req, opts)
+	_, errStream := exec.ExecuteStream(context.Background(), auth, req, opts)
+	_, errCount := exec.CountTokens(context.Background(), auth, req, opts)
+	for name, err := range map[string]error{"Execute": errExec, "ExecuteStream": errStream, "CountTokens": errCount} {
+		if !muse.IsContributorError(err) || !strings.Contains(err.Error(), "Muse-Wonder-1.0-Contributor(high)") {
+			t.Fatalf("%s: expected refusal of final payload model, got %v", name, err)
+		}
+		if scoped, ok := err.(interface{ IsRequestScoped() bool }); !ok || !scoped.IsRequestScoped() {
+			t.Fatalf("%s: refusal must be request-scoped: %T", name, err)
+		}
+		if status, ok := err.(interface{ StatusCode() int }); !ok || status.StatusCode() != http.StatusBadRequest {
+			t.Fatalf("%s: refusal must be HTTP 400: %T", name, err)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("payload override reached upstream %d times", hits)
+	}
+
+	// Explicit opt-in keeps the configured payload intact and enables its matching header.
+	t.Setenv("TMX_META_CONTRIBUTOR", "allow")
+	prepared, err := exec.prepareResponsesRequest(context.Background(), auth, req, opts, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headerReq := httptest.NewRequest(http.MethodPost, server.URL, nil)
+	applyMetaAPIHeaders(headerReq, auth, "k", true, nil, prepared.effectiveModel)
+	if got := headerReq.Header.Get("X-Tbh-Contributor-Mode"); got != "1" {
+		t.Fatalf("opted-in final model contributor header = %q, want 1", got)
+	}
+}
+
 // tmxSkipContributorModel skips upstream tests that send a contributor-mode model: this proxy
 // refuses them before anything reaches Meta (TestMetaExecutor_RefusesContributorModels).
 func tmxSkipContributorModel(t *testing.T, model string) {

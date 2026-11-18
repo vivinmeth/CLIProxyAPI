@@ -91,6 +91,9 @@ func (e *MetaExecutor) prepareResponsesRequest(ctx context.Context, auth *clipro
 	if effectiveModel == "" {
 		effectiveModel = baseModel
 	}
+	if errBlocked := muse.CheckUpstreamModel(effectiveModel); errBlocked != nil { // tmx: payload rules may select Contributor mode.
+		return nil, errBlocked
+	}
 	body = doc.Bytes()
 	return &metaPreparedRequest{
 		applyPatch:      applyPatch,
@@ -436,8 +439,7 @@ func applyMetaClientIdentity(req *http.Request) {
 }
 
 func isMetaContributorModel(model string) bool {
-	base := strings.TrimSpace(thinking.ParseSuffix(strings.TrimSpace(model)).ModelName)
-	return strings.HasSuffix(strings.ToLower(base), "-contributor")
+	return muse.IsContributorModel(model) // tmx: share the refusal and header model rule.
 }
 
 func applyMetaAPIHeaders(req *http.Request, auth *cliproxyauth.Auth, token string, stream bool, clientHeaders http.Header, model ...string) {
