@@ -141,7 +141,10 @@ func (m *Manager) tmxCooldownWindowsLocked(auth *Auth, now time.Time) []Cooldown
 }
 
 // tmxReportFailure reports a failed result; auth may be nil (stale results).
-func tmxReportFailure(result Result, auth *Auth) {
+func tmxReportFailure(result Result, auth *Auth, refusalTransition bool) {
+	if tmxTerminalRefusal(result.Error) && !refusalTransition {
+		return // Only the accepted disable transition becomes a refusal event.
+	}
 	o := currentCooldownObserver()
 	if o == nil || result.Success || result.AuthID == "" {
 		return

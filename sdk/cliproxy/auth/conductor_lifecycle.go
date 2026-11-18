@@ -209,6 +209,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	} else if m.cooldownDisabledForAuth(auth) {
 		cooldownStateChanged = clearDisabledCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
+	tmxRestoreAccountRefusal(auth) // tmx
 	auth.EnsureIndex()
 	m.mu.Lock()
 	if m.authEpochs == nil {
@@ -672,6 +673,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	} else if m.cooldownDisabledForAuth(auth) {
 		cooldownStateChanged = clearDisabledCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
+	tmxRestoreAccountRefusal(auth) // tmx
 	if existing.Metadata != nil {
 		if persistedHints, hasHints := existing.Metadata["antigravity_capability_hints"]; hasHints {
 			if auth.Metadata == nil {
@@ -936,6 +938,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if len(auth.ModelStates) > 0 {
 			updateAggregatedAvailability(auth, now)
 		}
+		tmxRestoreAccountRefusal(auth) // tmx
 		m.authEpochs[auth.ID] = max(m.authEpochs[auth.ID], auth.RegistrationEpoch) + 1
 		auth.RegistrationEpoch = m.authEpochs[auth.ID]
 		auth.Generation = 1

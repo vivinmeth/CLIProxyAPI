@@ -409,7 +409,7 @@ func (m *Manager) nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Du
 }
 
 func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time.Time, bool) {
-	if auth == nil {
+	if auth == nil || tmxAuthDisabled(auth) { // tmx
 		return time.Time{}, false
 	}
 	if hasUnauthorizedAuthFailure(auth) || hasDisabledInvalidGrantFailure(auth) {

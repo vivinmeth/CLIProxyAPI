@@ -420,8 +420,8 @@ func newAntigravityStatusErr(statusCode int, body []byte) statusErr {
 }
 
 // applyAntigravityTOSState performs the executor-side bookkeeping for a terminal
-// TOS_VIOLATION: it arms the optional pool-wide protective pause and logs the
-// appeal URL for the operator. The durable credential deactivation and the
+// TOS_VIOLATION: it arms the optional pool-wide protective pause. The durable
+// credential deactivation and the
 // appeal metadata on the auth record are carried by the returned statusErr
 // (tos_violation code + Error.Metadata) through the conductor, since the
 // executor only sees a cloned auth. It is a no-op for non-TOS errors.
@@ -431,11 +431,7 @@ func (e *AntigravityExecutor) applyAntigravityTOSState(cfg *config.Config, auth 
 		return
 	}
 	markAntigravityTOSPause(cfg, auth)
-	if violation.AppealURL != "" {
-		log.Warnf("antigravity executor: credential %s suspended for TOS_VIOLATION; submit appeal: %s (%s)", auth.ID, redactTOSAppealURL(violation.AppealURL), violation.AppealURLText)
-	} else {
-		log.Warnf("antigravity executor: credential %s suspended for TOS_VIOLATION", auth.ID)
-	}
+	// tmx: the conductor logs once when it accepts the disable transition.
 }
 func (e *AntigravityExecutor) maybeRefreshAntigravityCreditsHint(ctx context.Context, auth *cliproxyauth.Auth, accessToken string) {
 	if e == nil || auth == nil || !antigravityCreditsRetryEnabled(e.cfg) || antigravityCoolingDisabled(auth, e.cfg) {

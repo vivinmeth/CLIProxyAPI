@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/base64"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
@@ -57,13 +57,13 @@ type oauthStatusError struct {
 func (e oauthStatusError) Error() string   { return fmt.Sprintf("status %d: %s", e.code, e.msg) }
 func (e oauthStatusError) StatusCode() int { return e.code }
 
-func TestRefreshAuthForRequest_NormalDisabledAuth_RefreshesTokenSuccessfully(t *testing.T) {
+func TestRefreshAuthForRequest_NormalDisabledAuth_DoesNotRefresh(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	executor := &mockOAuthErrorExecutor{id: "test-provider"}
 	manager.RegisterExecutor(executor)
 
-	// Normal disabled auth without invalid_grant should refresh tokens normally (expected behavior)
+	// tmx: disabling also stops token refresh until the operator re-enables it.
 	auth := &Auth{
 		ID:       "normal-disabled-auth",
 		Provider: "test-provider",
@@ -78,15 +78,11 @@ func TestRefreshAuthForRequest_NormalDisabledAuth_RefreshesTokenSuccessfully(t *
 		t.Fatalf("Register error: %v", err)
 	}
 
-	refreshed, errRefresh := manager.refreshAuthForRequest(ctx, auth.ID, "")
-	if errRefresh != nil {
-		t.Fatalf("expected successful refresh for normal disabled auth, got error: %v", errRefresh)
+	if _, errRefresh := manager.refreshAuthForRequest(ctx, auth.ID, ""); errRefresh == nil {
+		t.Fatal("expected disabled auth to reject refresh")
 	}
-	if executor.refreshCalls.Load() != 1 {
-		t.Fatalf("executor.Refresh called %d times, want 1 for normal disabled auth", executor.refreshCalls.Load())
-	}
-	if refreshed.Metadata["access_token"] != "new-valid-token" {
-		t.Fatalf("refreshed token = %v, want new-valid-token", refreshed.Metadata["access_token"])
+	if executor.refreshCalls.Load() != 0 {
+		t.Fatalf("executor.Refresh called %d times, want 0", executor.refreshCalls.Load())
 	}
 }
 
@@ -431,12 +427,12 @@ func TestDisabledCodexRejectedRefreshTokenDoesNotSpin(t *testing.T) {
 		FileName: "codex-disabled.json",
 		Provider: "codex",
 		Status:   StatusActive,
-		Disabled: true,
+		Disabled: false,
 		Metadata: map[string]any{
 			"type":          "codex",
 			"access_token":  accessToken,
 			"refresh_token": "rt",
-			"disabled":      true,
+			"disabled":      false,
 		},
 	}
 	ex := &unauthorizedRefreshExecutor{
@@ -451,14 +447,16 @@ func TestDisabledCodexRejectedRefreshTokenDoesNotSpin(t *testing.T) {
 		t.Fatalf("Register error: %v", errReg)
 	}
 
-	// 1. First refresh attempt fails terminally; NextRefreshAfter must be deferred to exp (not 5m backoff).
+	// 1. An enabled credential may settle a terminal refresh rejection before it is disabled.
 	m.refreshAuth(ctx, a.ID)
 	got, _ := m.GetByID(a.ID)
 	if got == nil {
 		t.Fatal("auth not found after refreshAuth")
 	}
-	if !got.Disabled || got.Status != StatusDisabled || !got.Unavailable {
-		t.Fatalf("status = %s disabled=%v unavailable=%v, want disabled/unavailable", got.Status, got.Disabled, got.Unavailable)
+	got.Disabled = true
+	got.Status = StatusDisabled
+	if _, err := m.Update(ctx, got); err != nil {
+		t.Fatal(err)
 	}
 	if !got.RequiresSignIn || got.RejectedRefreshToken != "rt" {
 		t.Fatalf("RequiresSignIn=%v RejectedRefreshToken=%q, want true / \"rt\"", got.RequiresSignIn, got.RejectedRefreshToken)
@@ -467,32 +465,19 @@ func TestDisabledCodexRejectedRefreshTokenDoesNotSpin(t *testing.T) {
 		t.Fatalf("NextRefreshAfter = %v, want access token expiry %v", got.NextRefreshAfter, exp)
 	}
 
-	// 2. Even if NextRefreshAfter has elapsed while the access token is still valid inside the 96h lead window,
-	// a refresh job must restore NextRefreshAfter=exp and the scheduler must not spin or re-trigger before exp.
+	// 2. A disabled credential cannot enqueue a refresh, even with an elapsed deadline.
 	m.mu.Lock()
 	m.auths[a.ID].NextRefreshAfter = now.Add(-time.Second)
 	epoch := m.auths[a.ID].RegistrationEpoch
 	m.mu.Unlock()
-
-	job := m.markRefreshPending(nil, a.ID, epoch, now)
-	if job == nil {
-		t.Fatal("expected markRefreshPending to create job when NextRefreshAfter is in the past")
-	}
-	if !m.beginRefreshJob(ctx, job) {
-		t.Fatal("expected beginRefreshJob to succeed")
-	}
-	_, _ = m.refreshAuthForRequestAtEpoch(ctx, a.ID, "", epoch)
-	m.finishRefreshJob(job, time.Time{}, false)
-
-	afterJob, _ := m.GetByID(a.ID)
-	if !afterJob.NextRefreshAfter.Equal(exp) {
-		t.Fatalf("after job completion NextRefreshAfter = %v, want %v (must not be zeroed by finishRefreshJob)", afterJob.NextRefreshAfter, exp)
+	if job := m.markRefreshPending(nil, a.ID, epoch, now); job != nil {
+		t.Fatal("disabled credential queued a refresh")
 	}
 	if ex.RefreshCalls() != 1 {
-		t.Fatalf("upstream RefreshCalls = %d, want 1", ex.RefreshCalls())
+		t.Fatal("disabled credential submitted a refresh")
 	}
 
-	// 3. Even with NextRefreshAfter cleared, shouldRefresh must be false and nextRefreshCheckAt must defer to exp.
+	// 3. A disabled credential stays unscheduled, regardless of its token expiry.
 	m.mu.Lock()
 	m.auths[a.ID].NextRefreshAfter = time.Time{}
 	gen0 := m.auths[a.ID].Generation
@@ -506,8 +491,8 @@ func TestDisabledCodexRejectedRefreshTokenDoesNotSpin(t *testing.T) {
 	if shouldRef {
 		t.Fatal("shouldRefresh at now = true, want false for unchanged rejected refresh token with unexpired access token")
 	}
-	if !okNext || !nextAt.Equal(exp) {
-		t.Fatalf("nextRefreshCheckAt at now = (%v, %v), want (%v, true)", nextAt, okNext, exp)
+	if okNext {
+		t.Fatalf("disabled credential scheduled at %v", nextAt)
 	}
 
 	loop := newAuthAutoRefreshLoop(m, refreshCheckInterval, 1)
@@ -541,7 +526,7 @@ func TestDisabledCodexRejectedRefreshTokenDoesNotSpin(t *testing.T) {
 		ID:       "codex-disabled-expired.json",
 		FileName: "codex-disabled-expired.json",
 		Provider: "codex",
-		Status:   StatusActive,
+		Status:   StatusDisabled,
 		Disabled: true,
 		Metadata: map[string]any{
 			"type":          "codex",

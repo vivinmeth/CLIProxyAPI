@@ -23,7 +23,7 @@ func (e *disabledRefreshOutcomeExecutor) Refresh(_ context.Context, a *Auth) (*A
 	return a, nil
 }
 
-func TestDisabledRefreshOutcomeJobCycle(t *testing.T) {
+func TestReenabledRefreshOutcomeJobCycle(t *testing.T) {
 	for _, disabledFlag := range []bool{true, false} {
 		for _, renew := range []bool{false, true} {
 			name := "status-disabled"
@@ -53,8 +53,15 @@ func TestDisabledRefreshOutcomeJobCycle(t *testing.T) {
 					t.Fatal(err)
 				}
 				now := time.Now()
-				if at, ok := nextRefreshCheckAt(now, registered, time.Minute); !ok || at.After(now) {
-					t.Fatalf("disabled auth must remain eligible for proactive refresh: %v, %v", at, ok)
+				if _, ok := nextRefreshCheckAt(now, registered, time.Minute); ok {
+					t.Fatal("disabled auth must not refresh")
+				}
+				// tmx: explicit re-enable restores the existing refresh outcome cycle.
+				registered.Disabled = false
+				registered.Status = StatusActive
+				registered, err = m.Update(ctx, registered)
+				if err != nil {
+					t.Fatal(err)
 				}
 				job := m.markRefreshPending(nil, a.ID, registered.RegistrationEpoch, now)
 				if job == nil {
@@ -81,8 +88,8 @@ func TestDisabledRefreshOutcomeJobCycle(t *testing.T) {
 				if !current.LastRefreshedAt.After(oldRefresh) || current.RefreshFailures != 0 {
 					t.Fatalf("refresh outcome lost: timestamp=%v failures=%d", current.LastRefreshedAt, current.RefreshFailures)
 				}
-				if !current.Disabled || current.Status != StatusDisabled {
-					t.Fatal("disabled state changed")
+				if current.Disabled || current.Status == StatusDisabled {
+					t.Fatal("explicitly re-enabled auth became disabled")
 				}
 				if !current.NextRefreshAfter.Equal(refreshed.NextRefreshAfter) {
 					t.Fatal("job completion overwrote refresh outcome")
