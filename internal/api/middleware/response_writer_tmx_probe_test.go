@@ -14,8 +14,9 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/probes"
 )
 
-// Probes (no route, no body, 404/405) are counted, not written as error logs; real errors and
-// bodied requests to unknown routes keep their error-log slots.
+// Probes (no route, no body, 404/405) are counted, not written as error logs; real errors keep
+// their error-log slots. Since the 2026-11-18 upstream sync, upstream's unrouted-404 rule also
+// drops the error log of a bodied request to an unknown route (it is not counted as a probe).
 func TestProbesDoNotTakeErrorLogSlots(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	probes.ResetForTest()
@@ -52,8 +53,8 @@ func TestProbesDoNotTakeErrorLogSlots(t *testing.T) {
 			names = append(names, e.Name())
 		}
 	}
-	if len(names) != 2 || !strings.Contains(strings.Join(names, " "), "v1-messages-") || !strings.Contains(strings.Join(names, " "), "v1-messagez-") {
-		t.Fatalf("error logs = %v, want the 429 and the bodied unknown route only", names)
+	if len(names) != 1 || !strings.Contains(names[0], "v1-messages-") {
+		t.Fatalf("error logs = %v, want the 429 only", names)
 	}
 	sum := probes.Snapshot()
 	if sum.Total != 4 || len(sum.Sources) != 2 {

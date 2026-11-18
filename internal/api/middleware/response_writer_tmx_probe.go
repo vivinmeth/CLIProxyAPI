@@ -18,10 +18,14 @@ func tmxProbe(c *gin.Context, status int, apiErrors []*interfaces.ErrorMessage) 
 		return false
 	}
 	req := c.Request
-	hasBody := req.ContentLength > 0 || (req.ContentLength < 0 && req.Body != nil && req.Body != http.NoBody)
-	if !probes.Is(c.FullPath(), status, hasBody, len(apiErrors) > 0) {
+	if !probes.Is(c.FullPath(), status, tmxHasBody(req), len(apiErrors) > 0) {
 		return false
 	}
 	probes.Record(req.Method, req.URL.Path, c.ClientIP(), req.UserAgent(), status, time.Now())
 	return true
+}
+
+// tmxHasBody reports whether a request carried a body.
+func tmxHasBody(req *http.Request) bool {
+	return req != nil && (req.ContentLength > 0 || (req.ContentLength < 0 && req.Body != nil && req.Body != http.NoBody))
 }

@@ -45,6 +45,11 @@ func tmxTrustedRetryAfterHeader(err error) http.Header {
 	if errors.As(err, &pool) && pool != nil {
 		return safeRetryAfterHeader(min(pool.retryAfter, maxClientRetryAfter))
 	}
+	// Upstream's pool-cooldown annotation (2026-11 upstream) gets the same client cap.
+	var poolCooldown *poolCooldownTerminalError
+	if errors.As(err, &poolCooldown) && poolCooldown != nil && !poolCooldown.deadline.IsZero() {
+		return safeRetryAfterHeader(min(time.Until(poolCooldown.deadline), maxClientRetryAfter))
+	}
 	var trusted *trustedRetryAfterError
 	if errors.As(err, &trusted) && trusted != nil && !trusted.deadline.IsZero() {
 		return safeRetryAfterHeader(min(time.Until(trusted.deadline), maxClientRetryAfter))

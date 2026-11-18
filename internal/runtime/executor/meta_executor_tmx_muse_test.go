@@ -154,3 +154,12 @@ func TestMetaExecutor_RefusesContributorModels(t *testing.T) {
 		t.Fatalf("upstream called %d times", hits)
 	}
 }
+
+// tmxSkipContributorModel skips upstream tests that send a contributor-mode model: this proxy
+// refuses them before anything reaches Meta (TestMetaExecutor_RefusesContributorModels).
+func tmxSkipContributorModel(t *testing.T, model string) {
+	t.Helper()
+	if strings.Contains(strings.ToLower(model), "-contributor") {
+		t.Skip("tokenmaxx: contributor-mode models are refused (internal/tmx/muse/contributor.go)")
+	}
+}

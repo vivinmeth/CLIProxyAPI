@@ -40,8 +40,9 @@ func TestResponsesWebsocketExposesCodexTurnRateLimit(t *testing.T) {
 		StatusCode: http.StatusTooManyRequests,
 		Error:      errors.New(`{"error":{"type":"usage_limit_reached","message":"limit"}}`),
 	}
-	if shouldExposeResponsesUpstreamError(other) {
-		t.Fatal("other 429s keep upstream's silent close")
+	// Upstream (2026-11) exposes every 429 and quota error to the client as well.
+	if !shouldExposeResponsesUpstreamError(other) {
+		t.Fatal("upstream exposes other 429s too")
 	}
 }
 

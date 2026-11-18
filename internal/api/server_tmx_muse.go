@@ -5,8 +5,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/muse"
 )
 
-// registerTMXMuseRoutes serves Muse Code's model catalog at the host root, where Muse fetches it
-// (it strips the endpoint's /v1). Same client-key auth as /v1.
-func (s *Server) registerTMXMuseRoutes() {
-	s.engine.GET(muse.CatalogPath, AuthMiddleware(s.accessManager), gin.WrapF(muse.Handler(s.handlers.AuthManager)))
+// registerTMXMuseModels serves Muse Code's model catalog at GET /muse-code/models on upstream's
+// /muse-code group (client-key auth), where Muse fetches it (it strips the endpoint's /v1). It
+// answers with Meta's own catalog minus contributor models, falling back to the registry's meta
+// models, in place of upstream's registry-wide musecode.HandleModels. Upstream's relay keeps
+// /muse-code/config, /search and /browser_open.
+func (s *Server) registerTMXMuseModels(group *gin.RouterGroup) {
+	group.GET("/models", gin.WrapF(muse.Handler(s.handlers.AuthManager)))
 }

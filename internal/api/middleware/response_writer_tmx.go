@@ -123,7 +123,8 @@ func (w *ResponseWriterWrapper) tmxDiscard() {
 // tmxSubmit hands the finished exchange to the archive. It runs at the start of Finalize, while
 // the gin context and every spooled source are still available, and copies what it needs.
 func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
-	if c == nil || !capture.Enabled() || w.requestInfo == nil || c.GetBool(tmxSkipCaptureKey) {
+	// A panicked handler's partial exchange is not archived (upstream now finalizes after a panic).
+	if c == nil || !capture.Enabled() || w.requestInfo == nil || c.GetBool(tmxSkipCaptureKey) || w.panicked {
 		if w.tmx != nil {
 			w.tmx.body.Release()
 			w.tmx.chunks.Release()

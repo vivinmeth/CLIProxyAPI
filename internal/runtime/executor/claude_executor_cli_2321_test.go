@@ -85,6 +85,30 @@ func TestComputeFingerprintMatchesClaudeCode2321Capture(t *testing.T) {
 	}
 }
 
+func TestClaudeIncludePerTurnTiming_2321CatalogModels(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		want  bool
+	}{
+		{model: "claude-fable-5-2", want: true},
+		{model: "claude-fable-5-2[1m]", want: true},
+		{model: "claude-fable-5-1", want: true},
+		{model: "claude-opus-5-5", want: true},
+		{model: "claude-sonnet-5-5", want: true},
+		{model: "claude-mythos-5-2", want: true},
+		{model: "claude-haiku-5-5", want: false},
+		{model: "claude-fable-5", want: false},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			body := []byte(`{"model":"` + tc.model + `","output_config":{"timing":{"type":"enabled"}}}`)
+			if got := claudeIncludePerTurnTiming(body, nil); got != tc.want {
+				t.Fatalf("claudeIncludePerTurnTiming(%s) = %v, want %v", tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
+// tmx: kept from the fork's f8c8eeba port of upstream b4e7dbd2.
 func TestWithClaudeAdvisorToolBetaKeepsClaudeCode2321Order(t *testing.T) {
 	in := "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24"
 	want := "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24"

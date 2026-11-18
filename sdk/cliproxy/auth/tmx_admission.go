@@ -186,9 +186,10 @@ func admissionView(ctx context.Context) tmxAdmissionView {
 	return tmxAdmissionView{five: .95, seven: .98}
 }
 
-func (s *SessionAffinitySelector) tmxBoundPick(ctx context.Context, provider, model string, opts executor.Options, bound *Auth, available []*Auth) (*Auth, error) {
+func (s *SessionAffinitySelector) tmxBoundPick(ctx context.Context, provider, model string, opts executor.Options, bound *Auth, available []*Auth, reservation **weightedReservation) (*Auth, error) {
 	if _, ok := s.fallback.(*ResetSoonestSelector); !ok {
-		return bound, nil
+		// Other strategies keep upstream's bound pick (weighted routing reserves the binding).
+		return s.pickWithAffinityReservation(ctx, provider, model, opts, available, bound, reservation)
 	}
 	view := admissionView(ctx)
 	// Binding remains authoritative. Saturation permits only a transient spill;

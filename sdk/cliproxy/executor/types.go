@@ -15,6 +15,12 @@ const RequestedModelMetadataKey = "requested_model"
 // It is optional and may be absent for non-HTTP executions.
 const RequestPathMetadataKey = "request_path"
 
+// RequestIDMetadataKey stores the host request lifecycle identifier in Options.Metadata.
+const RequestIDMetadataKey = "request_id"
+
+// TraceIDMetadataKey stores the inbound request trace identifier in Options.Metadata.
+const TraceIDMetadataKey = "trace_id"
+
 // DisallowFreeAuthMetadataKey instructs auth selection to skip known free-tier credentials.
 const DisallowFreeAuthMetadataKey = "disallow_free_auth"
 
@@ -34,6 +40,8 @@ const GenerateMetadataKey = "generate"
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
+	// ExcludedAuthIDsMetadataKey excludes specific auth IDs from selection for the current attempt.
+	ExcludedAuthIDsMetadataKey = "excluded_auth_ids"
 	// SelectionIDMetadataKey stores the per-selection ID generated for a plugin scheduler pick.
 	SelectionIDMetadataKey = "selection_id"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.
@@ -257,6 +265,9 @@ func ResponseFormatOrSource(opts Options) sdktranslator.Format {
 type Response struct {
 	// Payload is the provider response in the executor format.
 	Payload []byte
+	// Incomplete reports that the upstream execution terminated in an incomplete state
+	// (e.g., response.incomplete) even if translated into a normal non-stream payload.
+	Incomplete bool
 	// Metadata exposes optional structured data for translators.
 	Metadata map[string]any
 	// Headers carries upstream HTTP response headers for passthrough to clients.
@@ -267,6 +278,9 @@ type Response struct {
 type StreamChunk struct {
 	// Payload is the raw provider chunk payload.
 	Payload []byte
+	// Incomplete reports that the upstream stream ended in an incomplete terminal state
+	// (e.g., response.incomplete) even if protocol translation mapped it to a normal chunk.
+	Incomplete bool
 	// Err reports any terminal error encountered while producing chunks.
 	Err error
 }

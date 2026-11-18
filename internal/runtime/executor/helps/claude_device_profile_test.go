@@ -2,12 +2,12 @@ package helps
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -374,7 +374,7 @@ func TestResolveClaudeDeviceProfilePreservesConfirmedClientAtBaselineVersion(t *
 		t.Fatalf("UserAgent = %q, want confirmed cli entrypoint preserved", profile.UserAgent)
 	}
 	if profile.PackageVersion != "0.128.0" || profile.RuntimeVersion != "v26.12.1" {
-		t.Fatalf("software profile = %s/%s, want 0.112.1/v26.3.0", profile.PackageVersion, profile.RuntimeVersion)
+		t.Fatalf("software profile = %s/%s, want 0.128.0/v26.12.1", profile.PackageVersion, profile.RuntimeVersion)
 	}
 }
 
@@ -410,6 +410,29 @@ func TestResolveClaudeDeviceProfileSeparatesVSCodeAgentSDKFromCLI(t *testing.T) 
 		t.Fatalf("ResolveClaudeDeviceProfileRequired() sdk-ts error = %v", errSDKTS)
 	}
 
+	cfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			NativeEntrypoints: []string{"t3-code", "custom-ide"},
+		},
+	}
+	t3CodeUA := "claude-cli/2.1.321 (external, t3-code, agent-sdk/0.3.276)"
+	t3CodeHeaders := claudeDeviceHeaders(t3CodeUA)
+	t3CodeHeaders.Set("X-Stainless-Package-Version", "0.128.0")
+	t3CodeHeaders.Set("X-Stainless-Runtime-Version", "v26.12.1")
+	t3CodeProfile, errT3Code := ResolveClaudeDeviceProfileRequired(context.Background(), auth, "api-key", t3CodeHeaders, cfg)
+	if errT3Code != nil {
+		t.Fatalf("ResolveClaudeDeviceProfileRequired() t3-code error = %v", errT3Code)
+	}
+
+	customIDEUA := "claude-cli/2.1.321 (external, custom-ide, agent-sdk/0.3.276)"
+	customIDEHeaders := claudeDeviceHeaders(customIDEUA)
+	customIDEHeaders.Set("X-Stainless-Package-Version", "0.128.0")
+	customIDEHeaders.Set("X-Stainless-Runtime-Version", "v26.12.1")
+	customIDEProfile, errCustomIDE := ResolveClaudeDeviceProfileRequired(context.Background(), auth, "api-key", customIDEHeaders, cfg)
+	if errCustomIDE != nil {
+		t.Fatalf("ResolveClaudeDeviceProfileRequired() custom-ide error = %v", errCustomIDE)
+	}
+
 	if cliProfile.UserAgent != "claude-cli/2.1.321 (external, cli)" {
 		t.Fatalf("CLI UserAgent = %q, want CLI profile", cliProfile.UserAgent)
 	}
@@ -418,6 +441,12 @@ func TestResolveClaudeDeviceProfileSeparatesVSCodeAgentSDKFromCLI(t *testing.T) 
 	}
 	if sdkTSProfile.UserAgent != sdkTSUA {
 		t.Fatalf("sdk-ts UserAgent = %q, want %q", sdkTSProfile.UserAgent, sdkTSUA)
+	}
+	if t3CodeProfile.UserAgent != t3CodeUA {
+		t.Fatalf("t3-code UserAgent = %q, want %q", t3CodeProfile.UserAgent, t3CodeUA)
+	}
+	if customIDEProfile.UserAgent != customIDEUA {
+		t.Fatalf("custom-ide UserAgent = %q, want %q", customIDEProfile.UserAgent, customIDEUA)
 	}
 
 	cliProfileAgain, errCLIAgain := ResolveClaudeDeviceProfileRequired(context.Background(), auth, "api-key", cliHeaders, nil)

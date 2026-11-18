@@ -30,7 +30,9 @@ type Record struct {
 	TraceID string
 	// SelectionID identifies the scheduler selection decision that produced this usage record when available.
 	SelectionID string
-	Provider    string
+	// HomeSelection carries deferred accounting for reused Home dispatches.
+	HomeSelection *HomeSelection
+	Provider      string
 	// BaseURL stores the configured upstream base URL when available.
 	BaseURL string
 	// ExecutorType stores the concrete executor type that handled the request.
@@ -86,6 +88,14 @@ type Record struct {
 // accepted upstream stream that ended without its terminal frame.
 const FailureStreamTruncatedCode = "stream_truncated"
 
+// FailureRequestScopedCode marks failures belonging to the request rather than
+// the selected credential, including local capability validation failures.
+const FailureRequestScopedCode = "request_scoped"
+
+// FailureForceCooldownCode marks failures matched by a request-scoped error rule
+// configured with a cooldown action (stop-and-cooldown or continue-and-cooldown).
+const FailureForceCooldownCode = "force_cooldown"
+
 // Failure holds HTTP failure metadata for an upstream request attempt.
 type Failure struct {
 	StatusCode int
@@ -96,7 +106,7 @@ type Failure struct {
 	Code string
 }
 
-// Detail holds the token usage breakdown.
+// Detail holds the token and structured usage breakdown captured from an upstream response.
 type Detail struct {
 	InputTokens         int64
 	OutputTokens        int64
@@ -114,6 +124,36 @@ type Detail struct {
 	ResponseSpeed      string
 	// ProviderCost is the cost the upstream itself reported (OpenCode); nil when none.
 	ProviderCost *ProviderCost
+
+	CacheCreation5mTokens    *int64
+	CacheCreation30mTokens   *int64
+	CacheCreation1hTokens    *int64
+	CacheCreation12hTokens   *int64
+	TextInputTokens          *int64
+	ImageInputTokens         *int64
+	AudioInputTokens         *int64
+	VideoInputTokens         *int64
+	FileInputTokens          *int64
+	CachedTextTokens         *int64
+	CachedImageTokens        *int64
+	CachedAudioTokens        *int64
+	TextOutputTokens         *int64
+	ImageOutputTokens        *int64
+	AudioOutputTokens        *int64
+	AcceptedPredictionTokens *int64
+	RejectedPredictionTokens *int64
+	CacheDetails             *CacheDetails
+	WebSearchRequests        *int64
+	ImageCount               *int64
+	RequestedImageDetails    *ImageDetails
+	ImageDetails             *ImageDetails
+	MediaCounts              *MediaCounts
+	ToolUsageDetails         *ToolUsageDetails
+	Iterations               *[]IterationUsage
+	CostDetails              *CostDetails
+	Speed                    string
+	InferenceGeo             string
+	UpstreamServiceTier      string
 }
 
 type requestedModelAliasContextKey struct{}
@@ -714,6 +754,9 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 			record.TraceID = trID
 		}
 	}
+	if record.HomeSelection == nil {
+		record.HomeSelection = HomeSelectionFromContext(ctx)
+	}
 	if strings.TrimSpace(record.SelectionID) == "" {
 		if selID := SelectionIDFromContext(ctx); selID != "" {
 			record.SelectionID = selID
@@ -761,6 +804,7 @@ func (m *Manager) run(ctx context.Context) {
 			return
 		}
 		item := m.queue[0]
+		m.queue[0] = queueItem{}
 		m.queue = m.queue[1:]
 		m.mu.Unlock()
 		if item.flushed != nil {

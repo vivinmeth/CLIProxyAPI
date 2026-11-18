@@ -3,20 +3,20 @@ package helps
 import (
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
-	"github.com/tidwall/gjson"
 )
 
 // tmxProviderCost reads OpenCode's cost fields from an OpenAI-style usage object (tokenmaxx fork;
 // sdk/cliproxy/usage.ProviderCost). Only a usage object carrying an "opencode" object counts, so
 // other upstreams that send a bare usage.cost (OpenRouter) keep being priced from the catalog.
-func tmxProviderCost(usageNode gjson.Result) *usage.ProviderCost {
+func tmxProviderCost(usageNode ojson.Result) *usage.ProviderCost {
 	oc := usageNode.Get("opencode")
 	if !oc.IsObject() {
 		return nil
 	}
-	num := func(r gjson.Result) *float64 {
-		if r.Type != gjson.Number {
+	num := func(r ojson.Result) *float64 {
+		if r.Type != ojson.Number {
 			return nil
 		}
 		v := r.Float()
