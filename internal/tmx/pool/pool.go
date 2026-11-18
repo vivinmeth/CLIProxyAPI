@@ -161,6 +161,9 @@ func Build(ctx context.Context, auths []*auth.Auth, counts map[string]int, accou
 		if !c.Enabled && a.LastError != nil && refusals.TerminalCode(a.LastError.Code) {
 			c.Reason = a.LastError.Code
 			c.StatusMessage = refusals.StatusMessage(a.LastError.Code)
+		} else if a.LastError != nil && a.LastError.Code == refusals.AttestationRefused {
+			c.Reason = refusals.AttestationRefused
+			c.StatusMessage = refusals.AttestationRefused
 		} else if a.Quota.Exceeded {
 			c.Reason = "quota"
 		} else if a.LastError != nil {

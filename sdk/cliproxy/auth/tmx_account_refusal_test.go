@@ -97,6 +97,141 @@ func TestTMXOrdinary403And429KeepCooldown(t *testing.T) {
 	}
 }
 
+func TestTMXToolAttestationKeepsCooldownAndSibling(t *testing.T) {
+	originalHooks := log.StandardLogger().ReplaceHooks(make(log.LevelHooks))
+	t.Cleanup(func() { log.StandardLogger().ReplaceHooks(originalHooks) })
+	hook := logtest.NewGlobal()
+	for _, model := range []string{"", "model"} {
+		hook.Reset()
+		ctx := context.Background()
+		m := NewManager(nil, nil, nil)
+		o := &recordingCooldownObserver{}
+		SetCooldownObserver(o)
+		t.Cleanup(func() { SetCooldownObserver(nil) })
+		for _, id := range []string{"tools", "sibling"} {
+			if _, err := m.Register(ctx, &Auth{ID: id, Provider: "meta", Status: StatusActive}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		before := time.Now()
+		failure := Result{AuthID: "tools", Provider: "meta", Model: model, Error: &Error{HTTPStatus: 403, Code: refusals.AttestationRefused, Message: `{"error":{"code":"client_attestation_denied"}}`}}
+		m.MarkResult(ctx, failure)
+		m.MarkResult(ctx, failure)
+		a, _ := m.GetByID("tools")
+		if a.Disabled || a.Status == StatusDisabled || a.LastError.Code != refusals.AttestationRefused {
+			t.Fatalf("tool refusal became terminal: %+v", a)
+		}
+		if blocked, _, retry := isAuthBlockedForModel(a, model, time.Now()); !blocked || retry.Before(before.Add(30*time.Minute)) || retry.After(time.Now().Add(30*time.Minute)) {
+			t.Fatalf("ordinary 403 cooldown lost: blocked=%v retry=%v", blocked, retry)
+		}
+		sibling, _ := m.GetByID("sibling")
+		if blocked, _, _ := isAuthBlockedForModel(sibling, model, time.Now()); blocked || sibling.Disabled {
+			t.Fatal("sibling credential blocked")
+		}
+		windows := m.CooldownSnapshot().Windows
+		if len(windows) == 0 {
+			t.Fatal("missing cooldown history windows")
+		}
+		for _, w := range windows {
+			if w.Reason != refusals.AttestationRefused || w.ErrorCode != refusals.AttestationRefused {
+				t.Fatalf("wrong history reason: %+v", w)
+			}
+		}
+		if len(o.failures) != 2 || o.failures[0].ErrorCode != refusals.AttestationRefused || o.failures[0].CredentialScope {
+			t.Fatalf("tool refusal reports: %+v", o.failures)
+		}
+		logs := 0
+		for _, entry := range hook.AllEntries() {
+			if strings.HasPrefix(entry.Message, "attestation refusal:") {
+				logs++
+			}
+		}
+		if logs != 1 {
+			t.Fatalf("transition logged %d times", logs)
+		}
+	}
+}
+
+func TestTMXRefusalReenableRestoresModelAndRefresh(t *testing.T) {
+	for _, code := range []string{refusals.MetaAttestation, "tos_violation"} {
+		for _, legacy := range []bool{false, true} {
+			ctx := context.Background()
+			m := NewManager(nil, nil, nil)
+			e := &mockOAuthErrorExecutor{id: "meta"}
+			if code == "tos_violation" {
+				e.id = "antigravity"
+			}
+			m.RegisterExecutor(e)
+			a, err := m.Register(ctx, &Auth{ID: "reenable", Provider: e.id, Status: StatusActive, Metadata: map[string]any{"refresh_token": "local-test", "refresh_interval_seconds": 3600}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.MarkResult(ctx, Result{AuthID: a.ID, Provider: e.id, Model: "model", Error: &Error{HTTPStatus: 403, Code: code, Metadata: map[string]string{"tos_appeal_url": "https://example.invalid/appeal?secret=hidden", "tos_appeal_url_text": "appeal"}}})
+			a, _ = m.GetByID(a.ID)
+			if !a.Disabled || a.ModelStates["model"].Status != StatusDisabled {
+				t.Fatal("refusal did not disable auth and model")
+			}
+			if legacy {
+				delete(a.Metadata, tmxRefusalMetadataKey)
+			}
+			a.Disabled = false
+			a.Status = StatusActive
+			if _, err := m.Update(ctx, a); err != nil {
+				t.Fatal(err)
+			}
+			a, _ = m.GetByID(a.ID)
+			if a.LastError != nil || a.StatusMessage != "" || a.Metadata[tmxRefusalMetadataKey] != nil || a.Metadata["tos_appeal_url"] != nil || a.Metadata["tos_appeal_url_text"] != nil || !modelStateIsClean(a.ModelStates["model"]) {
+				t.Fatalf("code=%s legacy=%v retained refusal: %+v model=%+v", code, legacy, a, a.ModelStates["model"])
+			}
+			now := time.Now()
+			for _, model := range []string{"", "model"} {
+				if blocked, _, _ := isAuthBlockedForModel(a, model, now); blocked {
+					t.Fatalf("re-enabled auth/model %q not selectable", model)
+				}
+			}
+			if next, ok := m.nextRefreshCheckAt(now, a, refreshCheckInterval); !ok || next.After(now) || !m.shouldRefresh(a, now) {
+				t.Fatal("re-enable did not schedule immediate refresh")
+			}
+			job := m.markRefreshPending(nil, a.ID, a.RegistrationEpoch, now)
+			if job == nil || m.markRefreshPending(nil, a.ID, a.RegistrationEpoch, now) != nil || !m.beginRefreshJob(ctx, job) {
+				t.Fatal("refresh not queued exactly once")
+			}
+			if _, err := m.refreshAuthForRequestAtEpoch(ctx, a.ID, "", job.registrationEpoch); err != nil {
+				t.Fatal(err)
+			}
+			m.finishRefreshJob(job, time.Time{}, false)
+			a, _ = m.GetByID(a.ID)
+			if e.refreshCalls.Load() != 1 || m.shouldRefresh(a, time.Now()) {
+				t.Fatal("re-enable did not refresh exactly once")
+			}
+		}
+	}
+}
+
+func TestTMXRefusalLogRedactsAppeal(t *testing.T) {
+	originalHooks := log.StandardLogger().ReplaceHooks(make(log.LevelHooks))
+	t.Cleanup(func() { log.StandardLogger().ReplaceHooks(originalHooks) })
+	hook := logtest.NewGlobal()
+	m := NewManager(nil, nil, nil)
+	ctx := context.Background()
+	_, _ = m.Register(ctx, &Auth{ID: "appeal", Provider: "antigravity", Status: StatusActive})
+	failure := Result{AuthID: "appeal", Provider: "antigravity", Error: &Error{HTTPStatus: 403, Code: "tos_violation", Metadata: map[string]string{"tos_appeal_url": "https://example.invalid/appeal?signed=secret#private"}}}
+	m.MarkResult(ctx, failure)
+	m.MarkResult(ctx, failure)
+	logs := 0
+	for _, entry := range hook.AllEntries() {
+		if strings.HasPrefix(entry.Message, "account refusal:") {
+			logs++
+			if !strings.Contains(entry.Message, "appeal=https://example.invalid/appeal") || strings.Contains(entry.Message, "secret") || strings.Contains(entry.Message, "private") {
+				t.Fatalf("appeal log not redacted: %s", entry.Message)
+			}
+		}
+	}
+	if logs != 1 {
+		t.Fatalf("refusal logged %d times", logs)
+	}
+}
+
 func TestTMXRefusalHonorsCredentialIdentity(t *testing.T) {
 	for _, replaced := range []bool{false, true} {
 		m := NewManager(nil, nil, nil)

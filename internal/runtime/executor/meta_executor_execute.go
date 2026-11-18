@@ -199,7 +199,7 @@ func (e *MetaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	reporter.ObserveResponseModel(data)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return resp, wrapMetaUpstreamError(httpResp.StatusCode, data)
+		return resp, helps.MetaRequestError(wrapMetaUpstreamError(httpResp.StatusCode, data), prepared.body) // tmx
 	}
 
 	var upstreamUsage helps.StreamUsageBuffer
@@ -265,7 +265,7 @@ func (e *MetaExecutor) translateMetaCompleted(ctx context.Context, req cliproxye
 		}
 		upstreamUsage.ObserveResponsesStream(eventData)
 		if errEvent := metaStreamEventError(eventData); errEvent != nil {
-			return metaCompletedTranslation{}, errEvent
+			return metaCompletedTranslation{}, helps.MetaRequestError(errEvent, prepared.body) // tmx
 		}
 		events, errBridge := prepared.applyPatch.Transform(eventData)
 		if errBridge != nil {

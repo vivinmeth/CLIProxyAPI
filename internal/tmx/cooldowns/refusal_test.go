@@ -17,3 +17,10 @@ func TestAccountRefusalHasOwnReasonAndNoRetry(t *testing.T) {
 		}
 	}
 }
+
+func TestToolAttestationHasOwnReasonWithOrdinary403History(t *testing.T) {
+	ev, ok := failureEvent(auth.FailureReport{At: time.Now(), AuthID: "tools", HTTPStatus: 403, ErrorCode: refusals.AttestationRefused})
+	if !ok || ev.Kind != KindAuthError || ev.Reason != refusals.AttestationRefused || ev.CredScope {
+		t.Fatalf("event=%+v recorded=%v", ev, ok)
+	}
+}

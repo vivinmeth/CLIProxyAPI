@@ -1619,6 +1619,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 		modelState := existingModelState(auth, modelKey)
+		wasAttestationCooling := tmxAttestationCooling(auth, modelKey, now) // tmx
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {
 			auth.Success++
@@ -2254,7 +2255,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		refusalTransition = tmxFinalizeAccountRefusal(auth, wasDisabled, result) // tmx
+		refusalTransition = tmxFinalizeAccountRefusal(auth, wasDisabled, result)          // tmx
+		tmxFinalizeAttestationRefusal(auth, modelKey, wasAttestationCooling, result, now) // tmx
 		_ = m.persistLocked(ctx, auth)
 		authSnapshot = auth.Clone()
 		m.tmxReportCooldownsLocked(auth, now) // tmx
