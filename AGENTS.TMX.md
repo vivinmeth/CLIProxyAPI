@@ -21,15 +21,18 @@ working:
 - **`reset-soonest` routing:** `sdk/cliproxy/auth/selector_reset_soonest*.go`, plus wiring in
   `conductor_selection.go`, `service_config.go`, `internal/config/config_types.go`. Within the top
   priority tier: unobserved credentials first, then soonest weekly reset, then already-passed
-  resets. It bypasses the scheduler fast path on purpose. `../wiki/routing-reset-soonest.md`.
+  resets. It bypasses the scheduler fast path on purpose. Session-affinity bound picks go through
+  `tmxBoundPick` (`tmx_admission.go`), which hands other strategies to upstream's
+  `pickWithAffinityReservation`. `../wiki/routing-reset-soonest.md`.
 - **Request log** (`internal/tmx/requestlog/`): usage-plugin hook → batched writes to Postgres
   `tmx.requests`. Routes `GET /v8/management/tmx/requests[/summary]` in
   `internal/api/server_management_tmx.go`; hooks in `server_management_v8.go`, `cmd/server/main.go`.
   `../wiki/observability-plan.md`.
 - **Archive** (`internal/tmx/archive/`, `internal/tmx/capture/`): full exchange capture + session
   ingest. Hooks: `capture.Enabled()` in the request-log gates in
-  `runtime/executor/helps/logging_helpers.go`, `sdk/api/handlers/handlers.go`, `handlers_errors.go`,
-  `openai/openai_responses_websocket.go`, `middleware/request_logging.go`; the response writer calls
+  `runtime/executor/helps/logging_helpers.go`, `sdk/api/handlers/handlers.go`,
+  `openai/openai_responses_websocket.go`, `middleware/request_logging.go` (capture reads bodies
+  on every route; upstream's matched-route gate limits only request logs); the response writer calls
   `tmxTee`/`tmxSubmit` (`middleware/response_writer_tmx.go`); `internal/api/server.go` registers
   response compression before request logging, so capture sees plain bodies. Keep these when
   merging upstream. `../wiki/archive-ingest.md`.
@@ -47,7 +50,10 @@ working:
   `Manager.ClearQuotaSignals`). `../wiki/reset-credits.md`, fleet contract
   `../wiki/reset-credits-api.md`.
 - **Muse Code** (`internal/tmx/muse/`): `GET /muse-code/models` (`internal/api/server_tmx_muse.go`,
-  hook in `server_routes.go`); Meta `response.subscription_usage` passed to Muse clients
+  mounted on upstream's `/muse-code` group in `server_routes.go` in place of upstream's
+  `musecode.HandleModels`; upstream's relay keeps `/muse-code/config`, `/search`, `/browser_open`;
+  its catalog tests skip via `tmxSkipUpstreamMuseCatalog`, its contributor-model tests via
+  `tmxSkipContributorModel`); Meta `response.subscription_usage` passed to Muse clients
   (`meta_executor_stream.go`, `isMuseClient`); harness `muse-code` (`ClientID` on
   `logging.ClientRequestMetadata`, set in `sdk/api/handlers/handlers.go`). Quota signals
   (`muse/usage.go`, `meta` in `sdk/cliproxy/auth/quota_signals.go`) read by
@@ -98,11 +104,19 @@ Go is in `~/.local/go/bin` (often not on `PATH`). Before handing off:
   to fix), `go build -o /tmp/cpa ./cmd/server`, and `go test` on the packages you touched (e.g.
   `./sdk/cliproxy/... ./internal/api/... ./internal/config/...`).
 - Integration tests need throwaway Postgres (`postgres:18-alpine`) DSNs: `TMX_REQUESTLOG_TEST_DSN`,
-  `TMX_ANALYTICS_TEST_DSN` (a second database), `TMX_COOLDOWNS_TEST_DSN`.
+  `TMX_ANALYTICS_TEST_DSN` (a second database), `TMX_COOLDOWNS_TEST_DSN`, `TMX_COOLDOWN_TEST_DSN`
+  (`internal/store`), `TMX_SESSION_BINDINGS_TEST_DSN`; give each its own database and run with
+  `-p 1`. Archive pack tests also need `TMX_ARCHIVE_TEST_S3` (a fresh SeaweedFS S3 per run, see
+  `internal/tmx/archive/blobstore_pack_test.go`).
 - `../scripts/dev-services.sh rebuild` and try the change on the dev backend (:8317).
 
 ## Project rules
 
+- **JSON and regexp libraries:** upstream's `AGENTS.md` now requires `github.com/MoeForge/moego`
+  (`ojson`, `json`, `regexp`, `base64`) instead of `tidwall/gjson`, `tidwall/sjson`,
+  `encoding/json` and `regexp`. Hooks in upstream files and new fork code use moego. Older
+  fork-only code under `internal/tmx/` still uses `gjson`/`sjson`, so `go.mod` keeps them after
+  upstream dropped them (2026-11-18 sync); port it to moego when you next change it.
 - **Main is deployed:** never rebase or force-push it. `git submodule update` leaves a detached
   HEAD: `git checkout main` and `git pull --ff-only` before committing. After pushing, commit the
   new pointer in the umbrella (`git add CLIProxyAPI`) and push.
