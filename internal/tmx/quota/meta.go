@@ -103,6 +103,7 @@ func ParseMetaSignals(signals map[string]string, _ time.Time) []Window {
 			t := time.Unix(reset, 0).UTC()
 			w.ResetsAt = &t
 		}
+		w.StartsAt = windowStart(w.ResetsAt, mins, time.Minute)
 		out = append(out, w)
 	}
 	sortWindows(out)
@@ -159,6 +160,7 @@ func ParseMetaKeyUsage(body []byte) ([]Window, string, error) {
 				t := time.Unix(s.w.ResetsAt, 0).UTC()
 				w.ResetsAt = &t
 			}
+			w.StartsAt = windowStart(w.ResetsAt, s.w.Minutes, time.Minute)
 			out = append(out, w)
 		}
 	}

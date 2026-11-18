@@ -23,6 +23,11 @@ func TestParseClaudeSignals(t *testing.T) {
 	if *ws[1].UsedPct != 4 {
 		t.Fatalf("7d used = %v", *ws[1].UsedPct)
 	}
+	for _, w := range ws {
+		if w.StartsAt != nil {
+			t.Fatalf("Claude signal invented start: %v", w.StartsAt)
+		}
+	}
 }
 
 const usageFixture = `{"five_hour":{"utilization":2.0,"resets_at":"2026-10-20T18:19:59.555617+00:00","limit_dollars":null},
@@ -39,6 +44,9 @@ func TestParseClaudeUsage(t *testing.T) {
 	got := map[string]Window{}
 	for _, w := range ws {
 		got[w.Window] = w
+		if w.StartsAt != nil {
+			t.Fatalf("Claude usage invented start: %v", w.StartsAt)
+		}
 	}
 	if len(got) != 3 {
 		t.Fatalf("windows = %+v (dollar pools and nulls must be skipped)", ws)

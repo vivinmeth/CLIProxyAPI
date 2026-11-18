@@ -206,6 +206,7 @@ type Account struct {
 type written struct {
 	used    *float64
 	resets  *time.Time
+	starts  *time.Time
 	status  string
 	writtAt time.Time
 }
@@ -328,6 +329,8 @@ func newService(ctx context.Context, db *sql.DB, schema string, fetch Fetcher, o
 		// snap_key: set by the writer, makes a replayed (spooled) snapshot idempotent.
 		`ALTER TABLE ` + s.table + ` ADD COLUMN IF NOT EXISTS snap_key TEXT`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS quota_snapshots_snap_key ON ` + s.table + ` (snap_key) WHERE snap_key IS NOT NULL`,
+		// Nullable, without a default or backfill: old snapshots have no known start.
+		`ALTER TABLE ` + s.table + ` ADD COLUMN IF NOT EXISTS starts_at TIMESTAMPTZ`,
 	} {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return nil, fmt.Errorf("quota schema: %w", err)
@@ -360,7 +363,7 @@ func newService(ctx context.Context, db *sql.DB, schema string, fetch Fetcher, o
 // nor forgets the plan.
 func (s *Service) loadLatest(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT ON (auth_id, "window") auth_id, provider, label,
-		plan, "window", used_pct, resets_at, status, source, ts FROM `+s.table+`
+		plan, "window", used_pct, resets_at, starts_at, status, source, ts FROM `+s.table+`
 		ORDER BY auth_id, "window", ts DESC`)
 	if err != nil {
 		return err
@@ -369,9 +372,9 @@ func (s *Service) loadLatest(ctx context.Context) error {
 	for rows.Next() {
 		var authID, provider, label, plan, window, status, source string
 		var used sql.NullFloat64
-		var resets sql.NullTime
+		var resets, starts sql.NullTime
 		var ts time.Time
-		if err = rows.Scan(&authID, &provider, &label, &plan, &window, &used, &resets, &status, &source, &ts); err != nil {
+		if err = rows.Scan(&authID, &provider, &label, &plan, &window, &used, &resets, &starts, &status, &source, &ts); err != nil {
 			return err
 		}
 		a := s.accountLocked(authID)
@@ -388,8 +391,12 @@ func (s *Service) loadLatest(ctx context.Context) error {
 			t := resets.Time.UTC()
 			w.ResetsAt = &t
 		}
+		if starts.Valid {
+			t := starts.Time.UTC()
+			w.StartsAt = &t
+		}
 		a.current[window] = Current{Window: w, ObservedAt: ts, Source: source}
-		a.written[window] = written{used: w.UsedPct, resets: w.ResetsAt, status: status, writtAt: ts}
+		a.written[window] = written{used: w.UsedPct, resets: w.ResetsAt, starts: w.StartsAt, status: status, writtAt: ts}
 	}
 	return rows.Err()
 }
@@ -605,7 +612,7 @@ func (s *Service) record(ctx context.Context, authID string, windows []Window, s
 			continue
 		}
 		toWrite = append(toWrite, snapshotRecord{Key: newSnapKey(), TS: at, AuthID: authID, Provider: provider,
-			Label: label, Plan: plan, Window: w.Window, UsedPct: w.UsedPct, ResetsAt: w.ResetsAt, Status: w.Status,
+			Label: label, Plan: plan, Window: w.Window, UsedPct: w.UsedPct, ResetsAt: w.ResetsAt, StartsAt: w.StartsAt, Status: w.Status,
 			Source: source})
 	}
 	s.mu.Unlock()
@@ -648,6 +655,7 @@ type snapshotRecord struct {
 	Window   string     `json:"window"`
 	UsedPct  *float64   `json:"used_pct"`
 	ResetsAt *time.Time `json:"resets_at"`
+	StartsAt *time.Time `json:"starts_at,omitempty"`
 	Status   string     `json:"status"`
 	Source   string     `json:"source"`
 }
@@ -663,9 +671,9 @@ func (s *Service) insertSnapshot(ctx context.Context, r snapshotRecord) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	_, err := s.db.ExecContext(ctx, `INSERT INTO `+s.table+` (ts, auth_id, provider, label, plan,
-		"window", used_pct, resets_at, status, source, snap_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		"window", used_pct, resets_at, starts_at, status, source, snap_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		ON CONFLICT (snap_key) WHERE snap_key IS NOT NULL DO NOTHING`,
-		r.TS, r.AuthID, r.Provider, r.Label, r.Plan, r.Window, r.UsedPct, r.ResetsAt, r.Status, r.Source, r.Key)
+		r.TS, r.AuthID, r.Provider, r.Label, r.Plan, r.Window, r.UsedPct, r.ResetsAt, r.StartsAt, r.Status, r.Source, r.Key)
 	return err
 }
 
@@ -677,7 +685,7 @@ func (s *Service) markWritten(r snapshotRecord) {
 	if last, ok := a.written[r.Window]; ok && last.writtAt.After(r.TS) {
 		return
 	}
-	a.written[r.Window] = written{used: r.UsedPct, resets: r.ResetsAt, status: r.Status, writtAt: r.TS}
+	a.written[r.Window] = written{used: r.UsedPct, resets: r.ResetsAt, starts: r.StartsAt, status: r.Status, writtAt: r.TS}
 }
 
 func (s *Service) spoolSnapshot(r snapshotRecord) {
@@ -743,6 +751,10 @@ func (s *Service) Durability() durability.Stats {
 }
 
 func changed(last written, w Window) bool {
+	if (last.starts == nil) != (w.StartsAt == nil) ||
+		(last.starts != nil && !last.starts.Equal(*w.StartsAt)) {
+		return true
+	}
 	if (last.used == nil) != (w.UsedPct == nil) ||
 		(last.used != nil && math.Abs(*last.used-*w.UsedPct) >= 0.01) {
 		return true
@@ -869,13 +881,14 @@ type Snapshot struct {
 	Window   string     `json:"window"`
 	UsedPct  *float64   `json:"used_pct"`
 	ResetsAt *time.Time `json:"resets_at"`
+	StartsAt *time.Time `json:"starts_at,omitempty"`
 	Status   string     `json:"status,omitempty"`
 	Source   string     `json:"source"`
 }
 
 // History returns snapshots in [from, to), oldest first. Empty authID/window mean all.
 func (s *Service) History(ctx context.Context, authID, window string, from, to time.Time, limit int) ([]Snapshot, bool, error) {
-	q := `SELECT ts, auth_id, provider, label, plan, "window", used_pct, resets_at, status, source FROM ` +
+	q := `SELECT ts, auth_id, provider, label, plan, "window", used_pct, resets_at, starts_at, status, source FROM ` +
 		s.table + ` WHERE ts >= $1 AND ts < $2`
 	args := []any{from, to}
 	if authID != "" {
@@ -897,8 +910,8 @@ func (s *Service) History(ctx context.Context, authID, window string, from, to t
 	for rows.Next() {
 		var r Snapshot
 		var used sql.NullFloat64
-		var resets sql.NullTime
-		if err = rows.Scan(&r.TS, &r.AuthID, &r.Provider, &r.Label, &r.Plan, &r.Window, &used, &resets,
+		var resets, starts sql.NullTime
+		if err = rows.Scan(&r.TS, &r.AuthID, &r.Provider, &r.Label, &r.Plan, &r.Window, &used, &resets, &starts,
 			&r.Status, &r.Source); err != nil {
 			return nil, false, err
 		}
@@ -909,6 +922,10 @@ func (s *Service) History(ctx context.Context, authID, window string, from, to t
 		if resets.Valid {
 			t := resets.Time.UTC()
 			r.ResetsAt = &t
+		}
+		if starts.Valid {
+			t := starts.Time.UTC()
+			r.StartsAt = &t
 		}
 		out = append(out, r)
 	}

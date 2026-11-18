@@ -21,7 +21,8 @@ type Window struct {
 	Window   string     `json:"window"`
 	UsedPct  *float64   `json:"used_pct"` // 0-100; nil when the source gives none
 	ResetsAt *time.Time `json:"resets_at"`
-	Status   string     `json:"status,omitempty"` // passive only: allowed / allowed_warning / rejected
+	StartsAt *time.Time `json:"starts_at,omitempty"` // only when the source gives a reset and length
+	Status   string     `json:"status,omitempty"`    // passive only: allowed / allowed_warning / rejected
 }
 
 // claudeHeaderWindows maps the passive unified rate-limit header prefixes to canonical windows.
@@ -182,6 +183,15 @@ func pct(v float64) *float64 {
 	return &v
 }
 
+// windowStart derives a start only from a known reset and positive, representable length.
+func windowStart(reset *time.Time, length int64, unit time.Duration) *time.Time {
+	if reset == nil || reset.IsZero() || length <= 0 || length > math.MaxInt64/int64(unit) {
+		return nil
+	}
+	t := reset.Add(-time.Duration(length) * unit)
+	return &t
+}
+
 func sortWindows(ws []Window) {
 	for i := 1; i < len(ws); i++ {
 		for j := i; j > 0 && ws[j].Window < ws[j-1].Window; j-- {
@@ -235,6 +245,7 @@ func ParseCodexSignals(signals map[string]string, observedAt time.Time) []Window
 		if strings.EqualFold(get("X-Codex-Limit-Reached"), "true") && used >= 100 {
 			w.Status = "rejected"
 		}
+		w.StartsAt = windowStart(w.ResetsAt, minutes, time.Minute)
 		out = append(out, w)
 	}
 	sortWindows(out)
@@ -270,6 +281,7 @@ func (r *codexRateLimit) windows(prefix string) []Window {
 		if r.LimitReached && *cw.UsedPercent >= 100 {
 			w.Status = "rejected"
 		}
+		w.StartsAt = windowStart(w.ResetsAt, cw.LimitWindowSeconds, time.Second)
 		out = append(out, w)
 	}
 	return out

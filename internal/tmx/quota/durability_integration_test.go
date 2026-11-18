@@ -40,11 +40,12 @@ func TestQuotaOutageLosesNothing(t *testing.T) {
 	t.Cleanup(s.spool.Close)
 	pct := func(v float64) *float64 { return &v }
 	base := time.Date(2026, 10, 22, 4, 0, 0, 0, time.UTC)
+	start := base.Add(-time.Hour)
 
 	proxy.Down()
 	ctx := context.Background()
-	s.record(ctx, "a", []Window{{Window: "5h", UsedPct: pct(10)}}, "polled", base)
-	s.record(ctx, "a", []Window{{Window: "5h", UsedPct: pct(20)}, {Window: "7d", UsedPct: pct(3)}}, "polled", base.Add(10*time.Minute))
+	s.record(ctx, "a", []Window{{Window: "5h", UsedPct: pct(10), StartsAt: &start}}, "polled", base)
+	s.record(ctx, "a", []Window{{Window: "5h", UsedPct: pct(20), StartsAt: &start}, {Window: "7d", UsedPct: pct(3)}}, "polled", base.Add(10*time.Minute))
 	s.mu.Lock()
 	_, marked := s.accounts["a"].written["5h"]
 	s.mu.Unlock()
@@ -78,6 +79,15 @@ func TestQuotaOutageLosesNothing(t *testing.T) {
 	_ = rows.Close()
 	if len(got) != 3 || got[0] != "04:00 5h" || got[1] != "04:10 5h" || got[2] != "04:10 7d" {
 		t.Fatalf("rows = %v", got)
+	}
+	hist, _, err := s.History(ctx, "a", "5h", base, base.Add(time.Hour), 100)
+	if err != nil || len(hist) != 2 {
+		t.Fatalf("replayed history = %+v, err = %v", hist, err)
+	}
+	for _, row := range hist {
+		if row.StartsAt == nil || !row.StartsAt.Equal(start) {
+			t.Fatalf("spooled start lost: %v", row.StartsAt)
+		}
 	}
 	s.mu.Lock()
 	last := s.accounts["a"].written["5h"]
