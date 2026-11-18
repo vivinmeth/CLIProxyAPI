@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -198,5 +199,39 @@ func TestTMXCaptureHandlerPanicReleasesMemoryAndSpill(t *testing.T) {
 				t.Fatalf("spill leaked: %v", files)
 			}
 		})
+	}
+}
+
+func TestTMXCaptureLateErrorAfterKeepAlive(t *testing.T) {
+	capture.Configure(4096, 1024, t.TempDir())
+	defer capture.Configure(0, 0, "")
+	var exchange *capture.Exchange
+	capture.SetSink(func(ex *capture.Exchange) { exchange = ex })
+	defer capture.SetSink(nil)
+	r := gin.New()
+	r.Use(RequestLoggingMiddleware(&spyRequestLogger{}))
+	r.POST("/v1/messages", func(c *gin.Context) {
+		_, _ = c.Writer.Write([]byte(" "))
+		c.Writer.Flush()
+		c.Writer.WriteHeader(http.StatusBadGateway)
+		_, _ = c.Writer.Write([]byte("upstream failed"))
+		wrapper := c.Writer.(*ResponseWriterWrapper)
+		if !wrapper.panicked || wrapper.tmxHandlerPanicked {
+			t.Fatal("late error must set upstream's error flag without recording a handler panic")
+		}
+	})
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"opus"}`)))
+	if exchange == nil {
+		t.Fatal("late error after keep-alive was not captured")
+	}
+	defer exchange.Release()
+	reader, err := exchange.Bodies["response"].Reader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	if err != nil || string(got) != " upstream failed" {
+		t.Fatalf("captured body=%q, err=%v", got, err)
 	}
 }

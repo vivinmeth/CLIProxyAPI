@@ -124,7 +124,7 @@ func (w *ResponseWriterWrapper) tmxDiscard() {
 // the gin context and every spooled source are still available, and copies what it needs.
 func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
 	// A panicked handler's partial exchange is not archived (upstream now finalizes after a panic).
-	if c == nil || !capture.Enabled() || w.requestInfo == nil || c.GetBool(tmxSkipCaptureKey) || w.panicked {
+	if c == nil || !capture.Enabled() || w.requestInfo == nil || c.GetBool(tmxSkipCaptureKey) || w.tmxHandlerPanicked {
 		if w.tmx != nil {
 			w.tmx.body.Release()
 			w.tmx.chunks.Release()

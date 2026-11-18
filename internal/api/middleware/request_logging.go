@@ -101,6 +101,7 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			recovered := recover()
 			if recovered != nil && !isAbortHandlerPanic(recovered) {
 				wrapper.panicked = true
+				wrapper.tmxHandlerPanicked = true // tmx: archive skips only real handler panics.
 				if !wrapper.ResponseWriter.Written() {
 					wrapper.statusCode = http.StatusInternalServerError
 					if wrapper.streamWriter != nil {

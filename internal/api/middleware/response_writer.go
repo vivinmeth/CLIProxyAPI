@@ -57,6 +57,7 @@ type ResponseWriterWrapper struct {
 	finalized           bool                        // finalized prevents post-Finalize writes (e.g. outer recovery) from reopening stream writers.
 	firstChunkTimestamp time.Time                   // firstChunkTimestamp captures TTFB for streaming responses.
 	tmx                 *tmxCapture                 // tokenmaxx fork: lossless capture (response_writer_tmx.go).
+	tmxHandlerPanicked  bool                        // tmx: only a recovered handler panic, not a late error status.
 }
 
 // NewResponseWriterWrapper creates and initializes a new ResponseWriterWrapper.
