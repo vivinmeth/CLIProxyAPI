@@ -2,6 +2,7 @@ package codexchatgpt
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/MoeForge/moego/json"
 	"github.com/klauspost/compress/zstd"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -125,6 +127,7 @@ func TestRefreshBoundsLogFields(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs.Reset()
+			logger.SetFormatter(&log.JSONFormatter{})
 			body, err := json.Marshal(map[string]string{
 				"client_id": tc.clientID, "grant_type": tc.grantType,
 				"refresh_reason": tc.reason, "refresh_token": PlaceholderRefreshToken,
@@ -136,7 +139,7 @@ func TestRefreshBoundsLogFields(t *testing.T) {
 			if w.Code != tc.wantStatus {
 				t.Fatalf("status = %d, want %d", w.Code, tc.wantStatus)
 			}
-			if logs.Len() > 1024 || bytes.Count(logs.Bytes(), []byte("\n")) != 1 {
+			if logs.Len() >= 1024 || bytes.Count(logs.Bytes(), []byte("\n")) != 1 {
 				t.Fatalf("expected one bounded log entry, got %d bytes", logs.Len())
 			}
 			var fields map[string]any
@@ -153,8 +156,22 @@ func TestRefreshBoundsLogFields(t *testing.T) {
 			if fields["placeholder_match"] != true || fields["status"] != float64(tc.wantStatus) {
 				t.Fatal("placeholder match or status missing or incorrect")
 			}
-			if strings.Contains(logs.String(), PlaceholderRefreshToken) || fields["refresh_token"] != nil || fields["body"] != nil {
+			wantMessage := fmt.Sprintf("tmx synthetic Codex token refresh grant_type=%s reason=%s placeholder_match=true status=%d client_id=%s",
+				tc.wantGrant, tc.wantReason, tc.wantStatus, tc.wantClientID)
+			if fields["msg"] != wantMessage {
+				t.Fatal("message does not contain the bounded outcome fields")
+			}
+			if strings.Contains(logs.String(), PlaceholderRefreshToken) || bytes.Contains(logs.Bytes(), body) || fields["refresh_token"] != nil || fields["body"] != nil {
 				t.Fatal("refresh log contains token or body data")
+			}
+			logs.Reset()
+			logger.SetFormatter(&logging.LogFormatter{})
+			call(t, Refresh, http.MethodPost, string(body))
+			if logs.Len() >= 1024 || bytes.Count(logs.Bytes(), []byte("\n")) != 1 || !strings.Contains(logs.String(), wantMessage) {
+				t.Fatal("production formatter must preserve one bounded outcome message")
+			}
+			if strings.Contains(logs.String(), PlaceholderRefreshToken) || bytes.Contains(logs.Bytes(), body) {
+				t.Fatal("production log contains token or body data")
 			}
 		})
 	}
@@ -237,6 +254,10 @@ func TestRefreshOnlyKeepsExactSyntheticLogin(t *testing.T) {
 			}
 			if fields["status"] != float64(tc.want) {
 				t.Fatal("logged status does not match response")
+			}
+			message, _ := fields["msg"].(string)
+			if !strings.Contains(message, fmt.Sprintf("placeholder_match=%t status=%d", fields["placeholder_match"], tc.want)) {
+				t.Fatal("message does not contain the placeholder match and response status")
 			}
 		})
 	}

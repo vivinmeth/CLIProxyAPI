@@ -86,7 +86,8 @@ func Refresh(w http.ResponseWriter, r *http.Request) {
 	log.WithFields(log.Fields{
 		"grant_type": grantType, "client_id": clientID, "refresh_reason": refreshReason,
 		"placeholder_match": placeholderMatch, "status": status,
-	}).Info("tmx synthetic Codex token refresh")
+	}).Infof("tmx synthetic Codex token refresh grant_type=%s reason=%s placeholder_match=%t status=%d client_id=%s",
+		grantType, refreshReason, placeholderMatch, status, clientID)
 	if status == http.StatusOK {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
