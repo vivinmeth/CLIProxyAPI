@@ -15,20 +15,22 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/refusals"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // Event kinds.
 const (
-	KindStart       = "cooldown_start"
-	KindUpdate      = "cooldown_update" // retry_at / reason / status of an open window changed
-	KindEnd         = "cooldown_end"
-	KindRateLimited = "rate_limited_429" // a 429 that isn't a usage limit
-	KindUsageLimit  = "usage_limit"      // plan / usage quota exhausted (429 usage_limit_reached, credential-wide 429, 402)
-	KindAuthError   = "auth_error"       // 401 / 403 / invalid_grant
-	KindOverloaded  = "overloaded"       // 529
-	KindStoreSet    = "store_set"        // trigger on cooldown_store: a cooldown row written
-	KindStoreClear  = "store_cleared"    // trigger on cooldown_store: a cooldown row cleared
+	KindStart          = "cooldown_start"
+	KindUpdate         = "cooldown_update" // retry_at / reason / status of an open window changed
+	KindEnd            = "cooldown_end"
+	KindRateLimited    = "rate_limited_429" // a 429 that isn't a usage limit
+	KindUsageLimit     = "usage_limit"      // plan / usage quota exhausted (429 usage_limit_reached, credential-wide 429, 402)
+	KindAuthError      = "auth_error"       // 401 / 403 / invalid_grant
+	KindAccountRefusal = "account_refusal"  // permanent account refusal, no retry timer
+	KindOverloaded     = "overloaded"       // 529
+	KindStoreSet       = "store_set"        // trigger on cooldown_store: a cooldown row written
+	KindStoreClear     = "store_cleared"    // trigger on cooldown_store: a cooldown row cleared
 )
 
 // Event sources.
@@ -105,6 +107,8 @@ func truncate(s string) string {
 func FailureKind(f auth.FailureReport) string {
 	text := strings.ToLower(f.ErrorCode + " " + f.Message)
 	switch {
+	case refusals.TerminalCode(f.ErrorCode):
+		return KindAccountRefusal
 	case strings.Contains(text, "invalid_grant"):
 		return KindAuthError
 	case f.HTTPStatus == 401 || f.HTTPStatus == 403:
@@ -156,6 +160,13 @@ func failureEvent(f auth.FailureReport) (Event, bool) {
 	if f.RetryAfter != nil && *f.RetryAfter > 0 {
 		ev.RetryAfterMs = f.RetryAfter.Milliseconds()
 		ev.RetryAt = timePtr(f.At.Add(*f.RetryAfter))
+	}
+	if kind == KindAccountRefusal {
+		ev.Reason = f.ErrorCode
+		ev.Message = refusals.StatusMessage(f.ErrorCode)
+		ev.CredScope = true
+		ev.RetryAt = nil
+		ev.RetryAfterMs = 0
 	}
 	return ev, true
 }
