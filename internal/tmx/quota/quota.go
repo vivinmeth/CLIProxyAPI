@@ -751,19 +751,23 @@ func (s *Service) Durability() durability.Stats {
 }
 
 func changed(last written, w Window) bool {
-	if (last.starts == nil) != (w.StartsAt == nil) ||
-		(last.starts != nil && !last.starts.Equal(*w.StartsAt)) {
+	if quotaTimeChanged(last.starts, w.StartsAt) {
 		return true
 	}
 	if (last.used == nil) != (w.UsedPct == nil) ||
 		(last.used != nil && math.Abs(*last.used-*w.UsedPct) >= 0.01) {
 		return true
 	}
-	if (last.resets == nil) != (w.ResetsAt == nil) ||
-		(last.resets != nil && math.Abs(last.resets.Sub(*w.ResetsAt).Seconds()) >= 60) {
+	if quotaTimeChanged(last.resets, w.ResetsAt) {
 		return true
 	}
 	return last.status != w.Status && w.Status != ""
+}
+
+// Relative reset headers can shift both window timestamps slightly between readings.
+func quotaTimeChanged(last, next *time.Time) bool {
+	return (last == nil) != (next == nil) ||
+		(last != nil && next != nil && math.Abs(last.Sub(*next).Seconds()) >= 60)
 }
 
 // ErrUnknownAccount / ErrUnsupportedProvider are returned by PollNow.

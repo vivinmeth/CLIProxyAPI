@@ -78,7 +78,7 @@ func TestQuotaStartsAtMigrationAndHistory(t *testing.T) {
 		t.Fatalf("restored start = %v, want %v", got, start)
 	}
 	s2.record(ctx, "a", []Window{w}, "polled", at.Add(3*time.Minute)) // unchanged after restart
-	changedStart := start.Add(time.Second)
+	changedStart := start.Add(time.Minute)
 	w.StartsAt = &changedStart
 	s2.record(ctx, "a", []Window{w}, "polled", at.Add(4*time.Minute))
 	w.StartsAt = nil

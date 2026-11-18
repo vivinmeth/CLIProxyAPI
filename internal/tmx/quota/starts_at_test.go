@@ -9,6 +9,60 @@ import (
 	"time"
 )
 
+func TestChangedIgnoresCodexRelativeStartDrift(t *testing.T) {
+	at := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	signals := map[string]string{
+		"X-Codex-Primary-Used-Percent":        "12",
+		"X-Codex-Primary-Window-Minutes":      "300",
+		"X-Codex-Primary-Reset-After-Seconds": "600",
+	}
+	first := ParseCodexSignals(signals, at)[0]
+	signals["X-Codex-Primary-Reset-After-Seconds"] = "591"
+	second := ParseCodexSignals(signals, at.Add(10*time.Second))[0]
+	if first.StartsAt == nil || second.StartsAt == nil || second.StartsAt.Sub(*first.StartsAt) != time.Second {
+		t.Fatalf("expected 1 s start drift: first=%+v second=%+v", first, second)
+	}
+	last := written{used: first.UsedPct, resets: first.ResetsAt, starts: first.StartsAt, writtAt: at}
+	if changed(last, second) {
+		t.Fatal("unchanged usage with 1 s start/reset drift should not write a snapshot")
+	}
+}
+
+func TestChangedStartsAtTolerance(t *testing.T) {
+	start := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name    string
+		drift   time.Duration
+		lastNil bool
+		nextNil bool
+		want    bool
+	}{
+		{name: "unchanged"},
+		{name: "forward drift", drift: 59 * time.Second},
+		{name: "backward drift", drift: -59 * time.Second},
+		{name: "forward boundary", drift: time.Minute, want: true},
+		{name: "backward boundary", drift: -time.Minute, want: true},
+		{name: "learned start", lastNil: true, want: true},
+		{name: "lost start", nextNil: true, want: true},
+		{name: "unknown start", lastNil: true, nextNil: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			next := start.Add(tc.drift)
+			last := written{used: pct(12), starts: &start}
+			w := Window{UsedPct: pct(12), StartsAt: &next}
+			if tc.lastNil {
+				last.starts = nil
+			}
+			if tc.nextNil {
+				w.StartsAt = nil
+			}
+			if got := changed(last, w); got != tc.want {
+				t.Fatalf("changed = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestParsersStartsAt(t *testing.T) {
 	const reset = int64(1793500000)
 	at := time.Unix(reset-600, 0).UTC()
