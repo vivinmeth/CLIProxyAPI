@@ -1,11 +1,15 @@
 package codexchatgpt
 
 import (
-	"encoding/json"
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/MoeForge/moego/json"
+	"github.com/klauspost/compress/zstd"
+	log "github.com/sirupsen/logrus"
 )
 
 func call(t *testing.T, h http.HandlerFunc, method, body string) (*httptest.ResponseRecorder, map[string]any) {
@@ -89,5 +93,87 @@ func TestRefreshIsFinal(t *testing.T) {
 	w, out := call(t, Refresh, http.MethodPost, `{"client_id":"app_x","grant_type":"refresh_token","refresh_reason":"unauthorized_recovery","refresh_token":"none"}`)
 	if w.Code != http.StatusUnauthorized || out["error"] != "refresh_token_invalidated" {
 		t.Fatalf("refresh: %d %v", w.Code, out)
+	}
+}
+
+func TestRefreshOnlyKeepsExactSyntheticLogin(t *testing.T) {
+	zstdEncoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zstdEncoder.Close()
+	valid := `{"client_id":"app_x","grant_type":"refresh_token","refresh_token":"` + PlaceholderRefreshToken + `","refresh_reason":"scheduled"}`
+	for _, tc := range []struct {
+		name, body, encoding string
+		want                 int
+	}{
+		{"scheduled", valid, "", http.StatusOK},
+		{"missing reason", strings.ReplaceAll(valid, `,"refresh_reason":"scheduled"`, ""), "", http.StatusOK},
+		{"unknown reason", strings.ReplaceAll(valid, "scheduled", "new_reason"), "", http.StatusOK},
+		{"recovery", strings.ReplaceAll(valid, "scheduled", "unauthorized_recovery"), "", http.StatusUnauthorized},
+		{"suffix", strings.ReplaceAll(valid, PlaceholderRefreshToken, PlaceholderRefreshToken+"-extra"), "", http.StatusUnauthorized},
+		{"prefix", strings.ReplaceAll(valid, PlaceholderRefreshToken, "tmx-synthetic"), "", http.StatusUnauthorized},
+		{"case", strings.ReplaceAll(valid, PlaceholderRefreshToken, strings.ToUpper(PlaceholderRefreshToken)), "", http.StatusUnauthorized},
+		{"real-looking", strings.ReplaceAll(valid, PlaceholderRefreshToken, "rt_test_revoked_0123456789"), "", http.StatusUnauthorized},
+		{"empty token", strings.ReplaceAll(valid, PlaceholderRefreshToken, ""), "", http.StatusUnauthorized},
+		{"wrong grant", strings.ReplaceAll(valid, `"grant_type":"refresh_token"`, `"grant_type":"authorization_code"`), "", http.StatusUnauthorized},
+		{"empty body", "", "", http.StatusUnauthorized},
+		{"not JSON", "not json", "", http.StatusUnauthorized},
+		{"trailing JSON", valid + `{}`, "", http.StatusUnauthorized},
+		{"invalid field type", strings.ReplaceAll(valid, `"scheduled"`, `42`), "", http.StatusUnauthorized},
+		{"zstd", string(zstdEncoder.EncodeAll([]byte(valid), nil)), "zstd", http.StatusUnauthorized},
+		{"zstd header", valid, "zstd", http.StatusUnauthorized},
+		{"too large", valid + strings.Repeat(" ", maxBodyBytes), "", http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			logger := log.StandardLogger()
+			oldOutput, oldFormatter, oldLevel := logger.Out, logger.Formatter, logger.GetLevel()
+			logger.SetOutput(&logs)
+			logger.SetFormatter(&log.JSONFormatter{})
+			logger.SetLevel(log.InfoLevel)
+			defer func() {
+				logger.SetOutput(oldOutput)
+				logger.SetFormatter(oldFormatter)
+				logger.SetLevel(oldLevel)
+			}()
+			req := httptest.NewRequest(http.MethodPost, RefreshPath, strings.NewReader(tc.body))
+			req.Header.Set("Content-Encoding", tc.encoding)
+			w := httptest.NewRecorder()
+			Refresh(w, req)
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d", w.Code, tc.want)
+			}
+			if tc.want == http.StatusOK {
+				if w.Body.String() != "{}" {
+					t.Fatal("success must be exactly an empty JSON object")
+				}
+			} else {
+				var out map[string]any
+				if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil || out["error"] != "refresh_token_invalidated" {
+					t.Fatal("expected the existing final refresh error")
+				}
+			}
+			if bytes.Count(logs.Bytes(), []byte("\n")) != 1 {
+				t.Fatal("expected one structured log line")
+			}
+			for _, forbidden := range []string{PlaceholderRefreshToken, "rt_test_revoked_0123456789", `"refresh_token":`, `"body":`} {
+				if strings.Contains(logs.String(), forbidden) {
+					t.Fatal("refresh log contains token or body data")
+				}
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(logs.Bytes(), &fields); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{"grant_type", "client_id", "refresh_reason", "placeholder_match", "status"} {
+				if _, ok := fields[key]; !ok {
+					t.Errorf("missing log field %s", key)
+				}
+			}
+			if fields["status"] != float64(tc.want) {
+				t.Fatal("logged status does not match response")
+			}
+		})
 	}
 }
