@@ -80,7 +80,7 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			return nil, errRead
 		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return nil, wrapMetaUpstreamError(httpResp.StatusCode, data)
+		return nil, helps.MetaRequestError(wrapMetaUpstreamError(httpResp.StatusCode, data), prepared.body) // tmx
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -219,6 +219,7 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			// Observe upstream content before translation or failure publication.
 			helps.ObserveResponsesTokenEvent(reporter, eventData)
 			if errEvent := metaStreamEventError(eventData); errEvent != nil {
+				errEvent = helps.MetaRequestError(errEvent, prepared.body) // tmx
 				helps.RecordAPIResponseError(ctx, e.cfg, errEvent)
 				reporter.PublishFailure(ctx, errEvent)
 				select {

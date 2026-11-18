@@ -23,3 +23,18 @@ func TestPoolExplainsAccountRefusal(t *testing.T) {
 		}
 	}
 }
+
+func TestPoolExplainsToolAttestationCooldown(t *testing.T) {
+	m := auth.NewManager(nil, nil, nil)
+	ctx := context.Background()
+	_, _ = m.Register(ctx, &auth.Auth{ID: "tools", Provider: "meta", Status: auth.StatusActive})
+	m.MarkResult(ctx, auth.Result{AuthID: "tools", Provider: "meta", Model: "model", Error: &auth.Error{HTTPStatus: 403, Code: refusals.AttestationRefused, Message: `{"error":{"code":"client_attestation_denied"}}`}})
+	a, _ := m.GetByID("tools")
+	got := Build(ctx, []*auth.Auth{a}, nil, nil, nil, "").Credentials[0]
+	if !got.Enabled || got.Status == auth.StatusDisabled || got.Reason != refusals.AttestationRefused || got.StatusMessage != refusals.AttestationRefused || got.NextRetryAfter == nil {
+		t.Fatalf("pool=%+v", got)
+	}
+	if len(got.Cooldowns) != 1 || got.Cooldowns[0].Reason != refusals.AttestationRefused || got.Cooldowns[0].HTTPStatus != 403 {
+		t.Fatalf("pool cooldowns=%+v", got.Cooldowns)
+	}
+}

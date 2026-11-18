@@ -167,6 +167,8 @@ func failureEvent(f auth.FailureReport) (Event, bool) {
 		ev.CredScope = true
 		ev.RetryAt = nil
 		ev.RetryAfterMs = 0
+	} else if f.ErrorCode == refusals.AttestationRefused {
+		ev.Reason = refusals.AttestationRefused
 	}
 	return ev, true
 }
