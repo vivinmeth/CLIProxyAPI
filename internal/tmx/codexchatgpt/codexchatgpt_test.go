@@ -96,6 +96,70 @@ func TestRefreshIsFinal(t *testing.T) {
 	}
 }
 
+func TestRefreshBoundsLogFields(t *testing.T) {
+	var logs bytes.Buffer
+	logger := log.StandardLogger()
+	oldOutput, oldFormatter, oldLevel := logger.Out, logger.Formatter, logger.GetLevel()
+	logger.SetOutput(&logs)
+	logger.SetFormatter(&log.JSONFormatter{})
+	logger.SetLevel(log.InfoLevel)
+	t.Cleanup(func() {
+		logger.SetOutput(oldOutput)
+		logger.SetFormatter(oldFormatter)
+		logger.SetLevel(oldLevel)
+	})
+
+	huge := strings.Repeat("x", 1<<18)
+	for _, tc := range []struct {
+		name, clientID, grantType, reason   string
+		wantClientID, wantGrant, wantReason string
+		wantStatus                          int
+	}{
+		{"huge client", huge, "refresh_token", "scheduled", huge[:64], "refresh_token", "scheduled", http.StatusOK},
+		{"huge reason", "app_x", "refresh_token", huge, "app_x", "refresh_token", "other", http.StatusOK},
+		{"all huge", huge, huge, huge, huge[:64], "other", "other", http.StatusUnauthorized},
+		{"missing reason", "app_x", "refresh_token", "", "app_x", "refresh_token", "missing", http.StatusOK},
+		{"proactive expiry", "app_x", "refresh_token", "proactive_expiry", "app_x", "refresh_token", "proactive_expiry", http.StatusOK},
+		{"forced", "app_x", "refresh_token", "forced", "app_x", "refresh_token", "forced", http.StatusOK},
+		{"unauthorized recovery", "app_x", "refresh_token", "unauthorized_recovery", "app_x", "refresh_token", "unauthorized_recovery", http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs.Reset()
+			body, err := json.Marshal(map[string]string{
+				"client_id": tc.clientID, "grant_type": tc.grantType,
+				"refresh_reason": tc.reason, "refresh_token": PlaceholderRefreshToken,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			w, _ := call(t, Refresh, http.MethodPost, string(body))
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", w.Code, tc.wantStatus)
+			}
+			if logs.Len() > 1024 || bytes.Count(logs.Bytes(), []byte("\n")) != 1 {
+				t.Fatalf("expected one bounded log entry, got %d bytes", logs.Len())
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(logs.Bytes(), &fields); err != nil {
+				t.Fatal(err)
+			}
+			for key, want := range map[string]string{
+				"client_id": tc.wantClientID, "grant_type": tc.wantGrant, "refresh_reason": tc.wantReason,
+			} {
+				if fields[key] != want {
+					t.Errorf("logged %s differs from expected bounded value", key)
+				}
+			}
+			if fields["placeholder_match"] != true || fields["status"] != float64(tc.wantStatus) {
+				t.Fatal("placeholder match or status missing or incorrect")
+			}
+			if strings.Contains(logs.String(), PlaceholderRefreshToken) || fields["refresh_token"] != nil || fields["body"] != nil {
+				t.Fatal("refresh log contains token or body data")
+			}
+		})
+	}
+}
+
 func TestRefreshOnlyKeepsExactSyntheticLogin(t *testing.T) {
 	zstdEncoder, err := zstd.NewWriter(nil)
 	if err != nil {

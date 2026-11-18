@@ -32,7 +32,8 @@ const (
 	RefreshPath   = "/backend-api/tmx/oauth/token"
 	AccountsPath  = "/backend-api/wham/accounts/check"
 
-	// PlaceholderRefreshToken must match PLACEHOLDER_REFRESH in scripts/codex-chatgpt-auth.py.
+	// PlaceholderRefreshToken must match PLACEHOLDER_REFRESH in the umbrella repo's
+	// scripts/codex-chatgpt-auth.py.
 	PlaceholderRefreshToken = "tmx-synthetic-no-refresh"
 
 	// mcpProtocolVersion is answered when the client asks for a version we don't list.
@@ -67,8 +68,23 @@ func Refresh(w http.ResponseWriter, r *http.Request) {
 	if placeholderMatch && req.GrantType == "refresh_token" && req.RefreshReason != "unauthorized_recovery" {
 		status = http.StatusOK
 	}
+	grantType := "other"
+	if req.GrantType == "refresh_token" {
+		grantType = req.GrantType
+	}
+	refreshReason := "other"
+	switch req.RefreshReason {
+	case "":
+		refreshReason = "missing"
+	case "proactive_expiry", "scheduled", "unauthorized_recovery", "forced":
+		refreshReason = req.RefreshReason
+	}
+	clientID := req.ClientID
+	if len(clientID) > 64 {
+		clientID = clientID[:64]
+	}
 	log.WithFields(log.Fields{
-		"grant_type": req.GrantType, "client_id": req.ClientID, "refresh_reason": req.RefreshReason,
+		"grant_type": grantType, "client_id": clientID, "refresh_reason": refreshReason,
 		"placeholder_match": placeholderMatch, "status": status,
 	}).Info("tmx synthetic Codex token refresh")
 	if status == http.StatusOK {
