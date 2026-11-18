@@ -1,4 +1,4 @@
-// Package refusals classifies only evidenced, terminal account refusals.
+// Package refusals classifies evidenced account and request attestation refusals.
 // The auth conductor applies its existing upstream TOS disable transition.
 package refusals
 
@@ -10,6 +10,9 @@ import (
 )
 
 const MetaAttestation = "account_refusal_meta_attestation"
+
+// AttestationRefused marks a tool-bearing request refusal, not an account ban.
+const AttestationRefused = "attestation_refused"
 
 const metaAttestationCode = "client_attestation_denied"
 
@@ -32,6 +35,9 @@ func Detect(provider string, status int, code, body string) string {
 	}
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	code = strings.ToLower(strings.TrimSpace(code))
+	if provider == "meta" && code == AttestationRefused {
+		return AttestationRefused
+	}
 	message := body
 	if ojson.Valid(body) {
 		if code != metaAttestationCode {
@@ -63,4 +69,13 @@ func StatusMessage(code string) string {
 		return metaAttestationCode + ": Meta requires the Muse Code client; resolve before manually re-enabling"
 	}
 	return "tos_violation"
+}
+
+// RedactTOSAppealURL removes signed/tracking query parameters and fragments.
+func RedactTOSAppealURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if idx := strings.IndexAny(trimmed, "?#"); idx >= 0 {
+		trimmed = trimmed[:idx]
+	}
+	return trimmed
 }

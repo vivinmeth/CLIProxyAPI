@@ -4,6 +4,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/refusals" // tmx
 )
 
 // CooldownView describes an unexpired local retry restriction, not overall
@@ -133,6 +135,8 @@ func newCooldownView(scope, model string, next, now time.Time, quota QuotaState,
 
 func cooldownErrorReason(err *Error) string {
 	switch {
+	case err != nil && err.Code == refusals.AttestationRefused: // tmx
+		return refusals.AttestationRefused // tmx
 	case isModelSupportResultError(err):
 		return "model_not_supported"
 	case isCloudflareChallengeResultError(err):

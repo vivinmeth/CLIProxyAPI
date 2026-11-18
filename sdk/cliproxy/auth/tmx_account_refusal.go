@@ -23,7 +23,7 @@ func tmxClassifyAccountRefusal(result Result, a *Auth) Result {
 	if code := refusals.Detect(a.Provider, statusCodeFromResult(result.Error), result.Error.Code, result.Error.Message); code != "" {
 		result.Error = cloneError(result.Error)
 		result.Error.Code = code
-		result.CredentialScope = true
+		result.CredentialScope = refusals.TerminalCode(code)
 	}
 	return result
 }
@@ -53,8 +53,40 @@ func tmxFinalizeAccountRefusal(a *Auth, wasDisabled bool, result Result) bool {
 		a.Metadata = make(map[string]any)
 	}
 	a.Metadata[tmxRefusalMetadataKey] = result.Error.Code
-	log.Warnf("account refusal: credential %s disabled: %s", tmxAuthIndex(a), a.StatusMessage)
+	appeal := refusals.RedactTOSAppealURL(result.Error.Metadata["tos_appeal_url"])
+	if appeal != "" {
+		log.Warnf("account refusal: credential %s disabled: %s; appeal=%s", tmxAuthIndex(a), a.StatusMessage, appeal)
+	} else {
+		log.Warnf("account refusal: credential %s disabled: %s", tmxAuthIndex(a), a.StatusMessage)
+	}
 	return true
+}
+
+func tmxAttestationCooling(a *Auth, model string, now time.Time) bool {
+	if tmxAuthDisabled(a) {
+		return false
+	}
+	if model != "" {
+		s := existingModelState(a, model)
+		return s != nil && s.LastError != nil && s.LastError.Code == refusals.AttestationRefused && s.NextRetryAfter.After(now)
+	}
+	return a.LastError != nil && a.LastError.Code == refusals.AttestationRefused && a.NextRetryAfter.After(now)
+}
+
+func tmxFinalizeAttestationRefusal(a *Auth, model string, wasCooling bool, result Result, now time.Time) {
+	if result.Error == nil || result.Error.Code != refusals.AttestationRefused || !tmxAttestationCooling(a, model, now) {
+		return
+	}
+	// Keep the safe reason in pool output and persisted cooldown windows.
+	if a.LastError != nil && a.LastError.Code == refusals.AttestationRefused {
+		a.StatusMessage = refusals.AttestationRefused
+	}
+	if s := existingModelState(a, model); s != nil && s.LastError != nil && s.LastError.Code == refusals.AttestationRefused {
+		s.StatusMessage = refusals.AttestationRefused
+	}
+	if !wasCooling {
+		log.Warnf("attestation refusal: credential %s cooling: %s", tmxAuthIndex(a), refusals.AttestationRefused)
+	}
 }
 
 // Stores persist token metadata, not runtime status fields. Restore the reason
@@ -64,15 +96,27 @@ func tmxRestoreAccountRefusal(a *Auth) {
 		return
 	}
 	code, _ := a.Metadata[tmxRefusalMetadataKey].(string)
+	if code == "" && tmxTerminalRefusal(a.LastError) {
+		code = a.LastError.Code // Also recover refusals made before the metadata marker existed.
+	}
 	if !refusals.TerminalCode(code) {
 		return
 	}
 	if !tmxAuthDisabled(a) {
 		delete(a.Metadata, tmxRefusalMetadataKey)
+		delete(a.Metadata, "tos_appeal_url")
+		delete(a.Metadata, "tos_appeal_url_text")
 		if tmxTerminalRefusal(a.LastError) {
 			a.LastError = nil
 			a.StatusMessage = ""
 		}
+		now := time.Now()
+		for _, state := range a.ModelStates {
+			if state != nil && tmxTerminalRefusal(state.LastError) {
+				resetModelState(state, now)
+			}
+		}
+		updateAggregatedAvailability(a, now)
 		return
 	}
 	a.Disabled = true

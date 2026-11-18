@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/refusals" // tmx
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
@@ -977,9 +978,5 @@ func antigravityInTOSPause(cfg *config.Config, auth *cliproxyauth.Auth) bool {
 // before logging, so a signed or tracking URL cannot leak through log output.
 // The full URL remains available on the auth record for operator use.
 func redactTOSAppealURL(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	if idx := strings.IndexAny(trimmed, "?#"); idx >= 0 {
-		trimmed = trimmed[:idx]
-	}
-	return trimmed
+	return refusals.RedactTOSAppealURL(raw) // tmx: share the conductor's log redaction.
 }
