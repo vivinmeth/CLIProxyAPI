@@ -79,7 +79,7 @@ func Refresh(w http.ResponseWriter, r *http.Request) {
 	case "proactive_expiry", "scheduled", "unauthorized_recovery", "forced":
 		refreshReason = req.RefreshReason
 	}
-	clientID := req.ClientID
+	clientID := unsafeIDPattern.ReplaceAllString(req.ClientID, "_")
 	if len(clientID) > 64 {
 		clientID = clientID[:64]
 	}
@@ -100,7 +100,12 @@ func Refresh(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-var accountIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+const idCharacters = `A-Za-z0-9._:-`
+
+var (
+	accountIDPattern = regexp.MustCompile(`^[` + idCharacters + `]{1,128}$`)
+	unsafeIDPattern  = regexp.MustCompile(`[^` + idCharacters + `]`)
+)
 
 // Accounts answers workspace discovery after the route's client-key authentication succeeds.
 func Accounts(w http.ResponseWriter, r *http.Request) {

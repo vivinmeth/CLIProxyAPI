@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/MoeForge/moego/json"
 	"github.com/klauspost/compress/zstd"
@@ -118,6 +119,14 @@ func TestRefreshBoundsLogFields(t *testing.T) {
 		wantStatus                          int
 	}{
 		{"huge client", huge, "refresh_token", "scheduled", huge[:64], "refresh_token", "scheduled", http.StatusOK},
+		{"public client", "app_EMoamEEZ73f0CkXaXp7hrann", "refresh_token", "scheduled", "app_EMoamEEZ73f0CkXaXp7hrann", "refresh_token", "scheduled", http.StatusOK},
+		{"allowed characters", "Az09._:-", "refresh_token", "scheduled", "Az09._:-", "refresh_token", "scheduled", http.StatusOK},
+		{"newline", "app_x\nforged", "refresh_token", "scheduled", "app_x_forged", "refresh_token", "scheduled", http.StatusOK},
+		{"carriage return", "app_x\rforged", "refresh_token", "scheduled", "app_x_forged", "refresh_token", "scheduled", http.StatusOK},
+		{"escape", "app_x\u001b[31m", "refresh_token", "scheduled", "app_x__31m", "refresh_token", "scheduled", http.StatusOK},
+		{"tab", "app_x\tforged", "refresh_token", "scheduled", "app_x_forged", "refresh_token", "scheduled", http.StatusOK},
+		{"multi-byte", "app_é😀", "refresh_token", "scheduled", "app___", "refresh_token", "scheduled", http.StatusOK},
+		{"multi-byte at cutoff", strings.Repeat("x", 63) + "é😀tail", "refresh_token", "scheduled", strings.Repeat("x", 63) + "_", "refresh_token", "scheduled", http.StatusOK},
 		{"huge reason", "app_x", "refresh_token", huge, "app_x", "refresh_token", "other", http.StatusOK},
 		{"all huge", huge, huge, huge, huge[:64], "other", "other", http.StatusUnauthorized},
 		{"missing reason", "app_x", "refresh_token", "", "app_x", "refresh_token", "missing", http.StatusOK},
@@ -169,6 +178,18 @@ func TestRefreshBoundsLogFields(t *testing.T) {
 			call(t, Refresh, http.MethodPost, string(body))
 			if logs.Len() >= 1024 || bytes.Count(logs.Bytes(), []byte("\n")) != 1 || !strings.Contains(logs.String(), wantMessage) {
 				t.Fatal("production formatter must preserve one bounded outcome message")
+			}
+			if !utf8.Valid(logs.Bytes()) {
+				t.Fatal("production log must be valid UTF-8")
+			}
+			_, loggedClientID, found := strings.Cut(strings.TrimSuffix(logs.String(), "\n"), "client_id=")
+			if !found || loggedClientID != tc.wantClientID || len(loggedClientID) > 64 {
+				t.Fatal("production log must contain the sanitized, bounded client ID")
+			}
+			for _, char := range loggedClientID {
+				if !strings.ContainsRune("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-", char) {
+					t.Fatal("production log client ID contains an unsafe character")
+				}
 			}
 			if strings.Contains(logs.String(), PlaceholderRefreshToken) || bytes.Contains(logs.Bytes(), body) {
 				t.Fatal("production log contains token or body data")
