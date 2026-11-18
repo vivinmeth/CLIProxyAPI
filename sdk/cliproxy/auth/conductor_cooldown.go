@@ -1569,6 +1569,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	modelKey := canonicalModelKey(result.Model)
 
 	var authSnapshot *Auth
+	refusalTransition := false // tmx: record terminal refusals only once.
 	cooldownStateChanged := false
 	scheduleUnauthorizedRefresh := false
 	now := time.Now()
@@ -1579,6 +1580,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	defer releaseMutation()
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		result = tmxClassifyAccountRefusal(result, auth) // tmx
+		wasDisabled := tmxAuthDisabled(auth)             // tmx
 		if isStaleExecutionResult(result, auth) {
 			staleEpoch := result.RegistrationEpoch > 0 && result.RegistrationEpoch < auth.RegistrationEpoch
 			if !staleEpoch && rejectsToken && result.AccessToken != "" {
@@ -1591,7 +1594,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			releaseMutation()
 			m.hook.OnResult(ctx, result)
 			m.publishErrorEvent(result, nil)
-			tmxReportFailure(result, nil) // tmx
+			tmxReportFailure(result, nil, false) // tmx
 			return
 		}
 		if modelKey == "" && strings.TrimSpace(result.RouteModel) != "" {
@@ -1801,7 +1804,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						state.NextRetryAfter = time.Time{}
 						state.Unavailable = true
 						state.Status = StatusDisabled
-						state.StatusMessage = "tos_violation"
+						state.StatusMessage = tmxRefusalStatusMessage(result.Error) // tmx
 					} else {
 						switch statusCode {
 						case 401, 402, 403:
@@ -2105,7 +2108,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						}
 					}
 					if isTOSViolationResultError(result.Error) {
-						auth.StatusMessage = "tos_violation"
+						auth.StatusMessage = tmxRefusalStatusMessage(result.Error) // tmx
 						auth.Status = StatusDisabled
 						auth.Disabled = true
 						auth.Unavailable = true
@@ -2251,6 +2254,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
+		refusalTransition = tmxFinalizeAccountRefusal(auth, wasDisabled, result) // tmx
 		_ = m.persistLocked(ctx, auth)
 		authSnapshot = auth.Clone()
 		m.tmxReportCooldownsLocked(auth, now) // tmx
@@ -2274,6 +2278,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
+	}
+	if refusalTransition { // tmx
+		m.queueRefreshUnschedule(result.AuthID)
 	}
 	// A newly exhausted Devin credential must join the refresh schedule so
 	// quota revalidation can detect early restoration (issue #6690).
@@ -2300,7 +2307,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
-	tmxReportFailure(result, authSnapshot) // tmx
+	tmxReportFailure(result, authSnapshot, refusalTransition) // tmx
 	m.updateSessionAffinity(result)
 }
 
@@ -3833,10 +3840,7 @@ func isCloudflareChallengeResultError(err *Error) bool {
 // the credential is deactivated instead of cooled; sibling credentials are not
 // hammered during an automated sweep.
 func isTOSViolationResultError(err *Error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(err.Code), "tos_violation")
+	return tmxTerminalRefusal(err) // tmx: share upstream's terminal disable path.
 }
 
 // persistTOSAppealMetadata copies the appeal detail carried on a TOS_VIOLATION
@@ -4301,13 +4305,9 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			}
 		case 402, 403:
 			if isTOSViolationResultError(resultErr) {
-				// Terminal credential suspension: deactivate so the credential is
-				// excluded from selection/rotation, but keep OAuth refresh intact
-				// (the suspension is service-scoped per issue #7515; the token and
-				// model catalog keep working) so operator tooling can verify
-				// account liveness. The appeal detail travels on the result error's
-				// Metadata and is persisted onto the credential record below.
-				auth.StatusMessage = "tos_violation"
+				// Terminal credential suspension: exclude from selection/rotation.
+				// tmx: disabled credentials also stop refreshing until re-enabled.
+				auth.StatusMessage = tmxRefusalStatusMessage(resultErr) // tmx
 				auth.Status = StatusDisabled
 				auth.Disabled = true
 				auth.Unavailable = true

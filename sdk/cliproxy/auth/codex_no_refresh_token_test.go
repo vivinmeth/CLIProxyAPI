@@ -37,6 +37,7 @@ func TestCodexAutoRefreshRequiresRenewalCredential(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, disabled := range []bool{false, true} {
+				want := tc.want && !disabled // tmx: a renewal grant cannot override disable.
 				m := NewManager(nil, &RoundRobinSelector{}, nil)
 				cfg := &internalconfig.Config{}
 				cfg.Home.Enabled = tc.home
@@ -48,15 +49,15 @@ func TestCodexAutoRefreshRequiresRenewalCredential(t *testing.T) {
 				if tc.siwc != nil {
 					a.Metadata["siwc"] = tc.siwc
 				}
-				if got := m.shouldRefresh(a, now); got != tc.want {
-					t.Fatalf("disabled=%v shouldRefresh=%v, want %v", disabled, got, tc.want)
+				if got := m.shouldRefresh(a, now); got != want {
+					t.Fatalf("disabled=%v shouldRefresh=%v, want %v", disabled, got, want)
 				}
-				if _, got := m.nextRefreshCheckAt(now, a, time.Second); got != tc.want {
-					t.Fatalf("disabled=%v scheduled=%v, want %v", disabled, got, tc.want)
+				if _, got := m.nextRefreshCheckAt(now, a, time.Second); got != want {
+					t.Fatalf("disabled=%v scheduled=%v, want %v", disabled, got, want)
 				}
 				a.NextRefreshAfter = now.Add(time.Minute)
-				if _, got := m.nextRefreshCheckAt(now, a, time.Second); got != tc.want {
-					t.Fatalf("disabled=%v pending scheduled=%v, want %v", disabled, got, tc.want)
+				if _, got := m.nextRefreshCheckAt(now, a, time.Second); got != want {
+					t.Fatalf("disabled=%v pending scheduled=%v, want %v", disabled, got, want)
 				}
 			}
 		})

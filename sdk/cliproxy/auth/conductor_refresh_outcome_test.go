@@ -103,14 +103,21 @@ func TestRejectedRefreshJobDoesNotImmediatelyReschedule(t *testing.T) {
 				}
 				wantStatus = StatusDisabled
 			}
-			if !manager.beginRefreshJob(ctx, job) {
-				t.Fatal("expected refresh job to begin")
+			if began := manager.beginRefreshJob(ctx, job); began == (tc.disabled || tc.statusDisabled) {
+				t.Fatal("refresh job must begin only while enabled")
 			}
 			if _, errRefresh := manager.refreshAuthForRequestAtEpoch(ctx, job.id, "", job.registrationEpoch); errRefresh == nil {
 				t.Fatal("expected the previously rejected refresh error")
 			}
 			manager.finishRefreshJob(job, time.Time{}, false)
 			current, _ := manager.GetByID(auth.ID)
+			if tc.disabled || tc.statusDisabled {
+				// tmx: disabled queued jobs never settle or refresh the credential.
+				if _, scheduled := manager.nextRefreshCheckAt(time.Now(), current, refreshCheckInterval); scheduled || executor.RefreshCalls() != 0 {
+					t.Fatal("disabled queued job refreshed or stayed scheduled")
+				}
+				return
+			}
 			if !current.Unavailable || current.Status != wantStatus || !current.RequiresSignIn {
 				t.Fatalf("expired credential must remain unavailable and require sign-in with status %s", wantStatus)
 			}

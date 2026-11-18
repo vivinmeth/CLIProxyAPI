@@ -133,7 +133,7 @@ func (m *Manager) codexAutoRefreshUnavailable(a *Auth, now time.Time) bool {
 }
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
-	if a == nil || m.codexAutoRefreshUnavailable(a, now) {
+	if a == nil || tmxAuthDisabled(a) || m.codexAutoRefreshUnavailable(a, now) { // tmx
 		return false
 	}
 	if hasUnauthorizedAuthFailure(a) || hasDisabledInvalidGrantFailure(a) {
@@ -362,7 +362,7 @@ func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 func (m *Manager) markRefreshPending(loop *authAutoRefreshLoop, id string, registrationEpoch uint64, now time.Time) *authRefreshJob {
 	m.mu.Lock()
 	auth := m.auths[id]
-	if auth == nil || auth.RegistrationEpoch != registrationEpoch || hasUnauthorizedAuthFailure(auth) || hasDisabledInvalidGrantFailure(auth) {
+	if auth == nil || tmxAuthDisabled(auth) || auth.RegistrationEpoch != registrationEpoch || hasUnauthorizedAuthFailure(auth) || hasDisabledInvalidGrantFailure(auth) { // tmx
 		m.mu.Unlock()
 		return nil
 	}
@@ -393,7 +393,7 @@ func (m *Manager) beginRefreshJob(ctx context.Context, job *authRefreshJob) bool
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	auth := m.auths[job.id]
-	if ctx.Err() != nil || m.refreshJobs[job.id] != job || auth == nil || auth.RegistrationEpoch != job.registrationEpoch {
+	if ctx.Err() != nil || m.refreshJobs[job.id] != job || auth == nil || tmxAuthDisabled(auth) || auth.RegistrationEpoch != job.registrationEpoch { // tmx
 		return false
 	}
 	job.running = true
@@ -1326,6 +1326,9 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if auth == nil || exec == nil {
 		return nil, errors.New("auth or executor not found")
 	}
+	if tmxAuthDisabled(auth) { // tmx: even forced refresh requires explicit re-enable.
+		return nil, errors.New("auth is disabled")
+	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		if resolver, okResolver := store.(interface {
 			RefreshJournalFor(*Auth) (codex.RefreshJournal, error)
@@ -1498,6 +1501,11 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		shouldUnschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
+			if tmxHasAccountRefusal(current) { // tmx: an in-flight failure cannot erase a refusal.
+				m.mu.Unlock()
+				m.queueRefreshUnschedule(id)
+				return nil, err
+			}
 			if base != nil && (current.RegistrationEpoch != base.RegistrationEpoch || current.CredentialVersion != base.CredentialVersion || secretGrantChanged(base, current)) {
 				m.mu.Unlock()
 				return nil, err

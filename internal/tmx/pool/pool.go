@@ -3,13 +3,14 @@ package pool
 
 import (
 	"context"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/regexp"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/quota"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/refusals"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	executor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
@@ -26,6 +27,7 @@ type Credential struct {
 	PlanType       string              `json:"plan_type"`
 	Enabled        bool                `json:"enabled"`
 	Status         auth.Status         `json:"status"`
+	StatusMessage  string              `json:"status_message,omitempty"`
 	Unavailable    bool                `json:"unavailable"`
 	NextRetryAfter *time.Time          `json:"next_retry_after"`
 	Reason         string              `json:"reason,omitempty"`
@@ -156,7 +158,10 @@ func Build(ctx context.Context, auths []*auth.Auth, counts map[string]int, accou
 		for _, key := range keys {
 			c.Windows = append(c.Windows, windows[key])
 		}
-		if a.Quota.Exceeded {
+		if !c.Enabled && a.LastError != nil && refusals.TerminalCode(a.LastError.Code) {
+			c.Reason = a.LastError.Code
+			c.StatusMessage = refusals.StatusMessage(a.LastError.Code)
+		} else if a.Quota.Exceeded {
 			c.Reason = "quota"
 		} else if a.LastError != nil {
 			switch a.LastError.HTTPStatus {
