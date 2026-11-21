@@ -20,8 +20,18 @@ func tmxClassifyAccountRefusal(result Result, a *Auth) Result {
 	if result.Success || result.Error == nil || a == nil {
 		return result
 	}
-	if code := refusals.Detect(a.Provider, statusCodeFromResult(result.Error), result.Error.Code, result.Error.Message); code != "" {
-		result.Error = cloneError(result.Error)
+	code := refusals.Detect(a.Provider, statusCodeFromResult(result.Error), result.Error.Code, result.Error.Message)
+	if refusals.GoogleProvider(a.Provider) && result.Error.HTTPStatus == http.StatusForbidden && result.Error.Code == refusals.GoogleValidation {
+		code = refusals.GoogleValidation // Already classified by the executor, without its response body.
+	}
+	if code != "" {
+		if code == refusals.GoogleValidation {
+			// Never clone the raw validation response or any session-bearing metadata.
+			result.Error = &Error{Code: code, Message: refusals.StatusMessage(code), HTTPStatus: http.StatusForbidden}
+			result.RetryAfter = nil
+		} else {
+			result.Error = cloneError(result.Error) // Preserve the legacy ToS appeal contract.
+		}
 		result.Error.Code = code
 		result.CredentialScope = refusals.TerminalCode(code)
 	}

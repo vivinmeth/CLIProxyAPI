@@ -12,6 +12,7 @@ func TestPoolExplainsAccountRefusal(t *testing.T) {
 	for _, tc := range []struct{ provider, code, body, reason string }{
 		{"meta", "", `{"error":{"code":"client_attestation_denied"}}`, refusals.MetaAttestation},
 		{"antigravity", "tos_violation", "TOS_VIOLATION", "tos_violation"},
+		{"antigravity", refusals.GoogleValidation, "https://example.invalid/session-private", refusals.GoogleValidation},
 	} {
 		m := auth.NewManager(nil, nil, nil)
 		_, _ = m.Register(context.Background(), &auth.Auth{ID: "refused", Provider: tc.provider, Status: auth.StatusActive})

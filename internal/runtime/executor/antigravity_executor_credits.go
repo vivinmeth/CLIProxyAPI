@@ -371,15 +371,7 @@ type antigravityTOSViolation struct {
 // Google RPC error body. It returns nil for any other shape, including
 // transient 429 quota errors and non-TOS 403s.
 func parseAntigravityTOSViolation(body []byte) *antigravityTOSViolation {
-	if len(body) == 0 {
-		return nil
-	}
-	code := int(ojson.GetBytesNoCopy(body, "error.code").Int())
-	if code != http.StatusForbidden {
-		return nil
-	}
-	status := strings.TrimSpace(ojson.GetBytesNoCopy(body, "error.status").String())
-	if !strings.EqualFold(status, "PERMISSION_DENIED") {
+	if refusals.Google(http.StatusForbidden, string(body)) != "tos_violation" { // tmx: share exact envelope validation.
 		return nil
 	}
 	details := ojson.GetBytesNoCopy(body, "error.details")
@@ -404,6 +396,10 @@ func parseAntigravityTOSViolation(body []byte) *antigravityTOSViolation {
 }
 
 func newAntigravityStatusErr(statusCode int, body []byte) statusErr {
+	// tmx: classify before copying the body, which can contain a verification session URL.
+	if code := refusals.Google(statusCode, string(body)); code == refusals.GoogleValidation {
+		return statusErr{code: statusCode, msg: refusals.StatusMessage(code), credentialScoped: true, accountRefusalCode: code}
+	}
 	err := statusErr{code: statusCode, msg: string(body)}
 	if statusCode == http.StatusTooManyRequests {
 		if retryAfter, parseErr := helps.ParseRetryDelay(body); parseErr == nil && retryAfter != nil {
@@ -418,6 +414,14 @@ func newAntigravityStatusErr(statusCode int, body []byte) statusErr {
 		}
 	}
 	return err
+}
+
+// tmx: retain ordinary error summaries and the legacy ToS appeal contract.
+func antigravityErrorSummary(status int, contentType string, body []byte) string {
+	if code := refusals.Google(status, string(body)); code == refusals.GoogleValidation {
+		return refusals.StatusMessage(code)
+	}
+	return helps.SummarizeErrorBody(contentType, body)
 }
 
 // applyAntigravityTOSState performs the executor-side bookkeeping for a terminal

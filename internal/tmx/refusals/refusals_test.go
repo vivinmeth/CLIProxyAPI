@@ -1,6 +1,44 @@
 package refusals
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestGoogleExactRefusal(t *testing.T) {
+	const body = `{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Verify at https://example.invalid/session-private","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"VALIDATION_REQUIRED","metadata":{"verification_url":"https://example.invalid/session-private"}}]}}`
+	for _, provider := range []string{"antigravity", "gemini", "gemini-cli"} {
+		for _, tc := range []struct {
+			name, body, want string
+			status           int
+		}{
+			{"validation", body, "account_refusal_google_validation", 403},
+			{"tos", strings.ReplaceAll(body, "VALIDATION_REQUIRED", "TOS_VIOLATION"), "tos_violation", 403},
+			{"http401", body, "", 401},
+			{"http429", body, "", 429},
+			{"http500", body, "", 500},
+			{"wrong code", strings.ReplaceAll(body, `"code":403`, `"code":401`), "", 403},
+			{"string code", strings.ReplaceAll(body, `"code":403`, `"code":"403"`), "", 403},
+			{"fractional code", strings.ReplaceAll(body, `"code":403`, `"code":403.5`), "", 403},
+			{"wrong status", strings.ReplaceAll(body, "PERMISSION_DENIED", "RESOURCE_EXHAUSTED"), "", 403},
+			{"wrong detail", strings.ReplaceAll(body, "google.rpc.ErrorInfo", "google.rpc.Help"), "", 403},
+			{"wrong reason", strings.ReplaceAll(body, "VALIDATION_REQUIRED", "SOME_OTHER_REASON"), "", 403},
+			{"plain permission", `{"error":{"code":403,"status":"PERMISSION_DENIED"}}`, "", 403},
+			{"malformed", body[:len(body)-1], "", 403},
+		} {
+			t.Run(provider+"/"+tc.name, func(t *testing.T) {
+				if got := Detect(provider, tc.status, "", tc.body); got != tc.want {
+					t.Fatalf("Detect = %q, want %q", got, tc.want)
+				}
+			})
+		}
+	}
+	for _, provider := range []string{"meta", "codex", "openai", "claude", "vertex"} {
+		if got := Detect(provider, 403, "", body); got != "" {
+			t.Fatalf("wrong provider %s matched %q", provider, got)
+		}
+	}
+}
 
 func TestDetect(t *testing.T) {
 	for _, tc := range []struct {

@@ -9,9 +9,9 @@ import (
 )
 
 func TestAccountRefusalHasOwnReasonAndNoRetry(t *testing.T) {
-	for _, code := range []string{refusals.MetaAttestation, "tos_violation"} {
+	for _, code := range []string{refusals.MetaAttestation, "tos_violation", refusals.GoogleValidation} {
 		retry := time.Hour
-		ev, ok := failureEvent(auth.FailureReport{At: time.Now(), AuthID: "refused", HTTPStatus: 403, ErrorCode: code, RetryAfter: &retry})
+		ev, ok := failureEvent(auth.FailureReport{At: time.Now(), AuthID: "refused", HTTPStatus: 403, ErrorCode: code, RetryAfter: &retry, Message: "https://example.invalid/verification/session-private"})
 		if !ok || ev.Kind != KindAccountRefusal || ev.Reason != code || !ev.CredScope || ev.RetryAt != nil || ev.RetryAfterMs != 0 || ev.Message != refusals.StatusMessage(code) {
 			t.Fatalf("event=%+v recorded=%v", ev, ok)
 		}
