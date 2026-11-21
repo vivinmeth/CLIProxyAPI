@@ -164,6 +164,9 @@ func failureEvent(f auth.FailureReport) (Event, bool) {
 	if kind == KindAccountRefusal {
 		ev.Reason = f.ErrorCode
 		ev.Message = refusals.StatusMessage(f.ErrorCode)
+		if f.Message == ev.Message+refusals.MemoryOnlySuffix {
+			ev.Message = f.Message
+		} // tmx: fixed persistence note only.
 		ev.CredScope = true
 		ev.RetryAt = nil
 		ev.RetryAfterMs = 0

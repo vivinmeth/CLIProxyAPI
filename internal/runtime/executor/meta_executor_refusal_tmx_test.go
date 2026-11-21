@@ -83,7 +83,7 @@ func TestTMXGoogleValidationExecuteLogsAreBounded(t *testing.T) {
 				if !got.Disabled || got.StatusMessage != refusals.StatusMessage(refusals.GoogleValidation) || resultErr.Code != refusals.GoogleValidation || resultErr.Message != got.StatusMessage || len(resultErr.Metadata) != 0 {
 					t.Errorf("unsafe validation result: %+v", resultErr)
 				}
-				if len(got.Metadata) != len(a.Metadata)+1 || got.Metadata["tmx_account_refusal"] != refusals.GoogleValidation {
+				if len(got.Metadata) != len(a.Metadata)+2 || got.Metadata["disabled"] != true || got.Metadata["tmx_account_refusal"] != refusals.GoogleValidation {
 					t.Errorf("unsafe terminal metadata: %+v", got.Metadata)
 				}
 			}

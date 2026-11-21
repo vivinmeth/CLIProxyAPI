@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -75,6 +76,291 @@ func TestTMXAccountRefusalDisablesOnce(t *testing.T) {
 				if logs != 1 {
 					t.Fatalf("refusal logs = %d, want 1", logs)
 				}
+			}
+		})
+	}
+}
+
+type tmxRefusalStore struct {
+	*reloadAuthStore
+	saves int
+	fail  bool
+	skip  bool
+}
+
+func (s *tmxRefusalStore) Save(ctx context.Context, a *Auth) (string, error) {
+	s.saves++
+	if s.skip {
+		return "", nil
+	}
+	if s.fail {
+		return "", errors.New("synthetic-store-failure https://example.invalid/session-private?token=synthetic-secret")
+	}
+	return s.reloadAuthStore.Save(ctx, a)
+}
+
+func newTMXRefusalStore() *tmxRefusalStore {
+	return &tmxRefusalStore{reloadAuthStore: &reloadAuthStore{records: make(map[string]*Auth), listEntered: make(chan struct{})}}
+}
+
+func tmxRefuseFixture(t *testing.T, m *Manager) *Auth {
+	t.Helper()
+	a, err := m.Register(context.Background(), &Auth{ID: "lifecycle", Provider: "antigravity", Status: StatusActive, Metadata: map[string]any{"access_token": "synthetic-old", "refresh_token": "synthetic-refresh", "note": "old"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.MarkResult(context.Background(), Result{AuthID: a.ID, Provider: a.Provider, Model: "model", Error: &Error{HTTPStatus: 403, Message: tmxGoogleValidationBody}})
+	return a
+}
+
+func assertTMXRefused(t *testing.T, a *Auth) {
+	t.Helper()
+	if a == nil || !a.Disabled || a.Status != StatusDisabled || !a.Unavailable || a.LastError == nil || a.LastError.Code != refusals.GoogleValidation || a.Metadata[tmxRefusalMetadataKey] != refusals.GoogleValidation || a.Metadata["disabled"] != true || !a.NextRetryAfter.IsZero() || !a.NextRefreshAfter.IsZero() {
+		t.Fatalf("refusal lost: %+v", a)
+	}
+	assertTMXNoValidationData(t, fmt.Sprintf("%+v", a.LastError))
+}
+
+func TestTMXRefusalLifecycleOwnsState(t *testing.T) {
+	for _, mode := range []string{"stale", "fresh", "marker-enabled", "refresh", "prepare", "register"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			store := newTMXRefusalStore()
+			m := NewManager(store, nil, nil)
+			stale := tmxRefuseFixture(t, m)
+			incoming := stale.Clone()
+			if mode == "fresh" {
+				incoming = &Auth{ID: stale.ID, Provider: stale.Provider, Status: StatusActive, Metadata: map[string]any{}}
+			}
+			if mode == "marker-enabled" {
+				incoming, _ = m.GetByID(stale.ID)
+				incoming.Disabled = false
+				incoming.Status = StatusActive
+				incoming.Metadata["disabled"] = false
+			}
+			incoming.Metadata["access_token"] = "synthetic-new"
+			incoming.Metadata["note"] = "new"
+			var err error
+			switch mode {
+			case "refresh":
+				_, err = m.UpdateRefreshedAuth(ctx, stale, incoming)
+			case "prepare":
+				_, err = m.UpdatePreparedAuth(ctx, stale, incoming)
+			case "register":
+				_, err = m.Register(ctx, incoming)
+			default:
+				_, err = m.Update(ctx, incoming)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := m.GetByID(stale.ID)
+			assertTMXRefused(t, got)
+			if got.Metadata["access_token"] != "synthetic-new" || got.Metadata["note"] != "new" {
+				t.Fatal("incoming token or unrelated metadata lost")
+			}
+			if mode == "register" && got.RegistrationEpoch <= stale.RegistrationEpoch {
+				t.Fatal("Register did not advance epoch")
+			}
+		})
+	}
+}
+
+func TestTMXRefusalReloadAuthoritativeAndRepairsStore(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		for _, skip := range []bool{false, true} {
+			t.Run(fmt.Sprintf("existing=%v/skip=%v", existing, skip), func(t *testing.T) {
+				ctx := context.Background()
+				store := newTMXRefusalStore()
+				m := NewManager(store, nil, nil)
+				if existing {
+					tmxRefuseFixture(t, m)
+				}
+				metadata := map[string]any{"disabled": false, "access_token": "synthetic-new"}
+				if !existing {
+					metadata[tmxRefusalMetadataKey] = refusals.GoogleValidation
+				}
+				fixture := &Auth{ID: "lifecycle", Provider: "antigravity", Status: StatusActive, Metadata: metadata}
+				store.records[fixture.ID] = fixture
+				if skip {
+					ctx = WithSkipPersist(ctx)
+				}
+				if err := m.Load(ctx); err != nil {
+					t.Fatal(err)
+				}
+				got, _ := m.GetByID(fixture.ID)
+				assertTMXRefused(t, got)
+				if existing && store.records[fixture.ID].Metadata[tmxRefusalMetadataKey] != refusals.GoogleValidation {
+					t.Fatal("reload did not write back preserved refusal")
+				}
+			})
+		}
+	}
+}
+
+func TestTMXRefusalSkipPersistRepairsOnce(t *testing.T) {
+	for _, register := range []bool{false, true} {
+		store := newTMXRefusalStore()
+		m := NewManager(store, nil, nil)
+		stale := tmxRefuseFixture(t, m)
+		before := store.saves
+		var err error
+		if register {
+			_, err = m.Register(WithSkipPersist(context.Background()), stale)
+		} else {
+			_, err = m.Update(WithSkipPersist(context.Background()), stale)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if store.saves != before+1 || store.records[stale.ID].Metadata[tmxRefusalMetadataKey] != refusals.GoogleValidation {
+			t.Fatal("watcher update was not repaired in store")
+		}
+		got, _ := m.GetByID(stale.ID)
+		assertTMXRefused(t, got)
+		before = store.saves
+		if _, err = m.Update(WithSkipPersist(context.Background()), got); err != nil {
+			t.Fatal(err)
+		}
+		if store.saves != before {
+			t.Fatal("marked watcher input causes a write loop")
+		}
+	}
+}
+
+func TestTMXRefusalCleanRegistrationNeedsRemove(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(nil, nil, nil)
+	old := tmxRefuseFixture(t, m)
+	m.Remove(ctx, old.ID)
+	clean, err := m.Register(ctx, &Auth{ID: old.ID, Provider: old.Provider, Status: StatusActive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clean.Disabled || clean.LastError != nil || clean.Metadata[tmxRefusalMetadataKey] != nil {
+		t.Fatal("clean registration refused")
+	}
+	m.MarkResult(ctx, Result{AuthID: old.ID, Provider: old.Provider, RegistrationEpoch: old.RegistrationEpoch, Error: &Error{HTTPStatus: 403, Code: refusals.GoogleValidation}})
+	got, _ := m.GetByID(old.ID)
+	if got.Disabled {
+		t.Fatal("old epoch disabled clean registration")
+	}
+}
+
+func TestTMXRefusalExplicitClearIntent(t *testing.T) {
+	ctx := context.Background()
+	if hasAccountRefusalClear(nil) || hasAccountRefusalClear(ctx) || !hasAccountRefusalClear(WithAccountRefusalClear(nil)) {
+		t.Fatal("clear intent context contract failed")
+	}
+	store := newTMXRefusalStore()
+	m := NewManager(store, nil, nil)
+	stale := tmxRefuseFixture(t, m)
+	got, ok, err := m.Modify(WithAccountRefusalClear(ctx), stale.ID, stale.RegistrationEpoch, func(current *Auth) error { current.Disabled = false; current.Status = StatusActive; return nil })
+	if err != nil || !ok {
+		t.Fatalf("explicit clear failed: %v", err)
+	}
+	if got.Disabled || got.LastError != nil || got.Metadata[tmxRefusalMetadataKey] != nil || got.Metadata["disabled"] != false || got.Unavailable || got.StatusMessage != "" || !modelStateIsClean(got.ModelStates["model"]) {
+		t.Fatalf("explicit clear retained refusal: %+v", got)
+	}
+	if store.records[got.ID].Disabled || store.records[got.ID].Metadata[tmxRefusalMetadataKey] != nil {
+		t.Fatal("clear not persisted")
+	}
+	if next, ok := m.nextRefreshCheckAt(time.Now(), got, refreshCheckInterval); !ok || next.After(time.Now()) {
+		t.Fatal("clear did not resume refresh")
+	}
+	// Intent cannot clear a record that the operator still requests disabled.
+	m.MarkResult(ctx, Result{AuthID: got.ID, Provider: got.Provider, Error: &Error{HTTPStatus: 403, Message: tmxGoogleValidationBody}})
+	_, _, err = m.Modify(WithAccountRefusalClear(ctx), got.ID, got.RegistrationEpoch, func(current *Auth) error { current.Disabled = true; current.Status = StatusDisabled; return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.GetByID(got.ID)
+	assertTMXRefused(t, got)
+}
+
+func TestTMXRefusalPersistedMarkerOverridesEnabledRegister(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	a, err := m.Register(context.Background(), &Auth{ID: "from-store", Provider: "antigravity", Status: StatusActive, Metadata: map[string]any{"disabled": false, tmxRefusalMetadataKey: refusals.GoogleValidation}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTMXRefused(t, a)
+}
+
+func TestTMXRefusalLateResultsAndOrdinaryDisable(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(nil, nil, nil)
+	a := tmxRefuseFixture(t, m)
+	for _, res := range []Result{{AuthID: a.ID, Provider: a.Provider, Success: true}, {AuthID: a.ID, Provider: a.Provider, Error: &Error{HTTPStatus: 429, Message: "rate limited"}}, {AuthID: a.ID, Provider: a.Provider, Error: &Error{HTTPStatus: 500, Message: "failed"}}} {
+		m.MarkResult(ctx, res)
+		got, _ := m.GetByID(a.ID)
+		assertTMXRefused(t, got)
+	}
+	ordinary, err := m.Register(ctx, &Auth{ID: "operator", Provider: "antigravity", Disabled: true, Status: StatusDisabled, Metadata: map[string]any{"disabled": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinary.Disabled = false
+	ordinary.Status = StatusActive
+	ordinary.Metadata["disabled"] = false
+	if _, err = m.Update(ctx, ordinary); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.GetByID(ordinary.ID)
+	if got.Disabled || got.Status != StatusActive {
+		t.Fatal("ordinary operator-disable behavior changed")
+	}
+}
+
+func TestTMXRefusalPersistenceIsHonest(t *testing.T) {
+	oldHooks := log.StandardLogger().ReplaceHooks(make(log.LevelHooks))
+	t.Cleanup(func() { log.StandardLogger().ReplaceHooks(oldHooks) })
+	hook := logtest.NewGlobal()
+	for _, kind := range []string{"saved", "error", "empty-save", "nil-store", "runtime-only", "plugin-virtual", "skip"} {
+		t.Run(kind, func(t *testing.T) {
+			hook.Reset()
+			store := newTMXRefusalStore()
+			m := NewManager(store, nil, nil)
+			if kind == "nil-store" {
+				m = NewManager(nil, nil, nil)
+			}
+			a := &Auth{ID: "persist", Provider: "antigravity", Status: StatusActive, Metadata: map[string]any{}}
+			if kind == "runtime-only" {
+				a.Attributes = map[string]string{"runtime_only": "true"}
+			}
+			if kind == "plugin-virtual" {
+				a.Attributes = map[string]string{AttributePluginVirtual: "true"}
+			}
+			_, _ = m.Register(context.Background(), a)
+			store.fail = kind == "error"
+			store.skip = kind == "empty-save"
+			o := &recordingCooldownObserver{}
+			SetCooldownObserver(o)
+			t.Cleanup(func() { SetCooldownObserver(nil) })
+			ctx := context.Background()
+			if kind == "skip" {
+				ctx = WithSkipPersist(ctx)
+			}
+			failure := Result{AuthID: a.ID, Provider: a.Provider, Error: &Error{HTTPStatus: 403, Message: tmxGoogleValidationBody}}
+			m.MarkResult(ctx, failure)
+			m.MarkResult(ctx, failure)
+			got, _ := m.GetByID(a.ID)
+			if got == nil || !got.Disabled {
+				t.Fatal("memory disable lost")
+			}
+			memoryOnly := kind != "saved"
+			logs := 0
+			for _, entry := range hook.AllEntries() {
+				assertTMXNoValidationData(t, fmt.Sprintf("%s %+v", entry.Message, entry.Data))
+				if strings.HasPrefix(entry.Message, "account refusal:") {
+					logs++
+					if strings.Contains(entry.Message, "memory-only: not persisted") != memoryOnly || (memoryOnly && entry.Level != log.ErrorLevel) {
+						t.Fatalf("dishonest persistence log: %s", entry.Message)
+					}
+				}
+			}
+			if logs != 1 || len(o.failures) != 1 || strings.Contains(o.failures[0].Message, "memory-only: not persisted") != memoryOnly {
+				t.Fatalf("missing persistence note: logs=%d events=%+v", logs, o.failures)
 			}
 		})
 	}
@@ -178,7 +464,7 @@ func TestTMXRefusalReenableRestoresModelAndRefresh(t *testing.T) {
 			}
 			a.Disabled = false
 			a.Status = StatusActive
-			if _, err := m.Update(ctx, a); err != nil {
+			if _, err := m.Update(WithAccountRefusalClear(ctx), a); err != nil {
 				t.Fatal(err)
 			}
 			a, _ = m.GetByID(a.ID)
@@ -397,7 +683,7 @@ func TestTMXAccountRefusalSurvivesMetadataReload(t *testing.T) {
 			}
 			a.Disabled = false
 			a.Status = StatusActive
-			if _, err := reloaded.Update(ctx, a); err != nil {
+			if _, err := reloaded.Update(WithAccountRefusalClear(ctx), a); err != nil {
 				t.Fatal(err)
 			}
 			a, _ = reloaded.GetByID(a.ID)
@@ -415,7 +701,7 @@ func TestTMXGoogleValidationStateHasNoResponseData(t *testing.T) {
 	t.Cleanup(func() { log.StandardLogger().ReplaceHooks(originalHooks) })
 	hook := logtest.NewGlobal()
 	ctx := context.Background()
-	for _, provider := range []string{"antigravity", "gemini", "gemini-cli"} {
+	for _, provider := range []string{"antigravity"} {
 		for _, model := range []string{"", "model"} {
 			t.Run(provider+"/"+model, func(t *testing.T) {
 				hook.Reset()
@@ -437,7 +723,7 @@ func TestTMXGoogleValidationStateHasNoResponseData(t *testing.T) {
 				if !got.Disabled || got.LastError == nil || got.LastError.Code != refusals.GoogleValidation || got.LastError.Message != refusals.StatusMessage(refusals.GoogleValidation) || got.LastError.Retryable || len(got.LastError.Metadata) != 0 {
 					t.Fatalf("unsafe or missing validation state: %+v", got)
 				}
-				if len(got.Metadata) != 1 || got.Metadata[tmxRefusalMetadataKey] != refusals.GoogleValidation {
+				if len(got.Metadata) != 2 || got.Metadata["disabled"] != true || got.Metadata[tmxRefusalMetadataKey] != refusals.GoogleValidation {
 					t.Fatalf("terminal metadata is not a fixed marker: %+v", got.Metadata)
 				}
 				assertTMXNoValidationData(t, fmt.Sprintf("%+v %+v %+v %+v", got.LastError, got.Metadata, got.ModelStates[model], o.failures))
@@ -531,6 +817,8 @@ func TestTMXGoogleOtherFailuresRemainNonterminal(t *testing.T) {
 		{"unproven reason", "antigravity", strings.ReplaceAll(tmxGoogleValidationBody, "VALIDATION_REQUIRED", "OTHER_REASON"), 403},
 		{"malformed", "antigravity", tmxGoogleValidationBody[:len(tmxGoogleValidationBody)-1], 403},
 		{"non Google", "meta", tmxGoogleValidationBody, 403},
+		{"direct gemini", "gemini", tmxGoogleValidationBody, 403},
+		{"plugin gemini CLI", "gemini-cli", tmxGoogleValidationBody, 403},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
