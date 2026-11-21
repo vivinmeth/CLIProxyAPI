@@ -186,7 +186,7 @@ func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
 		}
 	}
 	if ex.SessionID == "" {
-		if _, action := capture.NativeGeminiModelAction(ex.URL); action == "generateContent" || action == "streamGenerateContent" {
+		if capture.NativeGeminiGenerationAction(ex.URL) != "" {
 			ex.SessionID = sessionHint
 		}
 	}

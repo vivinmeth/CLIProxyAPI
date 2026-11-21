@@ -102,17 +102,25 @@ func TestTMXGeminiHandlerManagerCaptureSession(t *testing.T) {
 	records := make(chan usage.Record, 16)
 	usage.RegisterNamedPlugin("tmx-session-boundary-test", tmxSessionUsagePlugin{records})
 	defer usage.RegisterNamedPlugin("tmx-session-boundary-test", tmxSessionUsagePlugin{})
-	for _, action := range []string{"generateContent", "streamGenerateContent"} {
+	for _, route := range []struct{ model, action string }{
+		{"gemini-tmx-session-test", "generateContent"},
+		{"gemini-tmx-session-test", "streamGenerateContent"},
+		{"gemini-2.5-pro(high)", "generateContent"},
+		{"gemini-2.5-pro(high)", "streamGenerateContent"},
+		{"vertex-flash", "generateContent"},
+		{"vertex-flash", "streamGenerateContent"},
+	} {
+		requestedModel, action := route.model, route.action
 		for _, status := range []int{200, 403} {
 			for _, logOn := range []bool{false, true} {
-				t.Run(fmt.Sprintf("%s/%d/log%t", action, status, logOn), func(t *testing.T) {
+				t.Run(fmt.Sprintf("%s/%s/%d/log%t", requestedModel, action, status, logOn), func(t *testing.T) {
 					var ex *capture.Exchange
 					capture.SetSink(func(v *capture.Exchange) { ex = v })
 					defer capture.SetSink(nil)
 					manager := coreauth.NewManager(nil, nil, nil)
 					executor := &tmxSessionExecutor{status: status, cfg: &config.Config{SDKConfig: config.SDKConfig{RequestLog: logOn}}}
 					manager.RegisterExecutor(executor)
-					const model = "gemini-tmx-session-test"
+					model := strings.TrimSuffix(requestedModel, "(high)")
 					a := &coreauth.Auth{ID: "tmx-session-test", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 					if _, err := manager.Register(t.Context(), a); err != nil {
 						t.Fatal(err)
@@ -127,7 +135,7 @@ func TestTMXGeminiHandlerManagerCaptureSession(t *testing.T) {
 						c.Next()
 					}, middleware.RequestLoggingMiddleware(logging.NewFileRequestLogger(logOn, t.TempDir(), "", 0)))
 					r.POST("/v1beta/models/*action", h.GeminiHandler)
-					req := httptest.NewRequest("POST", "/v1beta/models/"+model+":"+action+"?alt=sse", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"synthetic session boundary"}]}]}`))
+					req := httptest.NewRequest("POST", "/v1beta/models/"+requestedModel+":"+action+"?alt=sse", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"synthetic session boundary"}]}]}`))
 					req.Header.Set("Content-Type", "application/json")
 					rec := httptest.NewRecorder()
 					r.ServeHTTP(rec, req)
