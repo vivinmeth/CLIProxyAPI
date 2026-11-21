@@ -21,7 +21,6 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -32,10 +31,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/durability"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/opencode"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/refusals"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/spool"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -128,7 +129,7 @@ func (p providerSpec) pollable(auth *coreauth.Auth) bool {
 // specFor returns the quota spec for an auth, or false when its provider isn't tracked or the
 // account is API-key based (no subscription quota).
 func specFor(auth *coreauth.Auth) (providerSpec, string, bool) {
-	if auth == nil || auth.Disabled {
+	if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
 		return providerSpec{}, "", false
 	}
 	name := strings.ToLower(strings.TrimSpace(auth.Provider))
@@ -165,7 +166,22 @@ type RequestFetcher interface {
 	TmxRequest(ctx context.Context, auth *coreauth.Auth, method, url string, headers map[string]string, body []byte) (int, []byte, error)
 }
 
+// SentRequestFetcher returns the identity that produced a usage response.
+type SentRequestFetcher interface {
+	TmxRequestSent(context.Context, *coreauth.Auth, string, string, map[string]string, []byte) (int, []byte, *coreauth.Auth, error)
+}
+
+// AccountRefuser persists a proven account refusal without inference accounting.
+type AccountRefuser interface {
+	TmxRefuseAccount(context.Context, *coreauth.Auth, string) error
+}
+
 func (s *Service) fetchUsage(ctx context.Context, spec providerSpec, auth *coreauth.Auth) (int, []byte, error) {
+	status, body, _, err := s.fetchUsageSent(ctx, spec, auth)
+	return status, body, err
+}
+
+func (s *Service) fetchUsageSent(ctx context.Context, spec providerSpec, auth *coreauth.Auth) (int, []byte, *coreauth.Auth, error) {
 	url := spec.usageURL
 	if spec.usageURLFor != nil {
 		url = spec.usageURLFor(auth)
@@ -173,19 +189,26 @@ func (s *Service) fetchUsage(ctx context.Context, spec providerSpec, auth *corea
 	if spec.method != "" && spec.method != "GET" {
 		rf, ok := s.fetch.(RequestFetcher)
 		if !ok {
-			return 0, nil, fmt.Errorf("fetcher cannot send %s", spec.method)
+			return 0, nil, nil, fmt.Errorf("fetcher cannot send %s", spec.method)
 		}
 		body := spec.body
 		if spec.bodyFor != nil {
 			var err error
 			body, err = spec.bodyFor(auth)
 			if err != nil {
-				return 0, nil, err
+				return 0, nil, nil, err
 			}
 		}
-		return rf.TmxRequest(ctx, auth, spec.method, url, spec.headers(auth), body)
+		if auth != nil && refusals.GoogleProvider(auth.Provider) {
+			if sentFetcher, ok := s.fetch.(SentRequestFetcher); ok {
+				return sentFetcher.TmxRequestSent(ctx, auth, spec.method, url, spec.headers(auth), body)
+			}
+		}
+		status, response, err := rf.TmxRequest(ctx, auth, spec.method, url, spec.headers(auth), body)
+		return status, response, nil, err
 	}
-	return s.fetch.TmxFetch(ctx, auth, url, spec.headers(auth))
+	status, response, err := s.fetch.TmxFetch(ctx, auth, url, spec.headers(auth))
+	return status, response, nil, err
 }
 
 // Current is the latest reading of one window.
@@ -230,6 +253,7 @@ type account struct {
 	lastPassive time.Time
 	planAt      time.Time
 	pauseUntil  time.Time
+	refused     *quotaAuthIdentity
 	// present: the account was in the auth manager (and tracked) at the last tick. Removed or
 	// disabled accounts keep their history but drop out of Accounts().
 	present bool
@@ -456,6 +480,7 @@ func (s *Service) tick(ctx context.Context) {
 		seen[auth.ID] = true
 		s.mu.Lock()
 		a := s.accountLocked(auth.ID)
+		a.clearReplacedRefusal(auth)
 		a.present = true
 		a.AuthIndex, a.Provider = auth.EnsureIndex(), provider
 		if label := strings.TrimSpace(auth.Label); label != "" {
@@ -520,7 +545,7 @@ func (s *Service) passiveFresh(windows []Window, observed, now time.Time) bool {
 // poll to slowEvery, unless a window only the usage API reports has passed its reset (its value is
 // then stale and must be re-read).
 func (s *Service) pollDueLocked(a *account, passiveWindows []Window, fresh bool, now time.Time) bool {
-	if a.polling != nil || now.Before(a.pauseUntil) {
+	if a.polling != nil || a.refused != nil || now.Before(a.pauseUntil) {
 		return false
 	}
 	if a.LastPollAt == nil {
@@ -551,9 +576,15 @@ func (s *Service) poll(ctx context.Context, spec providerSpec, auth *coreauth.Au
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	now := s.now().UTC()
-	status, body, err := ReadUsage(ctx, auth, func(readCtx context.Context) (int, []byte, error) {
-		return s.fetchUsage(readCtx, spec, auth)
+	status, body, sent, err := ReadUsageSent(ctx, auth, func(readCtx context.Context) (int, []byte, *coreauth.Auth, error) {
+		return s.fetchUsageSent(readCtx, spec, auth)
 	})
+	if err == nil && refusals.GoogleProvider(auth.Provider) {
+		if code := refusals.Google(status, string(body)); code != "" {
+			s.refuseQuotaAccount(ctx, auth, sent, a, code, now)
+			return
+		}
+	}
 	var windows []Window
 	var usagePlan string
 	pollErr := ""
@@ -586,10 +617,11 @@ func (s *Service) poll(ctx context.Context, spec providerSpec, auth *coreauth.Au
 	}
 	s.mu.Lock()
 	a.LastPollAt, a.PollError = &now, pollErr
+	pauseAllowed := err == nil || !refusals.GoogleProvider(auth.Provider)
 	switch {
-	case status == 429:
+	case pauseAllowed && status == 429:
 		a.pauseUntil = now.Add(rateLimitPause)
-	case status == 401 || status == 403:
+	case pauseAllowed && (status == 401 || status == 403):
 		a.pauseUntil = now.Add(authErrorPause)
 	}
 	s.mu.Unlock()
@@ -809,6 +841,7 @@ func (s *Service) PollNow(ctx context.Context, authID string) (Account, bool, er
 	now := s.now()
 	s.mu.Lock()
 	a := s.accountLocked(auth.ID)
+	a.clearReplacedRefusal(auth)
 	a.AuthIndex, a.Provider, a.present = auth.EnsureIndex(), provider, true
 	if label := strings.TrimSpace(auth.Label); label != "" {
 		a.Label = label
@@ -816,7 +849,7 @@ func (s *Service) PollNow(ctx context.Context, authID string) (Account, bool, er
 	if provider == "meta" && a.Plan == "" {
 		a.Plan = metaStoredPlan(auth)
 	}
-	throttled := !spec.pollable(auth) || now.Before(a.pauseUntil) || (a.LastPollAt != nil && now.Sub(*a.LastPollAt) < pollNowMinGap)
+	throttled := a.refused != nil || !spec.pollable(auth) || now.Before(a.pauseUntil) || (a.LastPollAt != nil && now.Sub(*a.LastPollAt) < pollNowMinGap)
 	planDue := now.Sub(a.planAt) >= planEvery
 	waiting := a.polling
 	if !throttled && waiting == nil {
@@ -871,7 +904,7 @@ func (s *Service) viewLocked(a *account) Account {
 				acc.Windows[j], acc.Windows[j-1] = acc.Windows[j-1], acc.Windows[j]
 			}
 		}
-		if a.LastPollAt != nil {
+		if a.LastPollAt != nil && a.refused == nil {
 			every := s.pollEvery
 			if a.PassiveFresh {
 				every = s.slowEvery

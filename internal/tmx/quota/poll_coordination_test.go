@@ -214,3 +214,43 @@ func TestFreshUsageReadNeverJoinsPreRedeemRead(t *testing.T) {
 		t.Fatalf("fresh read = %d %s %v", code, body, err)
 	}
 }
+
+func TestSharedUsageReadCredentialVersionAndSent(t *testing.T) {
+	ctx := context.Background()
+	a := &coreauth.Auth{ID: "version-split", Provider: "antigravity", RegistrationEpoch: 1, CredentialVersion: 1}
+	sent := a.Clone()
+	sent.CredentialVersion = 2
+	entered, release := make(chan struct{}), make(chan struct{})
+	leaderDone := make(chan *coreauth.Auth, 1)
+	go func() {
+		_, _, identity, _ := ReadUsageSent(ctx, a, func(context.Context) (int, []byte, *coreauth.Auth, error) {
+			close(entered)
+			<-release
+			return 403, []byte("old"), sent, nil
+		})
+		leaderDone <- identity
+	}()
+	<-entered
+	// Same version joins and gets exactly the shared sent record.
+	joined := &joinedReadContext{Context: ctx, seen: make(chan struct{})}
+	followerDone := make(chan *coreauth.Auth, 1)
+	go func() {
+		_, _, identity, _ := ReadUsageSent(joined, a, func(context.Context) (int, []byte, *coreauth.Auth, error) {
+			t.Error("same version fetched twice")
+			return 500, nil, nil, nil
+		})
+		followerDone <- identity
+	}()
+	<-joined.seen
+	newer := a.Clone()
+	newer.CredentialVersion = 2
+	status, body, err := ReadUsage(ctx, newer, func(context.Context) (int, []byte, error) { return 200, []byte("new"), nil })
+	// The call must complete while the old-version request is still blocked.
+	if err != nil || status != 200 || string(body) != "new" {
+		t.Errorf("new grant joined old response: %d %q %v", status, body, err)
+	}
+	close(release)
+	if <-leaderDone != sent || <-followerDone != sent {
+		t.Fatal("shared sent identity changed")
+	}
+}

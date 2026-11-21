@@ -18,28 +18,39 @@ const usageReadTimeout = 30 * time.Second
 type usageReply struct {
 	status int
 	body   []byte
+	sent   *coreauth.Auth // Shared read-only identity captured before the provider request.
 }
 
 // ReadUsage coalesces in-progress usage reads across quota polling and reset
 // inventory. Claude callers use the same cedar_ember superset endpoint so both
 // parsers can consume the shared response. Results are not cached after completion.
 func ReadUsage(ctx context.Context, auth *coreauth.Auth, fetch func(context.Context) (int, []byte, error)) (int, []byte, error) {
-	key := strings.ToLower(auth.Provider) + "\x00" + auth.ID + "\x00" + strconv.FormatUint(auth.RegistrationEpoch, 10)
+	status, body, _, err := ReadUsageSent(ctx, auth, func(readCtx context.Context) (int, []byte, *coreauth.Auth, error) {
+		status, body, err := fetch(readCtx)
+		return status, body, nil, err
+	})
+	return status, body, err
+}
+
+// ReadUsageSent shares the same flights as ReadUsage, including the actual sent
+// identity. Callers must not mutate sent; it belongs to the shared response.
+func ReadUsageSent(ctx context.Context, auth *coreauth.Auth, fetch func(context.Context) (int, []byte, *coreauth.Auth, error)) (int, []byte, *coreauth.Auth, error) {
+	key := strings.ToLower(auth.Provider) + "\x00" + auth.ID + "\x00" + strconv.FormatUint(auth.RegistrationEpoch, 10) + "\x00" + strconv.FormatUint(auth.CredentialVersion, 10)
 	done := usageReads.DoChan(key, func() (any, error) {
 		readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageReadTimeout)
 		defer cancel()
-		status, body, err := fetch(readCtx)
-		return usageReply{status: status, body: body}, err
+		status, body, sent, err := fetch(readCtx)
+		return usageReply{status: status, body: body, sent: sent}, err
 	})
 	select {
 	case <-ctx.Done():
-		return 0, nil, ctx.Err()
+		return 0, nil, nil, ctx.Err()
 	case result := <-done:
 		if result.Val == nil {
-			return 0, nil, result.Err
+			return 0, nil, nil, result.Err
 		}
 		reply := result.Val.(usageReply)
-		return reply.status, append([]byte(nil), reply.body...), result.Err
+		return reply.status, append([]byte(nil), reply.body...), reply.sent, result.Err
 	}
 }
 
