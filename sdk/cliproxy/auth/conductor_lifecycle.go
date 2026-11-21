@@ -202,6 +202,12 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		auth.AdoptedGrantHash = AuthGrantFingerprint(auth)
 	}
 	auth.UpdatedAt = now
+	m.mu.RLock()
+	repairRefusal := tmxReconcileAccountRefusal(ctx, m.auths[auth.ID], auth) // tmx
+	m.mu.RUnlock()
+	if repairRefusal {
+		ctx = WithoutSkipPersist(ctx)
+	}
 	cooldownStateChanged := normalizeModelStates(auth)
 	seedInitialForceCooldownDeadlines(auth)
 	if auth.Disabled || auth.Status == StatusDisabled {
@@ -235,7 +241,11 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	// Persist failures stay non-fatal, but must not be silent: a restart would
 	// lose the credential that only exists in memory.
 	if errPersist := m.persistLocked(ctx, auth); errPersist != nil {
-		log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("failed to persist registered auth %s (%s): %v", auth.Provider, auth.ID, errPersist)
+		if tmxHasAccountRefusal(auth) { // tmx: store errors may carry response/credential text.
+			tmxLogAccountRefusal(auth, Result{Error: auth.LastError}, false)
+		} else {
+			log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("failed to persist registered auth %s (%s): %v", auth.Provider, auth.ID, errPersist)
+		}
 	}
 	if m.authEpochs[auth.ID] != auth.RegistrationEpoch {
 		m.mu.Unlock()
@@ -493,6 +503,9 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	}
 	cooldownStateChanged := false
 	now := time.Now()
+	if tmxReconcileAccountRefusal(ctx, existing, auth) {
+		ctx = WithoutSkipPersist(ctx)
+	} // tmx
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if isFileSnapshot {
 			auth.ModelStates = existing.ModelStates
@@ -695,7 +708,11 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			return nil, false, false, fmt.Errorf("persist meta auth: %w", errPersist)
 		}
 		// Ordinary persistence failures remain non-fatal, but never silent.
-		log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("failed to persist updated auth %s (%s): %v", auth.Provider, auth.ID, errPersist)
+		if tmxHasAccountRefusal(auth) { // tmx
+			tmxLogAccountRefusal(auth, Result{Error: auth.LastError}, false)
+		} else {
+			log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("failed to persist updated auth %s (%s): %v", auth.Provider, auth.ID, errPersist)
+		}
 	}
 	if m.authEpochs[auth.ID] != auth.RegistrationEpoch {
 		m.mu.Unlock()
@@ -932,6 +949,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 			continue
 		}
+		repairRefusal := tmxReconcileAccountRefusal(ctx, previousAuths[auth.ID], auth) // tmx
 		auth.EnsureIndex()
 		_ = m.migrateAuthAliasModelStatesLocked(auth, nil, now, false)
 		seedInitialForceCooldownDeadlines(auth)
@@ -950,6 +968,9 @@ func (m *Manager) Load(ctx context.Context) error {
 		}
 		if auth.CredentialVersion == 0 {
 			auth.CredentialVersion = 1
+		}
+		if repairRefusal && !m.tmxPersistAccountRefusalLocked(WithoutSkipPersist(ctx), auth) { // tmx: repair a stale store snapshot once.
+			tmxLogAccountRefusal(auth, Result{Error: auth.LastError}, false)
 		}
 		m.auths[auth.ID] = auth.Clone()
 	}
@@ -1042,7 +1063,8 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 			return errWait
 		}
 		defer releaseFg()
-		_, err := store.Save(ctx, auth)
+		path, err := store.Save(ctx, auth)
+		tmxNoteRefusalSave(ctx, path, err) // tmx: distinguish a successful save from an intentional skip.
 		return err
 	}
 
@@ -1054,6 +1076,7 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 		return errWait
 	}
 	defer releaseFg()
-	_, err := store.Save(ctx, auth)
+	path, err := store.Save(ctx, auth)
+	tmxNoteRefusalSave(ctx, path, err) // tmx
 	return err
 }

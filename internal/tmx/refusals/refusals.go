@@ -14,6 +14,9 @@ const MetaAttestation = "account_refusal_meta_attestation"
 // GoogleValidation requires operator action before this account can infer again.
 const GoogleValidation = "account_refusal_google_validation"
 
+// MemoryOnlySuffix is the fixed persistence warning allowed in refusal events.
+const MemoryOnlySuffix = "; memory-only: not persisted"
+
 // AttestationRefused marks a tool-bearing request refusal, not an account ban.
 const AttestationRefused = "attestation_refused"
 
@@ -63,7 +66,7 @@ func Detect(provider string, status int, code, body string) string {
 // GoogleProvider identifies the Google subscription executors.
 func GoogleProvider(provider string) bool {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "antigravity", "gemini", "gemini-cli":
+	case "antigravity":
 		return true
 	}
 	return false

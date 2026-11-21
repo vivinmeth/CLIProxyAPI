@@ -7,7 +7,7 @@ import (
 
 func TestGoogleExactRefusal(t *testing.T) {
 	const body = `{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Verify at https://example.invalid/session-private","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"VALIDATION_REQUIRED","metadata":{"verification_url":"https://example.invalid/session-private"}}]}}`
-	for _, provider := range []string{"antigravity", "gemini", "gemini-cli"} {
+	for _, provider := range []string{"antigravity"} {
 		for _, tc := range []struct {
 			name, body, want string
 			status           int
@@ -33,7 +33,7 @@ func TestGoogleExactRefusal(t *testing.T) {
 			})
 		}
 	}
-	for _, provider := range []string{"meta", "codex", "openai", "claude", "vertex"} {
+	for _, provider := range []string{"meta", "codex", "openai", "claude", "vertex", "gemini", "gemini-cli"} {
 		if got := Detect(provider, 403, "", body); got != "" {
 			t.Fatalf("wrong provider %s matched %q", provider, got)
 		}

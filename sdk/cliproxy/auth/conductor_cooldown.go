@@ -23,6 +23,7 @@ import (
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/refusals" // tmx
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
@@ -2270,7 +2271,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 		refusalTransition = tmxFinalizeAccountRefusal(auth, wasDisabled, result)          // tmx
 		tmxFinalizeAttestationRefusal(auth, modelKey, wasAttestationCooling, result, now) // tmx
-		_ = m.persistLocked(ctx, auth)
+		if refusalTransition {                                                            // tmx: a nil persistence error can also mean no store write occurred.
+			persisted := m.tmxPersistAccountRefusalLocked(ctx, auth)
+			tmxLogAccountRefusal(auth, result, persisted)
+			if !persisted {
+				result.Error = cloneError(result.Error)
+				result.Error.Message = tmxRefusalStatusMessage(result.Error) + refusals.MemoryOnlySuffix
+			}
+		} else {
+			_ = m.persistLocked(ctx, auth)
+		}
 		authSnapshot = auth.Clone()
 		m.tmxReportCooldownsLocked(auth, now) // tmx
 		if trackCooldownState {

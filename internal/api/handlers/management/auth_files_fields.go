@@ -127,7 +127,11 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
-	updatedAuth, committed, errModify := h.authManager.Modify(ctx, targetAuth.ID, targetAuth.RegistrationEpoch, func(current *coreauth.Auth) error {
+	modifyCtx := ctx
+	if !*req.Disabled {
+		modifyCtx = coreauth.WithAccountRefusalClear(ctx)
+	} // tmx: explicit operator re-enable only.
+	updatedAuth, committed, errModify := h.authManager.Modify(modifyCtx, targetAuth.ID, targetAuth.RegistrationEpoch, func(current *coreauth.Auth) error {
 		applyAuthDisabledState(current, *req.Disabled)
 		return nil
 	})
@@ -171,6 +175,10 @@ func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth
 	}
 	now := time.Now()
 	hookAuths := make([]*coreauth.Auth, 0)
+	modifyCtx := ctx
+	if !disabled {
+		modifyCtx = coreauth.WithAccountRefusalClear(ctx)
+	} // tmx
 	for _, auth := range h.authManager.List() {
 		if auth == nil {
 			continue
@@ -179,7 +187,7 @@ func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth
 			!sameAuthFilePath(authAttribute(auth, coreauth.AttributeVirtualSource), sourcePath) {
 			continue
 		}
-		updated, committed, errUpdate := h.authManager.Modify(ctx, auth.ID, auth.RegistrationEpoch, func(current *coreauth.Auth) error {
+		updated, committed, errUpdate := h.authManager.Modify(modifyCtx, auth.ID, auth.RegistrationEpoch, func(current *coreauth.Auth) error {
 			applyAuthDisabledState(current, disabled)
 			current.UpdatedAt = now
 			return nil
@@ -333,7 +341,14 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return
 	}
 
-	updatedAuth, committed, errModify := h.authManager.Modify(ctx, targetAuth.ID, targetAuth.RegistrationEpoch, func(current *coreauth.Auth) error {
+	modifyCtx := ctx
+	if raw, ok := req["disabled"]; ok { // tmx: notes and other field patches do not grant clear intent.
+		var disabled *bool
+		if json.Unmarshal(raw, &disabled) == nil && disabled != nil && !*disabled {
+			modifyCtx = coreauth.WithAccountRefusalClear(ctx)
+		}
+	}
+	updatedAuth, committed, errModify := h.authManager.Modify(modifyCtx, targetAuth.ID, targetAuth.RegistrationEpoch, func(current *coreauth.Auth) error {
 		return applyAuthFileFieldsPatch(current, req, requestRetryPatch)
 	})
 	if errModify != nil {

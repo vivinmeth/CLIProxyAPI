@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -9,6 +10,25 @@ import (
 )
 
 const tmxRefusalMetadataKey = "tmx_account_refusal"
+
+type accountRefusalClearContextKey struct{}
+
+// WithAccountRefusalClear authorizes one operator-requested re-enable. The
+// incoming auth must also be enabled; the intent is never persisted as metadata.
+func WithAccountRefusalClear(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, accountRefusalClearContextKey{}, true)
+}
+
+func hasAccountRefusalClear(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	clear, _ := ctx.Value(accountRefusalClearContextKey{}).(bool)
+	return clear
+}
 
 func tmxAuthDisabled(a *Auth) bool {
 	return a != nil && (a.Disabled || a.Status == StatusDisabled)
@@ -43,7 +63,77 @@ func tmxTerminalRefusal(err *Error) bool {
 }
 
 func tmxHasAccountRefusal(a *Auth) bool {
-	return tmxAuthDisabled(a) && tmxTerminalRefusal(a.LastError)
+	return tmxAccountRefusalCode(a) != ""
+}
+
+func tmxAccountRefusalCode(a *Auth) string {
+	if a == nil {
+		return ""
+	}
+	code, _ := a.Metadata[tmxRefusalMetadataKey].(string)
+	if refusals.TerminalCode(code) {
+		return code
+	}
+	if tmxTerminalRefusal(a.LastError) {
+		return a.LastError.Code
+	}
+	return ""
+}
+
+// The registered record owns its refusal. Only the explicit operator intent
+// may clear it; missing fields and an enabled incoming copy are not consent.
+// The return value requests repair of storage that omitted the refusal marker.
+func tmxReconcileAccountRefusal(ctx context.Context, existing, incoming *Auth) bool {
+	code := tmxAccountRefusalCode(existing)
+	if code == "" {
+		tmxRestoreAccountRefusal(incoming)
+		return false
+	}
+	if hasAccountRefusalClear(ctx) && !tmxAuthDisabled(incoming) {
+		tmxClearAccountRefusal(incoming)
+		return false
+	}
+	missingMarker := tmxAccountRefusalCodeFromMetadata(incoming) != code
+	if incoming.Metadata == nil {
+		incoming.Metadata = make(map[string]any)
+	}
+	incoming.Metadata[tmxRefusalMetadataKey] = code
+	for _, key := range []string{"tos_appeal_url", "tos_appeal_url_text"} {
+		if value, ok := existing.Metadata[key]; ok {
+			incoming.Metadata[key] = value
+		}
+	}
+	incoming.LastError = cloneError(existing.LastError)
+	tmxRestoreAccountRefusal(incoming)
+	return missingMarker
+}
+
+func tmxAccountRefusalCodeFromMetadata(a *Auth) string {
+	if a == nil {
+		return ""
+	}
+	code, _ := a.Metadata[tmxRefusalMetadataKey].(string)
+	return code
+}
+
+func tmxClearAccountRefusal(a *Auth) {
+	delete(a.Metadata, tmxRefusalMetadataKey)
+	delete(a.Metadata, "tos_appeal_url")
+	delete(a.Metadata, "tos_appeal_url_text")
+	if a.Metadata != nil {
+		a.Metadata["disabled"] = false
+	}
+	a.LastError = nil
+	a.StatusMessage = ""
+	a.NextRetryAfter = time.Time{}
+	a.NextRefreshAfter = time.Time{}
+	now := time.Now()
+	for _, state := range a.ModelStates {
+		if state != nil && tmxTerminalRefusal(state.LastError) {
+			resetModelState(state, now)
+		}
+	}
+	updateAggregatedAvailability(a, now)
 }
 
 func tmxRefusalStatusMessage(err *Error) string {
@@ -51,7 +141,7 @@ func tmxRefusalStatusMessage(err *Error) string {
 }
 
 // The upstream path owns disabling/persistence. Finalize only the new transition:
-// remove refresh scheduling and emit one safe operator log and history event.
+// remove refresh scheduling and prepare one safe operator log and history event.
 func tmxFinalizeAccountRefusal(a *Auth, wasDisabled bool, result Result) bool {
 	if wasDisabled || !tmxAuthDisabled(a) || !tmxTerminalRefusal(result.Error) {
 		return false
@@ -63,13 +153,44 @@ func tmxFinalizeAccountRefusal(a *Auth, wasDisabled bool, result Result) bool {
 		a.Metadata = make(map[string]any)
 	}
 	a.Metadata[tmxRefusalMetadataKey] = result.Error.Code
+	a.Metadata["disabled"] = true
+	return true
+}
+
+func tmxLogAccountRefusal(a *Auth, result Result, persisted bool) {
+	message := "account refusal: credential " + tmxAuthIndex(a) + " disabled: " + tmxRefusalStatusMessage(result.Error)
+	if !persisted {
+		message += refusals.MemoryOnlySuffix
+	}
 	appeal := refusals.RedactTOSAppealURL(result.Error.Metadata["tos_appeal_url"])
 	if appeal != "" {
-		log.Warnf("account refusal: credential %s disabled: %s; appeal=%s", tmxAuthIndex(a), a.StatusMessage, appeal)
-	} else {
-		log.Warnf("account refusal: credential %s disabled: %s", tmxAuthIndex(a), a.StatusMessage)
+		message += "; appeal=" + appeal
 	}
-	return true
+	if persisted {
+		log.Warn(message)
+	} else {
+		log.Error(message)
+	}
+}
+
+type tmxRefusalSaveContextKey struct{}
+type tmxRefusalSaveOutcome struct{ written bool }
+
+func tmxNoteRefusalSave(ctx context.Context, path string, err error) {
+	if ctx != nil {
+		if outcome, ok := ctx.Value(tmxRefusalSaveContextKey{}).(*tmxRefusalSaveOutcome); ok {
+			outcome.written = err == nil && path != ""
+		}
+	}
+}
+
+func (m *Manager) tmxPersistAccountRefusalLocked(ctx context.Context, a *Auth) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	outcome := &tmxRefusalSaveOutcome{}
+	err := m.persistLocked(context.WithValue(ctx, tmxRefusalSaveContextKey{}, outcome), a)
+	return err == nil && outcome.written
 }
 
 func tmxAttestationCooling(a *Auth, model string, now time.Time) bool {
@@ -105,35 +226,22 @@ func tmxRestoreAccountRefusal(a *Auth) {
 	if a == nil {
 		return
 	}
-	code, _ := a.Metadata[tmxRefusalMetadataKey].(string)
-	if code == "" && tmxTerminalRefusal(a.LastError) {
-		code = a.LastError.Code // Also recover refusals made before the metadata marker existed.
-	}
+	code := tmxAccountRefusalCode(a)
 	if !refusals.TerminalCode(code) {
 		return
 	}
-	if !tmxAuthDisabled(a) {
-		delete(a.Metadata, tmxRefusalMetadataKey)
-		delete(a.Metadata, "tos_appeal_url")
-		delete(a.Metadata, "tos_appeal_url_text")
-		if tmxTerminalRefusal(a.LastError) {
-			a.LastError = nil
-			a.StatusMessage = ""
-		}
-		now := time.Now()
-		for _, state := range a.ModelStates {
-			if state != nil && tmxTerminalRefusal(state.LastError) {
-				resetModelState(state, now)
-			}
-		}
-		updateAggregatedAvailability(a, now)
-		return
+	if a.Metadata == nil {
+		a.Metadata = make(map[string]any)
 	}
+	a.Metadata[tmxRefusalMetadataKey] = code
+	a.Metadata["disabled"] = true
 	a.Disabled = true
 	a.Status = StatusDisabled
 	a.Unavailable = true
 	a.StatusMessage = refusals.StatusMessage(code)
 	a.NextRetryAfter = time.Time{}
 	a.NextRefreshAfter = time.Time{}
-	a.LastError = &Error{Code: code, Message: a.StatusMessage, HTTPStatus: http.StatusForbidden}
+	if a.LastError == nil || a.LastError.Code != code || code == refusals.GoogleValidation {
+		a.LastError = &Error{Code: code, Message: a.StatusMessage, HTTPStatus: http.StatusForbidden}
+	}
 }
