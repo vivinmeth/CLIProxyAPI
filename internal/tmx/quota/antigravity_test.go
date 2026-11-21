@@ -102,6 +102,34 @@ func TestAntigravityRejectsUnsupportedOrMalformedData(t *testing.T) {
 	}
 }
 
+func TestAntigravitySkipsMissingFractions(t *testing.T) {
+	spec := antigravityTestSpec(t)
+	for _, missing := range []string{
+		`{"bucketId":"omitted","resetTime":"2026-11-22T00:00:00Z"}`,
+		`{"bucketId":"omitted","remainingFraction":null}`,
+		`{"bucketId":"omitted","remaining_fraction":null}`,
+		`{"bucketId":"omitted","remainingFraction":null,"remaining_fraction":null}`,
+	} {
+		t.Run(missing, func(t *testing.T) {
+			body := fmt.Sprintf(`{"groups":[{"displayName":"Pro","buckets":[%s,{"bucketId":"valid","remainingFraction":0.25,"resetTime":"2026-11-23T00:00:00Z"}]}]}`, missing)
+			ws, _, err := spec.parseUsage([]byte(body))
+			if err != nil || len(ws) != 1 || !strings.HasSuffix(ws[0].Window, ":valid") || ws[0].UsedPct == nil || *ws[0].UsedPct != 75 || ws[0].ResetsAt == nil || ws[0].ResetsAt.Format(time.RFC3339) != "2026-11-23T00:00:00Z" {
+				t.Fatalf("omitted fraction suppressed valid bucket or became usage: %+v %v", ws, err)
+			}
+			allMissing := fmt.Sprintf(`{"groups":[{"buckets":[%s,{}]}]}`, missing)
+			ws, _, err = spec.parseUsage([]byte(allMissing))
+			if err == nil || len(ws) != 0 {
+				t.Fatalf("all omitted fractions became evidence: %+v %v", ws, err)
+			}
+		})
+	}
+	// A null camelCase value may still carry a real fraction in snake_case.
+	ws, _, err := spec.parseUsage([]byte(`{"groups":[{"buckets":[{"remainingFraction":null,"remaining_fraction":0}]}]}`))
+	if err != nil || len(ws) != 1 || ws[0].UsedPct == nil || *ws[0].UsedPct != 100 {
+		t.Fatalf("explicit zero fraction lost: %+v %v", ws, err)
+	}
+}
+
 type agRequest struct{ id, project, method, url string }
 type agFetcher struct {
 	auths    []*coreauth.Auth
@@ -182,11 +210,17 @@ func TestAntigravityPollAccountIsolation(t *testing.T) {
 	if _, throttled, err := s.PollNow(context.Background(), "ag-a"); err != nil || !throttled || len(f.requests) != before {
 		t.Fatal("failed account cooldown not enforced", err)
 	}
-	now = now.Add(time.Minute)
-	f.replies["ag-b"] = fakeRoute{200, `{"groups":[]}`}
-	bad, throttled, err := s.PollNow(context.Background(), "ag-b")
-	if err != nil || throttled || bad.PollError == "" || len(bad.Windows) != 1 || *bad.Windows[0].UsedPct != 50 || !bad.Windows[0].ObservedAt.Equal(healthy.Windows[0].ObservedAt) {
-		t.Fatalf("malformed response cleared evidence: %+v %v", bad, err)
+	for _, body := range []string{
+		`{"groups":[]}`,
+		`{"groups":[{"buckets":[{}, {"remainingFraction":null,"remaining_fraction":null}]}]}`,
+		`{"groups":[{"buckets":[{"remainingFraction":0.5},{"remainingFraction":"broken"}]}]}`,
+	} {
+		now = now.Add(time.Minute)
+		f.replies["ag-b"] = fakeRoute{200, body}
+		bad, throttled, err := s.PollNow(context.Background(), "ag-b")
+		if err != nil || throttled || bad.PollError == "" || len(bad.Windows) != 1 || *bad.Windows[0].UsedPct != 50 || !bad.Windows[0].ObservedAt.Equal(healthy.Windows[0].ObservedAt) {
+			t.Fatalf("missing/malformed response cleared evidence: %+v %v", bad, err)
+		}
 	}
 	// Removing project metadata is an account error before the authenticated adapter.
 	now = now.Add(time.Minute)
