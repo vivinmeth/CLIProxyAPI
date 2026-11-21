@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -37,8 +38,9 @@ func (p tmxSessionUsagePlugin) HandleUsage(_ context.Context, r usage.Record) {
 }
 
 type tmxSessionExecutor struct {
-	status int
-	cfg    *config.Config
+	status        int
+	cfg           *config.Config
+	expectedModel string
 }
 type tmxSessionStatusError struct{}
 
@@ -46,6 +48,9 @@ func (tmxSessionStatusError) Error() string    { return "synthetic refusal" }
 func (tmxSessionStatusError) StatusCode() int  { return 403 }
 func (*tmxSessionExecutor) Identifier() string { return "tmx-session-synthetic" }
 func (e *tmxSessionExecutor) record(ctx context.Context, a *coreauth.Auth, req coreexecutor.Request) error {
+	if e.expectedModel != "" && req.Model != e.expectedModel {
+		return fmt.Errorf("manager execution model = %q, want %q", req.Model, e.expectedModel)
+	}
 	// The real manager supplies session metadata, and the actual usage reporter publishes it.
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{Method: "POST", URL: "https://offline.invalid/synthetic"})
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), req.Model, a)
@@ -109,6 +114,10 @@ func TestTMXGeminiHandlerManagerCaptureSession(t *testing.T) {
 		{"gemini-2.5-pro(high)", "streamGenerateContent"},
 		{"vertex-flash", "generateContent"},
 		{"vertex-flash", "streamGenerateContent"},
+		{"native/gemini-3-pro-preview", "generateContent"},
+		{"test/vertex-pro", "streamGenerateContent"},
+		{"native%2Fgemini-3-pro-preview", "generateContent"},
+		{"test%2Fvertex-pro", "streamGenerateContent"},
 	} {
 		requestedModel, action := route.model, route.action
 		for _, status := range []int{200, 403} {
@@ -120,8 +129,15 @@ func TestTMXGeminiHandlerManagerCaptureSession(t *testing.T) {
 					manager := coreauth.NewManager(nil, nil, nil)
 					executor := &tmxSessionExecutor{status: status, cfg: &config.Config{SDKConfig: config.SDKConfig{RequestLog: logOn}}}
 					manager.RegisterExecutor(executor)
-					model := strings.TrimSuffix(requestedModel, "(high)")
+					model, err := url.PathUnescape(strings.TrimSuffix(requestedModel, "(high)"))
+					if err != nil {
+						t.Fatal(err)
+					}
 					a := &coreauth.Auth{ID: "tmx-session-test", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+					if prefix, upstreamModel, prefixed := strings.Cut(model, "/"); prefixed {
+						a.Prefix = prefix
+						executor.expectedModel = upstreamModel
+					}
 					if _, err := manager.Register(t.Context(), a); err != nil {
 						t.Fatal(err)
 					}

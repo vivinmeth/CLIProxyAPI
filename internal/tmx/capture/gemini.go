@@ -3,7 +3,6 @@ package capture
 import (
 	"net/url"
 	"strings"
-	"unicode"
 )
 
 // NativeGeminiModelAction returns only a validated model identifier and native
@@ -22,8 +21,8 @@ func NativeGeminiModelAction(rawURL string) (string, string) {
 }
 
 // NativeGeminiGenerationAction recognizes generation routes independently of
-// model labels. Aliases and thinking suffixes can route successfully without
-// being safe labels; this helper returns only the action, never URL model text.
+// model labels. Like GeminiHandler, it requires one colon and a nonempty model,
+// without validating model text. Only the action leaves this helper, never URL text.
 func NativeGeminiGenerationAction(rawURL string) string {
 	_, action := nativeGeminiPath(rawURL)
 	if action == "generateContent" || action == "streamGenerateContent" {
@@ -40,10 +39,7 @@ func nativeGeminiPath(rawURL string) (string, string) {
 	for _, prefix := range []string{"/v1beta/models/", "/v1/models/", "/models/"} {
 		if native, ok := strings.CutPrefix(u.Path, prefix); ok {
 			model, action, found := strings.Cut(native, ":")
-			if !found || model == "" || action == "" || strings.ContainsAny(model, "/\\?#") || strings.Contains(action, ":") {
-				return "", ""
-			}
-			if strings.ContainsFunc(model, func(c rune) bool { return unicode.IsSpace(c) || unicode.IsControl(c) }) {
+			if !found || model == "" || action == "" || strings.Contains(action, ":") {
 				return "", ""
 			}
 			return model, action
