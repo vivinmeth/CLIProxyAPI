@@ -69,8 +69,8 @@ type antigravityBucket struct {
 
 // ParseAntigravityUsage consumes CPAMC's groups/buckets quota contract. Each
 // group and bucket keeps its own identity and reset. The response supplies no
-// plan; CPAMC gets subscription metadata separately. Missing data is an error,
-// so polling cannot replace earlier evidence with made-up zero usage.
+// plan; CPAMC gets subscription metadata separately. Buckets without fractions
+// are skipped; no usable buckets is an error that preserves earlier evidence.
 func ParseAntigravityUsage(body []byte) ([]Window, string, error) {
 	var payload struct {
 		Groups []struct {
@@ -97,9 +97,12 @@ func ParseAntigravityUsage(body []byte) ([]Window, string, error) {
 			if len(raw) == 0 || string(raw) == "null" {
 				raw = bucket.RemainingSnake
 			}
+			if len(raw) == 0 || string(raw) == "null" {
+				continue
+			}
 			var value any
 			if err := json.Unmarshal(raw, &value); err != nil {
-				return nil, "", errors.New("antigravity quota: missing or malformed remaining fraction")
+				return nil, "", errors.New("antigravity quota: malformed remaining fraction")
 			}
 			remaining := math.NaN()
 			switch v := value.(type) {
