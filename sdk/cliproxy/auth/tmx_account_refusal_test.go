@@ -919,3 +919,120 @@ func TestTMXTerminalRefusalPrecedesRequestScopedAction(t *testing.T) {
 		}
 	}
 }
+
+func TestTMXQuotaRefusalTransition(t *testing.T) {
+	ctx := context.Background()
+	for _, code := range []string{refusals.GoogleValidation, "tos_violation"} {
+		t.Run(code, func(t *testing.T) {
+			store := newTMXRefusalStore()
+			hook := &recordingHook{}
+			m := NewManager(store, nil, hook)
+			observer := &recordingCooldownObserver{}
+			SetCooldownObserver(observer)
+			defer SetCooldownObserver(nil)
+			sent, err := m.Register(ctx, &Auth{ID: "quota", Provider: "antigravity", Status: StatusActive, Metadata: map[string]any{"access_token": "access", "refresh_token": "grant"}, LastError: &Error{Code: "unauthorized", HTTPStatus: 401}, NextRefreshAfter: time.Now().Add(time.Hour)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, _ := m.GetByID(sent.ID)
+			m.refreshLoop = newAuthAutoRefreshLoop(m, time.Minute, 1)
+			m.refreshLoop.upsert(sent.ID, time.Now().Add(time.Hour))
+			m.refreshLoop.queueReschedule(sent.ID)
+			saves := store.saves
+			if err = m.TmxRefuseAccount(ctx, sent, code); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := m.GetByID(sent.ID)
+			if !got.Disabled || got.Status != StatusDisabled || got.Metadata[tmxRefusalMetadataKey] != code || !got.NextRefreshAfter.IsZero() || got.Generation != before.Generation+1 {
+				t.Fatalf("refusal not applied: %+v", got)
+			}
+			if got.Failed != before.Failed || got.Success != before.Success || got.recentRequests != before.recentRequests || hook.lastResult.Load() != nil {
+				t.Fatal("quota refusal recorded an inference")
+			}
+			if store.saves != saves+1 || len(observer.failures) != 1 {
+				t.Fatal("missing save or event")
+			}
+			if _, scheduled := m.refreshLoop.peek(); scheduled || len(m.refreshLoop.dirty) != 0 {
+				t.Fatal("quota refusal left refresh scheduled")
+			}
+			if err = m.TmxRefuseAccount(ctx, sent, code); err != nil || store.saves != saves+1 || len(observer.failures) != 1 {
+				t.Fatal("refusal not idempotent")
+			}
+			restarted := NewManager(store, nil, nil)
+			if err = restarted.Load(ctx); err != nil {
+				t.Fatal(err)
+			}
+			restored, _ := restarted.GetByID(sent.ID)
+			if !restored.Disabled || restored.Metadata[tmxRefusalMetadataKey] != code || restarted.shouldRefresh(restored, time.Now().Add(24*time.Hour)) {
+				t.Fatal("reload lost durable refusal")
+			}
+		})
+	}
+}
+
+func TestTMXQuotaRefusalIdentity(t *testing.T) {
+	for _, action := range []string{"reregister", "new-grant", "new-grant-same-access", "same-grant-refresh", "late-after-clear", "non-google", "invalid-code", "delete"} {
+		t.Run(action, func(t *testing.T) {
+			ctx := context.Background()
+			store := newTMXRefusalStore()
+			m := NewManager(store, nil, nil)
+			observer := &recordingCooldownObserver{}
+			SetCooldownObserver(observer)
+			defer SetCooldownObserver(nil)
+			sent, _ := m.Register(ctx, &Auth{ID: "identity", Provider: "antigravity", Status: StatusActive, Metadata: map[string]any{"access_token": "access", "refresh_token": "grant"}})
+			code := refusals.GoogleValidation
+			switch action {
+			case "reregister":
+				m.Remove(ctx, sent.ID)
+				_, _ = m.Register(ctx, sent.Clone())
+			case "new-grant", "new-grant-same-access", "same-grant-refresh":
+				_, _, _ = m.Modify(ctx, sent.ID, sent.RegistrationEpoch, func(a *Auth) error {
+					if action != "new-grant-same-access" {
+						a.Metadata["access_token"] = "new-access"
+					}
+					if action == "new-grant" || action == "new-grant-same-access" {
+						a.Metadata["refresh_token"] = "new-grant"
+					}
+					return nil
+				})
+			case "late-after-clear":
+				if err := m.TmxRefuseAccount(ctx, sent, code); err != nil {
+					t.Fatal(err)
+				}
+				_, _, err := m.Modify(WithAccountRefusalClear(ctx), sent.ID, sent.RegistrationEpoch, func(a *Auth) error { a.Disabled = false; a.Status = StatusActive; return nil })
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "non-google":
+				_, _, _ = m.Modify(ctx, sent.ID, sent.RegistrationEpoch, func(a *Auth) error { a.Provider = "codex"; return nil })
+			case "invalid-code":
+				code = "not-terminal"
+			case "delete":
+				m.Remove(ctx, sent.ID)
+			}
+			saves := store.saves
+			events := len(observer.failures)
+			before, _ := m.GetByID(sent.ID)
+			err := m.TmxRefuseAccount(ctx, sent, code)
+			got, exists := m.GetByID(sent.ID)
+			apply := action == "same-grant-refresh" || action == "late-after-clear"
+			if apply {
+				if err != nil || !got.Disabled || store.saves != saves+1 {
+					t.Fatalf("same grant lost terminal refusal: %v", err)
+				}
+			} else {
+				if err == nil || exists && got.Disabled || store.saves != saves || len(observer.failures) != events {
+					t.Fatalf("stale/invalid refusal applied: %v", err)
+				}
+			}
+			if exists && (got.Failed != before.Failed || got.Success != before.Success || got.recentRequests != before.recentRequests) {
+				t.Fatal("quota refusal changed inference accounting")
+			}
+			if action == "reregister" || action == "new-grant" || action == "new-grant-same-access" || action == "delete" {
+				if !errors.Is(err, ErrTmxRefusalStale) {
+					t.Fatalf("wrong stale error: %v", err)
+				}
+			}
+		})
+	}
+}

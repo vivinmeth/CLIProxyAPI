@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -10,6 +11,70 @@ import (
 )
 
 const tmxRefusalMetadataKey = "tmx_account_refusal"
+
+// ErrTmxRefusalStale means the response belongs to a superseded registration or grant.
+var ErrTmxRefusalStale = errors.New("account refusal belongs to a superseded credential")
+
+var errTmxRefusalUnavailable = errors.New("account refusal could not be persisted")
+var errTmxRefusalInvalid = errors.New("invalid account refusal")
+
+// TmxRefuseAccount applies a proven quota refusal without recording an inference.
+// The sent snapshot must describe the credentials that produced the response.
+func (m *Manager) TmxRefuseAccount(ctx context.Context, sent *Auth, code string) error {
+	if m == nil || sent == nil || sent.ID == "" || !refusals.TerminalCode(code) {
+		return errTmxRefusalInvalid
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	release, err := m.lockAuthMutationContext(ctx, sent.ID)
+	if err != nil {
+		return errTmxRefusalUnavailable
+	}
+	defer release()
+	result := Result{AuthID: sent.ID, Provider: sent.Provider, RegistrationEpoch: sent.RegistrationEpoch,
+		CredentialVersion: sent.CredentialVersion, AccessToken: authAccessToken(sent), RefreshToken: authRefreshToken(sent),
+		CredentialScope: true, Error: &Error{Code: code, Message: refusals.StatusMessage(code), HTTPStatus: http.StatusForbidden}}
+	m.mu.Lock()
+	current := m.auths[sent.ID]
+	// Google grant replacement wins even when the new grant retains the old
+	// access token, which the shared stale helper otherwise accepts immediately.
+	grantChanged := current != nil && refusals.GoogleProvider(current.Provider) && current.CredentialVersion != sent.CredentialVersion && authRefreshToken(current) != result.RefreshToken
+	if current == nil || current.RegistrationEpoch != sent.RegistrationEpoch || grantChanged || isStaleExecutionResult(result, current) {
+		m.mu.Unlock()
+		return ErrTmxRefusalStale
+	}
+	if !refusals.GoogleProvider(current.Provider) || !refusals.GoogleProvider(sent.Provider) {
+		m.mu.Unlock()
+		return errTmxRefusalInvalid
+	}
+	if tmxAuthDisabled(current) {
+		m.mu.Unlock()
+		return nil
+	}
+	current.LastError = cloneError(result.Error)
+	tmxRestoreAccountRefusal(current)
+	tmxFinalizeAccountRefusal(current, false, result)
+	current.Generation++
+	current.UpdatedAt = time.Now()
+	persisted := m.tmxPersistAccountRefusalLocked(ctx, current)
+	tmxLogAccountRefusal(current, result, persisted)
+	snapshot := current.Clone()
+	m.mu.Unlock()
+	release()
+	if m.scheduler != nil {
+		m.scheduler.upsertAuthResult(snapshot, nil, true)
+	}
+	m.queueRefreshUnschedule(sent.ID)
+	if !persisted {
+		result.Error.Message += refusals.MemoryOnlySuffix
+	}
+	tmxReportFailure(result, snapshot, true)
+	if !persisted {
+		return errTmxRefusalUnavailable
+	}
+	return nil
+}
 
 type accountRefusalClearContextKey struct{}
 
