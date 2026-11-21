@@ -76,6 +76,8 @@ type providerSpec struct {
 	usageURLFor func(*coreauth.Auth) string
 	method      string
 	body        []byte
+	// bodyFor, when set, builds the request body from this account's metadata.
+	bodyFor func(*coreauth.Auth) ([]byte, error)
 	// canPoll, when set, reports whether an account can be polled; others stay passive-only.
 	canPoll    func(*coreauth.Auth) bool
 	headers    func(*coreauth.Auth) map[string]string
@@ -115,7 +117,8 @@ var providers = map[string]providerSpec{
 		passive:    ParseCodexSignals,
 		parseUsage: ParseCodexUsage,
 	},
-	"meta": metaSpec,
+	"meta":        metaSpec,
+	"antigravity": antigravitySpec,
 }
 
 func (p providerSpec) pollable(auth *coreauth.Auth) bool {
@@ -172,7 +175,15 @@ func (s *Service) fetchUsage(ctx context.Context, spec providerSpec, auth *corea
 		if !ok {
 			return 0, nil, fmt.Errorf("fetcher cannot send %s", spec.method)
 		}
-		return rf.TmxRequest(ctx, auth, spec.method, url, spec.headers(auth), spec.body)
+		body := spec.body
+		if spec.bodyFor != nil {
+			var err error
+			body, err = spec.bodyFor(auth)
+			if err != nil {
+				return 0, nil, err
+			}
+		}
+		return rf.TmxRequest(ctx, auth, spec.method, url, spec.headers(auth), body)
 	}
 	return s.fetch.TmxFetch(ctx, auth, url, spec.headers(auth))
 }
@@ -773,7 +784,7 @@ func quotaTimeChanged(last, next *time.Time) bool {
 // ErrUnknownAccount / ErrUnsupportedProvider are returned by PollNow.
 var (
 	ErrUnknownAccount      = errors.New("unknown auth_id")
-	ErrUnsupportedProvider = errors.New("quota polling supports claude, codex and meta subscription accounts only")
+	ErrUnsupportedProvider = errors.New("quota polling supports claude, codex, meta and antigravity subscription accounts only")
 )
 
 // PollNow polls one account immediately and returns its fresh state. A second call within 30 s,
