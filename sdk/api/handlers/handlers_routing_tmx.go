@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/clients"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/muse"
 )
@@ -24,20 +26,38 @@ func tmxContributorBlocked(models ...string) *interfaces.ErrorMessage {
 	return nil
 }
 
-// tmxProvidersForExecution is providersForExecution plus the owner's per-client rule (tokenmaxx
-// fork; internal/tmx/clients): a Codex client asking for a Claude model, by id, alias or any route
-// that resolves to the Claude provider (the final model, after "auto" resolves), gets a 400 before
-// routing. Any request on the Responses API counts as Codex's: no other client sends Claude models
-// there. Claude work goes through Claude Code.
+// tmxProvidersForExecution checks resolved routes before dispatch: Grok-shell uses only xAI,
+// and Codex/Responses clients cannot request Claude models (internal/tmx/clients).
 func (h *BaseAPIHandler) tmxProvidersForExecution(ctx context.Context, entryProtocol, modelName, originalRequestedModel string, allowImageModel bool, routeDecision modelRouteDecision, execOptions modelExecutionOptions) ([]string, string, *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
 	if errMsg != nil {
 		return providers, normalizedModel, errMsg
 	}
-	if errMsg = tmxCodexClaudeRefusal(ctx, entryProtocol, providers, originalRequestedModel, modelName, normalizedModel, routeDecision.Model); errMsg != nil {
+	if errMsg = tmxClientModelRefusal(ctx, entryProtocol, providers, execOptions.Headers, originalRequestedModel, modelName, normalizedModel, routeDecision.Model); errMsg != nil {
 		return nil, "", errMsg
 	}
 	return providers, normalizedModel, nil
+}
+
+// tmxClientModelRefusal applies Grok's boundary alongside the existing Codex/Responses rule.
+// Plugin executors pass no providers, so their opaque routes cannot prove xAI identity.
+// Explicit helper headers may identify Grok, but cannot erase an inbound Grok identity.
+func tmxClientModelRefusal(ctx context.Context, entryProtocol string, providers []string, headers http.Header, models ...string) *interfaces.ErrorMessage {
+	if clients.IsGrokShell(tmxRequestHeaders(ctx)) || clients.IsGrokShell(headers) {
+		allowed := clients.OnlyXAI(providers)
+		for _, model := range models {
+			if model == "" || strings.TrimSpace(thinking.ParseSuffix(model).ModelName) == "auto" {
+				continue
+			}
+			if !clients.ResolvesOnlyToXAI(model, nil) {
+				allowed = false
+			}
+		}
+		if !allowed {
+			return &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: errors.New(clients.GrokModelErrorBody(models[0]))}
+		}
+	}
+	return tmxCodexClaudeRefusal(ctx, entryProtocol, providers, models...)
 }
 
 // tmxCodexClaudeRefusal is the per-client rule's check, also run before a plugin executor (which

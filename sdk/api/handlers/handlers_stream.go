@@ -364,7 +364,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		return nil, nil, errChan
 	}
 	if routeDecision.ExecutorPluginID != "" {
-		if errMsg := tmxCodexClaudeRefusal(ctx, entryProtocol, nil, originalRequestedModel, modelName, routeDecision.Model); errMsg != nil { // tmx
+		if errMsg := tmxClientModelRefusal(ctx, entryProtocol, nil, execOptions.Headers, originalRequestedModel, modelName, routeDecision.Model); errMsg != nil { // tmx
 			errChan := make(chan *interfaces.ErrorMessage, 1)
 			errChan <- errMsg
 			close(errChan)

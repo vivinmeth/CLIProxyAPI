@@ -16,3 +16,21 @@ func tmxListedModelInfos(infos []*registry.ModelInfo) []*registry.ModelInfo {
 	}
 	return out
 }
+
+func tmxGrokRegistryModelAllowed(id string) bool {
+	return !clients.Hidden(id) && clients.ResolvesOnlyToXAI(id, nil)
+}
+
+// Home is authoritative for its catalog, including unknown or mixed routes. Do not
+// substitute local registry metadata when Home's route evidence is incomplete.
+func tmxGrokHomeModelAllowed(entry homeModelEntry, providers []string) bool {
+	if clients.Hidden(entry.id) || !clients.OnlyXAI(providers) {
+		return false
+	}
+	for _, route := range entry.routes {
+		if !clients.OnlyXAI([]string{route.provider}) {
+			return false
+		}
+	}
+	return true
+}

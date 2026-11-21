@@ -16,12 +16,19 @@ import (
 func TestModelsDispatchByGrokShellUserAgent(t *testing.T) {
 	modelRegistry := registry.GetGlobalRegistry()
 	clientID := "test-grok-shell-model-list"
-	modelRegistry.RegisterClient(clientID, "openai", []*registry.ModelInfo{
-		{ID: "grok-shell-openai-model", DisplayName: "Grok Shell Model", ContextLength: 256000, Thinking: &registry.ThinkingSupport{Levels: []string{"high"}}},
+	modelRegistry.RegisterClient(clientID, "xai", []*registry.ModelInfo{
+		{ID: "grok-shell-xai-model", DisplayName: "Grok Shell Model", ContextLength: 256000, Thinking: &registry.ThinkingSupport{Levels: []string{"high"}}},
+		{ID: "quiet-choice", MetadataModelID: "grok-shell-xai-model"},
+		{ID: "mixed-choice"},
 	})
 	modelRegistry.RegisterClient(clientID+"-claude", "claude", []*registry.ModelInfo{
 		{ID: "grok-shell-claude-model", DisplayName: "Claude Catalog Model", ContextLength: 200000},
+		{ID: "mixed-choice"},
 	})
+	for _, provider := range []string{"codex", "meta", "antigravity", "openai"} {
+		modelRegistry.RegisterClient(clientID+"-"+provider, provider, []*registry.ModelInfo{{ID: "grok-looking-" + provider, OwnedBy: "xai"}})
+		t.Cleanup(func() { modelRegistry.UnregisterClient(clientID + "-" + provider) })
+	}
 	t.Cleanup(func() {
 		modelRegistry.UnregisterClient(clientID)
 		modelRegistry.UnregisterClient(clientID + "-claude")
@@ -62,11 +69,11 @@ func TestModelsDispatchByGrokShellUserAgent(t *testing.T) {
 			if response.Object != "list" {
 				t.Fatalf("object = %q, want list", response.Object)
 			}
-			var foundOpenAI, foundClaude bool
+			var foundXAI, foundAlias bool
 			for _, model := range response.Data {
 				switch model.ID {
-				case "grok-shell-openai-model":
-					foundOpenAI = true
+				case "grok-shell-xai-model":
+					foundXAI = true
 					if model.Model != model.ID || model.Name != "Grok Shell Model" || model.ContextWindow != 256000 {
 						t.Fatalf("OpenAI model mapping = %#v", model)
 					}
@@ -76,21 +83,14 @@ func TestModelsDispatchByGrokShellUserAgent(t *testing.T) {
 					if len(model.ReasoningEfforts) != 1 || model.ReasoningEfforts[0].Value != "high" {
 						t.Fatalf("OpenAI reasoning efforts = %#v", model.ReasoningEfforts)
 					}
-				case "grok-shell-claude-model":
-					foundClaude = true
-					if model.Model != model.ID || model.Name != "Claude Catalog Model" || model.ContextWindow != 200000 {
-						t.Fatalf("Claude model mapping = %#v", model)
-					}
-					if len(model.ReasoningEfforts) != 0 {
-						t.Fatalf("Claude reasoning efforts = %#v, want none", model.ReasoningEfforts)
-					}
+				case "quiet-choice":
+					foundAlias = true
+				case "grok-shell-claude-model", "mixed-choice", "grok-looking-codex", "grok-looking-meta", "grok-looking-antigravity", "grok-looking-openai":
+					t.Fatalf("non-xAI model leaked to Grok: %#v", model)
 				}
 			}
-			if !foundOpenAI {
-				t.Fatalf("registered OpenAI Grok model missing: %s", recorder.Body.String())
-			}
-			if !foundClaude {
-				t.Fatalf("registered Claude Grok model missing: %s", recorder.Body.String())
+			if !foundXAI || !foundAlias {
+				t.Fatalf("registered xAI Grok model missing: %s", recorder.Body.String())
 			}
 		})
 	}
@@ -135,8 +135,12 @@ func TestModelsDispatchKeepsOrdinaryOpenAIResponse(t *testing.T) {
 
 func TestGrokHomeModelAdapterOmitsReasoning(t *testing.T) {
 	models := grokModelsFromHomeEntries([]homeModelEntry{
-		{id: "home-model", displayName: "Home Model", contextLength: 1234},
-		{id: "home-model-without-context", displayName: "No Context Model"},
+		{id: "home-model", providers: []string{"xai"}, displayName: "Home Model", contextLength: 1234},
+		{id: "home-model-without-context", providers: []string{"xai"}, displayName: "No Context Model"},
+		{id: "grok-looking-claude", providers: []string{"claude"}},
+		{id: "unknown-home-model"},
+		{id: "mixed-home-model", providers: []string{"xai", "meta"}},
+		{id: "partly-unknown-home-model", providers: []string{"xai"}, nativeCapabilityRoutes: []registry.NativeCapabilityRoute{{Provider: "xai"}, {Provider: ""}}},
 	})
 	if len(models) != 2 {
 		t.Fatalf("Home model count = %d, want 2", len(models))

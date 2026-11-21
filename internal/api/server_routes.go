@@ -684,7 +684,11 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 
 func grokModelsFromHomeEntries(entries []homeModelEntry) []grokbuild.ModelInfo {
 	models := make([]grokbuild.ModelInfo, 0, len(entries))
+	providersForModel := homeProvidersForModel(entries)
 	for _, entry := range entries {
+		if !tmxGrokHomeModelAllowed(entry, providersForModel(entry.id)) { // tmx
+			continue
+		}
 		models = append(models, grokbuild.ModelInfo{
 			ID:            entry.id,
 			DisplayName:   entry.displayName,
@@ -697,7 +701,7 @@ func grokModelsFromHomeEntries(entries []homeModelEntry) []grokbuild.ModelInfo {
 func grokModelsFromRegistryInfos(infos []*registry.ModelInfo) []grokbuild.ModelInfo {
 	models := make([]grokbuild.ModelInfo, 0, len(infos))
 	for _, info := range infos {
-		if info == nil {
+		if info == nil || !tmxGrokRegistryModelAllowed(info.ID) { // tmx
 			continue
 		}
 		model := grokbuild.ModelInfo{

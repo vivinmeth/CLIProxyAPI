@@ -60,7 +60,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 		return nil, nil, errMsg
 	}
 	if routeDecision.ExecutorPluginID != "" {
-		if errMsg := tmxCodexClaudeRefusal(ctx, entryProtocol, nil, originalRequestedModel, modelName, routeDecision.Model); errMsg != nil { // tmx
+		if errMsg := tmxClientModelRefusal(ctx, entryProtocol, nil, execOptions.Headers, originalRequestedModel, modelName, routeDecision.Model); errMsg != nil { // tmx
 			return nil, nil, errMsg
 		}
 		return h.executeWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
@@ -143,7 +143,7 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	originalRequestedModel := modelName
 	routeDecision := h.applyModelRouter(ctx, handlerType, modelName, rawJSON, false, execOptions)
 	if routeDecision.ExecutorPluginID != "" {
-		if errMsg := tmxCodexClaudeRefusal(ctx, handlerType, nil, originalRequestedModel, modelName, routeDecision.Model); errMsg != nil { // tmx
+		if errMsg := tmxClientModelRefusal(ctx, handlerType, nil, execOptions.Headers, originalRequestedModel, modelName, routeDecision.Model); errMsg != nil { // tmx
 			return nil, nil, errMsg
 		}
 		return h.countWithPluginExecutor(ctx, handlerType, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)

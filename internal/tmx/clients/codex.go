@@ -4,12 +4,12 @@
 package clients
 
 import (
-	"encoding/json"
 	"net/http"
-	"regexp"
 	"strings"
 	"sync/atomic"
 
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/regexp"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 

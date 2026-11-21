@@ -1,12 +1,12 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/clients"
 )
@@ -220,13 +220,16 @@ func TestTmxOtherListsHideZen(t *testing.T) {
 		}
 		return rec.Body.String()
 	}
-	for _, body := range []string{get("/v1beta/models", ""), get("/v1/models", "grok-shell/1.0.70")} {
+	for _, body := range []string{get("/v1beta/models", ""), get("/v1/models", "curl/8")} {
 		if strings.Contains(body, "opencode-zen/") {
 			t.Errorf("list shows Zen: %.300s", body)
 		}
 		if !strings.Contains(body, "opencode-go/kimi-k3") {
 			t.Errorf("list lost the Go model: %.300s", body)
 		}
+	}
+	if body := get("/v1/models", "grok-shell/1.0.70"); strings.Contains(body, "opencode-") || strings.Contains(body, "claude-") {
+		t.Errorf("Grok catalog shows a non-xAI model: %.300s", body)
 	}
 	if body := get("/v1/models?client_version=cpa", ""); !strings.Contains(body, "claude-opus-5-5") || strings.Contains(body, "opencode-zen/") {
 		t.Errorf("cpa catalog = %.300s", body)
