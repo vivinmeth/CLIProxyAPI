@@ -1559,7 +1559,20 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	if m != nil {
 		if policy := m.ResultPolicy(); policy != nil {
+			// tmx: proven account refusals outrank retry policies. Classify using
+			// the registered provider before a policy can replace the evidence.
+			m.mu.RLock()
+			result = tmxClassifyAccountRefusal(result, m.auths[result.AuthID])
+			m.mu.RUnlock()
+			terminal := !result.Success && tmxTerminalRefusal(result.Error) && statusCodeFromResult(result.Error) == http.StatusForbidden
+			terminalResult := result
+			if terminal {
+				terminalResult.Error = cloneError(result.Error)
+			}
 			result = policy.ApplyResultPolicy(ctx, result)
+			if terminal {
+				result = terminalResult
+			}
 			if result.AuthID == "" {
 				return
 			}

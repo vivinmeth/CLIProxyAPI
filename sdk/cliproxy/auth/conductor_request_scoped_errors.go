@@ -379,6 +379,9 @@ func applyRequestScopedActionToResult(action string, okAction bool, result *Resu
 	if !okAction || result == nil || result.Error == nil {
 		return
 	}
+	if tmxTerminalRefusal(result.Error) { // tmx: an account refusal cannot become periodic retries.
+		return
+	}
 	if action == RequestScopedActionStop || action == RequestScopedActionContinue {
 		result.Error.Code = ErrorCodeRequestScoped
 	} else if action == RequestScopedActionStopAndCooldown || action == RequestScopedActionContinueAndCooldown {

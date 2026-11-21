@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ func TestTMXAccountRefusalDisablesOnce(t *testing.T) {
 		{"meta_text", "meta", "", "Muse Code subscriptions cover requests from the Muse Code client only.", refusals.MetaAttestation},
 		{"meta_direct_code", "meta", "client_attestation_denied", "refused", refusals.MetaAttestation},
 		{"upstream_tos", "antigravity", "tos_violation", "TOS_VIOLATION", "tos_violation"},
+		{"google_validation", "antigravity", refusals.GoogleValidation, "ignored", refusals.GoogleValidation},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			originalHooks := log.StandardLogger().ReplaceHooks(make(log.LevelHooks))
@@ -153,12 +155,12 @@ func TestTMXToolAttestationKeepsCooldownAndSibling(t *testing.T) {
 }
 
 func TestTMXRefusalReenableRestoresModelAndRefresh(t *testing.T) {
-	for _, code := range []string{refusals.MetaAttestation, "tos_violation"} {
+	for _, code := range []string{refusals.MetaAttestation, "tos_violation", refusals.GoogleValidation} {
 		for _, legacy := range []bool{false, true} {
 			ctx := context.Background()
 			m := NewManager(nil, nil, nil)
 			e := &mockOAuthErrorExecutor{id: "meta"}
-			if code == "tos_violation" {
+			if code != refusals.MetaAttestation {
 				e.id = "antigravity"
 			}
 			m.RegisterExecutor(e)
@@ -364,13 +366,13 @@ func TestTMXInflightRefreshPreservesAccountRefusal(t *testing.T) {
 }
 
 func TestTMXAccountRefusalSurvivesMetadataReload(t *testing.T) {
-	for _, code := range []string{refusals.MetaAttestation, "tos_violation"} {
+	for _, code := range []string{refusals.MetaAttestation, "tos_violation", refusals.GoogleValidation} {
 		for _, load := range []bool{false, true} {
 			ctx := context.Background()
 			m := NewManager(nil, nil, nil)
 			provider := "meta"
 			rawCode := "client_attestation_denied"
-			if code == "tos_violation" {
+			if code != refusals.MetaAttestation {
 				provider = "antigravity"
 				rawCode = code
 			}
@@ -402,6 +404,230 @@ func TestTMXAccountRefusalSurvivesMetadataReload(t *testing.T) {
 			if a.Metadata[tmxRefusalMetadataKey] != nil || tmxTerminalRefusal(a.LastError) {
 				t.Fatal("explicit re-enable retained terminal marker")
 			}
+		}
+	}
+}
+
+const tmxGoogleValidationBody = `{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Verify at https://example.invalid/verification/session-private?token=synthetic-secret","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"VALIDATION_REQUIRED","metadata":{"verification_url":"https://example.invalid/verification/session-private?token=synthetic-secret"}}]}}`
+
+func TestTMXGoogleValidationStateHasNoResponseData(t *testing.T) {
+	originalHooks := log.StandardLogger().ReplaceHooks(make(log.LevelHooks))
+	t.Cleanup(func() { log.StandardLogger().ReplaceHooks(originalHooks) })
+	hook := logtest.NewGlobal()
+	ctx := context.Background()
+	for _, provider := range []string{"antigravity", "gemini", "gemini-cli"} {
+		for _, model := range []string{"", "model"} {
+			t.Run(provider+"/"+model, func(t *testing.T) {
+				hook.Reset()
+				store := &reloadAuthStore{records: make(map[string]*Auth), listEntered: make(chan struct{})}
+				h := &recordingHook{}
+				m := NewManager(store, nil, h)
+				o := &recordingCooldownObserver{}
+				SetCooldownObserver(o)
+				t.Cleanup(func() { SetCooldownObserver(nil) })
+				for _, id := range []string{"refused", "sibling"} {
+					if _, err := m.Register(ctx, &Auth{ID: id, Provider: provider, Status: StatusActive}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				retry := time.Hour
+				failure := Result{AuthID: "refused", Provider: provider, Model: model, RetryAfter: &retry, Error: &Error{HTTPStatus: 403, Retryable: true, Message: tmxGoogleValidationBody, Metadata: map[string]string{"tos_appeal_url": "https://example.invalid/session-private", "verification_url": "synthetic-secret"}}}
+				m.MarkResult(ctx, failure)
+				got, _ := m.GetByID("refused")
+				if !got.Disabled || got.LastError == nil || got.LastError.Code != refusals.GoogleValidation || got.LastError.Message != refusals.StatusMessage(refusals.GoogleValidation) || got.LastError.Retryable || len(got.LastError.Metadata) != 0 {
+					t.Fatalf("unsafe or missing validation state: %+v", got)
+				}
+				if len(got.Metadata) != 1 || got.Metadata[tmxRefusalMetadataKey] != refusals.GoogleValidation {
+					t.Fatalf("terminal metadata is not a fixed marker: %+v", got.Metadata)
+				}
+				assertTMXNoValidationData(t, fmt.Sprintf("%+v %+v %+v %+v", got.LastError, got.Metadata, got.ModelStates[model], o.failures))
+				if len(o.failures) != 1 || o.failures[0].Message != refusals.StatusMessage(refusals.GoogleValidation) || o.failures[0].RetryAfter != nil {
+					t.Fatalf("unsafe refusal event: %+v", o.failures)
+				}
+				observed := h.lastResult.Load()
+				if observed == nil || observed.Error.Message != refusals.StatusMessage(refusals.GoogleValidation) || len(observed.Error.Metadata) != 0 {
+					t.Fatalf("unsafe result hook: %+v", observed)
+				}
+				if failure.Error.Message != tmxGoogleValidationBody || failure.Error.Metadata["verification_url"] != "synthetic-secret" {
+					t.Fatal("classification mutated caller-owned response")
+				}
+				m.MarkResult(ctx, failure)
+				if len(o.failures) != 1 {
+					t.Fatal("duplicate refusal event")
+				}
+				logs := 0
+				for _, entry := range hook.AllEntries() {
+					assertTMXNoValidationData(t, fmt.Sprintf("%s %+v", entry.Message, entry.Data))
+					if strings.HasPrefix(entry.Message, "account refusal:") {
+						logs++
+					}
+				}
+				if logs != 1 {
+					t.Fatalf("refusal logs = %d", logs)
+				}
+				sibling, _ := m.GetByID("sibling")
+				if sibling.Disabled || sibling.Unavailable || sibling.LastError != nil {
+					t.Fatal("refusal affected sibling")
+				}
+				store.mu.Lock()
+				saved := store.records["refused"].Clone()
+				store.mu.Unlock()
+				assertTMXNoValidationData(t, fmt.Sprintf("%+v %+v", saved.LastError, saved.Metadata))
+				// Real stores retain disabled metadata, not runtime error/model fields.
+				store.mu.Lock()
+				store.records["refused"] = &Auth{ID: saved.ID, Provider: provider, Disabled: saved.Disabled, Metadata: saved.Metadata}
+				store.mu.Unlock()
+				restarted := NewManager(store, nil, nil)
+				if err := restarted.Load(ctx); err != nil {
+					t.Fatal(err)
+				}
+				restored, _ := restarted.GetByID("refused")
+				if !restored.Disabled || restored.LastError == nil || restored.LastError.Code != refusals.GoogleValidation || restored.StatusMessage != got.StatusMessage {
+					t.Fatal("restart lost validation refusal")
+				}
+				if m.shouldRefresh(restored, time.Now().Add(365*24*time.Hour)) {
+					t.Fatal("validation auth wants refresh")
+				}
+				assertTMXNoValidationData(t, fmt.Sprintf("%+v %+v", restored.LastError, restored.Metadata))
+			})
+		}
+	}
+}
+
+func assertTMXNoValidationData(t *testing.T, value string) {
+	t.Helper()
+	for _, forbidden := range []string{"https://", "example.invalid", "session-private", "synthetic-secret", "verification_url", `"details"`} {
+		if strings.Contains(value, forbidden) {
+			t.Fatalf("validation response data retained: %s", value)
+		}
+	}
+}
+
+func TestTMXGoogleValidationRejectsStaleRegistration(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(nil, nil, nil)
+	old, _ := m.Register(ctx, &Auth{ID: "epoch", Provider: "antigravity", Status: StatusActive})
+	current, _ := m.Register(ctx, &Auth{ID: old.ID, Provider: old.Provider, Status: StatusActive})
+	if current.RegistrationEpoch <= old.RegistrationEpoch {
+		t.Fatal("registration epoch did not advance")
+	}
+	m.MarkResult(ctx, Result{AuthID: old.ID, Provider: old.Provider, RegistrationEpoch: old.RegistrationEpoch, Error: &Error{HTTPStatus: 403, Message: tmxGoogleValidationBody}})
+	got, _ := m.GetByID(old.ID)
+	if got.Disabled || got.Status != StatusActive || got.LastError != nil || got.Metadata[tmxRefusalMetadataKey] != nil {
+		t.Fatal("stale refusal disabled newer registration")
+	}
+}
+
+func TestTMXGoogleOtherFailuresRemainNonterminal(t *testing.T) {
+	for _, tc := range []struct {
+		name, provider, body string
+		status               int
+	}{
+		{"unauthorized", "antigravity", tmxGoogleValidationBody, 401},
+		{"rate limited", "antigravity", tmxGoogleValidationBody, 429},
+		{"server error", "antigravity", tmxGoogleValidationBody, 500},
+		{"missing HTTP status", "antigravity", tmxGoogleValidationBody, 0},
+		{"plain permission", "antigravity", `{"error":{"code":403,"status":"PERMISSION_DENIED"}}`, 403},
+		{"unproven reason", "antigravity", strings.ReplaceAll(tmxGoogleValidationBody, "VALIDATION_REQUIRED", "OTHER_REASON"), 403},
+		{"malformed", "antigravity", tmxGoogleValidationBody[:len(tmxGoogleValidationBody)-1], 403},
+		{"non Google", "meta", tmxGoogleValidationBody, 403},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			m := NewManager(nil, nil, nil)
+			_, _ = m.Register(ctx, &Auth{ID: "ordinary", Provider: tc.provider, Status: StatusActive})
+			m.MarkResult(ctx, Result{AuthID: "ordinary", Provider: tc.provider, Error: &Error{HTTPStatus: tc.status, Message: tc.body}})
+			got, _ := m.GetByID("ordinary")
+			if got.Disabled || got.Status == StatusDisabled || got.Metadata[tmxRefusalMetadataKey] != nil {
+				t.Fatalf("ordinary failure became terminal: %+v", got)
+			}
+			if tc.status == 403 && !got.NextRetryAfter.After(time.Now()) {
+				t.Fatal("ordinary 403 lost cooldown")
+			}
+			if tc.status == 429 && !got.Quota.Exceeded {
+				t.Fatal("ordinary 429 lost quota cooldown")
+			}
+		})
+	}
+}
+
+func TestTMXTerminalRefusalPrecedesResultPolicy(t *testing.T) {
+	for _, tc := range []struct{ name, code, body, want string }{
+		{"validation body", "", tmxGoogleValidationBody, refusals.GoogleValidation},
+		{"validation code", refusals.GoogleValidation, refusals.StatusMessage(refusals.GoogleValidation), refusals.GoogleValidation},
+		{"tos body", "", strings.ReplaceAll(tmxGoogleValidationBody, "VALIDATION_REQUIRED", "TOS_VIOLATION"), "tos_violation"},
+		{"tos code", "tos_violation", "TOS_VIOLATION", "tos_violation"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			m := NewManager(nil, nil, nil)
+			_, _ = m.Register(ctx, &Auth{ID: "policy", Provider: "antigravity", Status: StatusActive})
+			o := &recordingCooldownObserver{}
+			SetCooldownObserver(o)
+			t.Cleanup(func() { SetCooldownObserver(nil) })
+			calls := 0
+			m.SetResultPolicy(ResultPolicyFunc(func(_ context.Context, res Result) Result {
+				calls++
+				// Mutate the error in place as well as result fields: the original must be independent.
+				res.Error.Code = ErrorCodeForceCooldown
+				res.Error.Message = "policy retry"
+				res.Error.HTTPStatus = 429
+				res.CredentialScope = false
+				return res
+			}))
+			for range 2 {
+				m.MarkResult(ctx, Result{AuthID: "policy", Provider: "antigravity", Model: "model", Error: &Error{HTTPStatus: 403, Code: tc.code, Message: tc.body}})
+			}
+			got, _ := m.GetByID("policy")
+			if calls != 2 || !got.Disabled || got.LastError == nil || got.LastError.Code != tc.want || got.StatusMessage != refusals.StatusMessage(tc.want) || !got.NextRetryAfter.IsZero() || !got.NextRefreshAfter.IsZero() || len(o.failures) != 1 || o.failures[0].ErrorCode != tc.want {
+				t.Fatalf("policy replaced terminal result: auth=%+v events=%+v", got, o.failures)
+			}
+			if tc.want == refusals.GoogleValidation {
+				assertTMXNoValidationData(t, fmt.Sprintf("%+v %+v %+v", got.LastError, got.Metadata, o.failures))
+			}
+		})
+	}
+}
+
+func TestTMXOrdinary403RetainsResultPolicy(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(nil, nil, nil)
+	_, _ = m.Register(ctx, &Auth{ID: "policy", Provider: "antigravity", Status: StatusActive})
+	m.SetResultPolicy(ResultPolicyFunc(func(_ context.Context, res Result) Result {
+		res.Error = &Error{HTTPStatus: 403, Code: ErrorCodeRequestScoped, Message: "configured stop"}
+		return res
+	}))
+	m.MarkResult(ctx, Result{AuthID: "policy", Provider: "antigravity", Error: &Error{HTTPStatus: 403, Message: "ordinary permission"}})
+	got, _ := m.GetByID("policy")
+	if got.Disabled || got.Unavailable || !got.NextRetryAfter.IsZero() || got.LastError != nil {
+		t.Fatalf("ordinary policy ignored: %+v", got)
+	}
+}
+
+func TestTMXTerminalRefusalPrecedesRequestScopedAction(t *testing.T) {
+	for _, action := range []string{RequestScopedActionStop, RequestScopedActionContinue, RequestScopedActionStopAndCooldown, RequestScopedActionContinueAndCooldown} {
+		for _, code := range []string{refusals.GoogleValidation, "tos_violation"} {
+			t.Run(action+"/"+code, func(t *testing.T) {
+				ctx := context.Background()
+				m := NewManager(nil, nil, nil)
+				_, _ = m.Register(ctx, &Auth{ID: "scoped", Provider: "antigravity", Status: StatusActive})
+				res := Result{AuthID: "scoped", Provider: "antigravity", Error: &Error{HTTPStatus: 403, Code: code, Message: refusals.StatusMessage(code)}}
+				applyRequestScopedActionToResult(action, true, &res)
+				m.MarkResult(ctx, res)
+				got, _ := m.GetByID("scoped")
+				if res.Error.Code != code || !got.Disabled || got.LastError.Code != code {
+					t.Fatalf("request action replaced terminal code: %+v", res.Error)
+				}
+				ordinary := Result{Error: &Error{HTTPStatus: 403, Message: "ordinary"}}
+				applyRequestScopedActionToResult(action, true, &ordinary)
+				want := ErrorCodeRequestScoped
+				if action == RequestScopedActionStopAndCooldown || action == RequestScopedActionContinueAndCooldown {
+					want = ErrorCodeForceCooldown
+				}
+				if ordinary.Error.Code != want {
+					t.Fatal("ordinary request-scoped behavior changed")
+				}
+			})
 		}
 	}
 }

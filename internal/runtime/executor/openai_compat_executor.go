@@ -1300,6 +1300,7 @@ type statusErr struct {
 	tosViolation       bool
 	tosAppealURL       string
 	tosAppealURLText   string
+	accountRefusalCode string // tmx: fixed Google validation code, without response metadata.
 	// diagnostic is a content-free detail for logs only; it never reaches clients.
 	diagnostic string
 }
@@ -1349,6 +1350,9 @@ func (e statusErr) TOSAppealMetadata() map[string]string {
 func (e statusErr) ErrorCode() string {
 	if e.tosViolation {
 		return "tos_violation"
+	}
+	if e.accountRefusalCode != "" { // tmx
+		return e.accountRefusalCode
 	}
 	if e.transientTransport {
 		return cliproxyauth.ErrorCodeTransientTransport
