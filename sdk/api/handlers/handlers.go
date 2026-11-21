@@ -743,6 +743,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx = logging.WithResponseStatusHolder(newCtx)
 	newCtx = logging.WithResponseHeadersHolder(newCtx)
+	newCtx = tmxWithCaptureSessionHint(newCtx, c) // tmx: request-local executor-to-capture identity bridge.
 
 	cancelCtx := newCtx
 	if requestCtx != nil && requestCtx != parentCtx {

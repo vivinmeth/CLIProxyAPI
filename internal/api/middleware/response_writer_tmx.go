@@ -13,12 +13,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/capture"
 	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
-	"github.com/tidwall/gjson"
 )
 
 const tmxSkipCaptureKey = "tmx.capture.skip"
@@ -123,6 +123,15 @@ func (w *ResponseWriterWrapper) tmxDiscard() {
 // tmxSubmit hands the finished exchange to the archive. It runs at the start of Finalize, while
 // the gin context and every spooled source are still available, and copies what it needs.
 func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
+	// Finalize even skipped/failed captures before Gin can be reused. Executors
+	// retain only this closed holder, so late writes cannot reach another request.
+	var sessionHint string
+	if c != nil {
+		value, _ := c.Get(capture.SessionHintGinKey)
+		if holder, ok := value.(*capture.SessionHint); ok {
+			sessionHint = holder.Take()
+		}
+	}
 	// A panicked handler's partial exchange is not archived (upstream now finalizes after a panic).
 	if c == nil || !capture.Enabled() || w.requestInfo == nil || c.GetBool(tmxSkipCaptureKey) || w.tmxHandlerPanicked {
 		if w.tmx != nil {
@@ -166,14 +175,19 @@ func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
 	// Extract identity while borrowing the original body: a bounded archive prefix
 	// may end before trailing metadata in a large spooled request.
 	ex.ClientSessionID = coresession.ClaudeMetadataSessionID(requestBody)
-	ex.RequestModel = gjson.GetBytes(requestBody, "model").String()
-	ex.RequestStreaming = gjson.GetBytes(requestBody, "stream").Bool()
+	ex.RequestModel = ojson.GetBytes(requestBody, "model").String()
+	ex.RequestStreaming = ojson.GetBytes(requestBody, "stream").Bool()
 	if ex.SessionID == "" {
 		if info, ok := coresession.ExtractSessionInfo(http.Header(ex.RequestHeaders), requestBody, nil); ok {
 			ex.SessionID = coresession.NormalizeToCanonicalUUID(info.SessionID)
 			if ex.SessionID == "" {
 				ex.SessionID = info.SessionID
 			}
+		}
+	}
+	if ex.SessionID == "" {
+		if _, action := capture.NativeGeminiModelAction(ex.URL); action == "generateContent" || action == "streamGenerateContent" {
+			ex.SessionID = sessionHint
 		}
 	}
 	ex.Bodies["request"] = capture.CaptureInGroup(requestBody, nil, group)

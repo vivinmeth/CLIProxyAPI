@@ -66,6 +66,7 @@ func requestLogCaptureEnabled(cfg *config.Config) bool {
 
 // RecordAPIRequest stores the upstream request metadata in Gin context for request logging.
 func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequestLog) {
+	tmxNoteCaptureSession(ctx) // tmx: keep capture identity independent of request-log policy.
 	if cfg == nil || cfg.CommercialMode {
 		return
 	}
