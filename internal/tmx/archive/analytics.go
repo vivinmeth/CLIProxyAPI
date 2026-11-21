@@ -1091,6 +1091,7 @@ func (an *analytics) extractImported(ctx context.Context, id string) error {
 
 type proxyExchange struct {
 	traceID          string
+	url              string
 	ts               time.Time
 	finished         sql.NullTime
 	status           int
@@ -1104,7 +1105,7 @@ type proxyExchange struct {
 // GET /tmx/archive/conversation makes.
 func (an *analytics) extractProxy(ctx context.Context, key string) error {
 	id := "proxy:" + key
-	rows, err := an.a.db.QueryContext(ctx, `SELECT trace_id, ts, finished_at, status, request_bytes, request_body,
+	rows, err := an.a.db.QueryContext(ctx, `SELECT trace_id, url, ts, finished_at, status, request_bytes, request_body,
 		response_body, session_id, client_session_id FROM `+schema+`.exchanges
 		WHERE (client_session_id = $1 OR session_id = $1) AND method = 'POST' ORDER BY ts`, key)
 	if err != nil {
@@ -1115,7 +1116,7 @@ func (an *analytics) extractProxy(ctx context.Context, key string) error {
 	for rows.Next() {
 		var e proxyExchange
 		var client string
-		if err = rows.Scan(&e.traceID, &e.ts, &e.finished, &e.status, &e.requestBytes, &e.reqBody, &e.resBody,
+		if err = rows.Scan(&e.traceID, &e.url, &e.ts, &e.finished, &e.status, &e.requestBytes, &e.reqBody, &e.resBody,
 			&e.sessionID, &client); err != nil {
 			_ = rows.Close()
 			return err
@@ -1209,7 +1210,7 @@ func (an *analytics) proxyMessages(ctx context.Context, e proxyExchange) ([]msgR
 			}
 		}
 		root := gjson.ParseBytes(body)
-		model = root.Get("model").String()
+		model = requestModel(body, e.url)
 		add := func(role, blob string, raw gjson.Result, conv func() []ConvItem) {
 			rawCopy := raw.Raw
 			msgs = append(msgs, msgRow{role: role, model: model, ts: &ts, blob: blob,

@@ -13,6 +13,7 @@ import (
 	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/klauspost/compress/zstd"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/capture"
 )
 
 const geminiReply = `{"candidates":[{"index":0,"content":{"role":"model","parts":[
@@ -21,6 +22,47 @@ const geminiReply = `{"candidates":[{"index":0,"content":{"role":"model","parts"
 	{"functionCall":{"id":"weather-1","name":"get_weather","args":{"city":"Paris"}}},
 	{"executableCode":{"language":"PYTHON","code":"print(1)"}}
 ]},"finishReason":"STOP"}],"usageMetadata":{"candidatesTokenCount":30},"modelVersion":"gemini-2.5-pro"}`
+
+func TestRequestModel(t *testing.T) {
+	const native = "/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse&key=offline-secret#offline-fragment"
+	for _, tc := range []struct {
+		name, body, url, want string
+	}{
+		{"native", `{ "contents": [], "generationConfig": {"thinkingConfig": {"thinkingLevel": "high"}} }`, native, "gemini-4-argon"},
+		{"absolute", `{}`, "http://127.0.0.1:8317" + native, "gemini-4-argon"},
+		{"userinfo", `{}`, "https://offline-user:offline-secret@example.test" + native, "gemini-4-argon"},
+		{"json", `{}`, "/v1beta/models/gemini-4-argon:generateContent", "gemini-4-argon"},
+		{"count", `{}`, "/v1/models/gemini-2.5-flash-lite:countTokens?key=offline-secret", "gemini-2.5-flash-lite"},
+		{"unversioned", `{}`, "/models/gemini-4-argon:generateContent", "gemini-4-argon"},
+		{"body wins", `{"model":"explicit-model"}`, native, "explicit-model"},
+		{"empty body model", `{"model":""}`, native, "gemini-4-argon"},
+		{"anthropic", `{"model":"claude-opus-5-5"}`, "/v1/messages", "claude-opus-5-5"},
+		{"openai", `{"model":"gpt-6.1-sol"}`, "/v1/responses", "gpt-6.1-sol"},
+		{"body with malformed url", `{"model":"explicit-model"}`, "http://[", "explicit-model"},
+		{"empty url", `{}`, "", ""},
+		{"malformed", `{}`, "http://[", ""},
+		{"bad escape", `{}`, "/v1beta/models/gemini-%zz:generateContent", ""},
+		{"opaque", `{}`, "https:models/gemini-4-argon:generateContent", ""},
+		{"wrong scheme", `{}`, "file:///v1beta/models/gemini-4-argon:generateContent", ""},
+		{"missing host", `{}`, "https:///v1beta/models/gemini-4-argon:generateContent", ""},
+		{"non gemini route", `{}`, "/v1/messages?model=gemini-4-argon", ""},
+		{"non gemini model", `{}`, "/v1beta/models/gpt-6.1-sol:generateContent", ""},
+		{"missing model", `{}`, "/v1beta/models/:generateContent", ""},
+		{"empty gemini model", `{}`, "/v1beta/models/gemini-:generateContent", ""},
+		{"missing action", `{}`, "/v1beta/models/gemini-4-argon", ""},
+		{"wrong action", `{}`, "/v1beta/models/gemini-4-argon:predict", ""},
+		{"extra path", `{}`, "/v1beta/models/gemini-4-argon:generateContent/extra", ""},
+		{"embedded key", `{}`, "/v1beta/models/gemini-4-argon;key=offline-secret:generateContent", ""},
+		{"escaped query", `{}`, "/v1beta/models/gemini-4-argon%3Fkey=offline-secret:generateContent", ""},
+		{"escaped slash", `{}`, "/v1beta/models/gemini-4-argon%2Foffline-secret:generateContent", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := requestModel([]byte(tc.body), tc.url); got != tc.want {
+				t.Errorf("requestModel = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
 
 func TestGeminiResponseJSON(t *testing.T) {
 	for _, body := range []string{geminiReply, `{"response":` + geminiReply + `,"traceId":"offline"}`} {
@@ -204,35 +246,98 @@ func TestGeminiProxyMessages(t *testing.T) {
 		}
 		return hash
 	}
-	req := put(`{"model":"gemini-2.5-pro","contents":[{"role":"user","parts":[{"text":"Weather?"}]}]}`)
-	manifest, err := json.Marshal(Manifest{Format: "raw", Raw: req})
-	if err != nil {
-		t.Fatal(err)
-	}
 	an := &analytics{a: &Archive{blobs: blobs}}
 	finished := time.Date(2026, 11, 21, 7, 0, 0, 0, time.UTC)
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, []byte(geminiReply)); err != nil {
 		t.Fatal(err)
 	}
-	for _, response := range []string{geminiReply, "data: " + compact.String() + "\n\ndata: [DONE]\n"} {
-		rows, model, err := an.proxyMessages(context.Background(), proxyExchange{
-			traceID: "gemini-offline", reqBody: put(string(manifest)), resBody: put(response),
-			finished: sql.NullTime{Time: finished, Valid: true},
+	for _, request := range []struct {
+		name, url, model, bodyModel string
+	}{
+		{"native", "/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse", "gemini-4-argon", ""},
+		{"absolute", "http://127.0.0.1:8317/v1beta/models/gemini-4-argon:generateContent?key=offline-secret#offline-fragment", "gemini-4-argon", ""},
+		{"helper", "/v1beta/models/gemini-2.5-flash-lite:generateContent", "gemini-2.5-flash-lite", ""},
+		{"explicit", "/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse", "explicit-model", `"model":"explicit-model",`},
+		{"non gemini", "/v1/messages", "", ""},
+	} {
+		t.Run(request.name, func(t *testing.T) {
+			req := put(`{` + request.bodyModel + `"contents":[{"role":"user","parts":[{"text":"Weather?"}]}],"generationConfig":{"thinkingConfig":{"thinkingLevel":"high"}}}`)
+			manifest, err := json.Marshal(Manifest{Format: "raw", Raw: req})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, response := range []string{geminiReply, "data: " + compact.String() + "\n\ndata: [DONE]\n"} {
+				rows, model, err := an.proxyMessages(context.Background(), proxyExchange{
+					traceID: "gemini-offline", reqBody: put(string(manifest)), resBody: put(response),
+					url:      request.url,
+					finished: sql.NullTime{Time: finished, Valid: true},
+				})
+				if err != nil || model != request.model || len(rows) != 2 {
+					t.Fatalf("analytics messages = %+v, %q, %v", rows, model, err)
+				}
+				for _, row := range rows {
+					if row.model != model {
+						t.Fatalf("analytics message model = %q, want %q", row.model, model)
+					}
+				}
+				_, items, err := rows[1].produce()
+				if got := fmtSlice(kinds(items)); got != "[assistant:thinking assistant:text assistant:tool_call assistant:other]" {
+					t.Fatalf("analytics Gemini items = %s", got)
+				}
+				want := responseItems([]byte(geminiReply))
+				for i := range want {
+					want[i].Model = model
+				}
+				if err != nil || !reflect.DeepEqual(items, want) || rows[1].role != "assistant" || !rows[1].ts.Equal(finished) {
+					t.Fatalf("analytics reply = %+v, %v", items, err)
+				}
+			}
 		})
-		if err != nil || model != "gemini-2.5-pro" || len(rows) != 2 {
-			t.Fatalf("analytics messages = %+v, %q, %v", rows, model, err)
+	}
+}
+
+func TestGeminiModelAttributionStored(t *testing.T) {
+	a, an := openTestAnalytics(t)
+	ctx := context.Background()
+	start := time.Date(2026, 11, 21, 7, 0, 0, 0, time.UTC)
+	ex := &capture.Exchange{
+		TraceID: "gemini-native", SessionID: "gemini-native-session", Method: "POST",
+		URL: "/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse", Status: 200,
+		StartedAt: start, FinishedAt: start.Add(time.Second),
+		RequestBody:  []byte(`{"contents":[{"role":"user","parts":[{"text":"Weather?"}]}]}`),
+		ResponseBody: []byte(geminiReply),
+	}
+	if err := a.storeExchange(ctx, ex); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise the archive reader before analytics extraction, then the SQL
+	// SELECT/Scan and persisted session/message/item models through the worker.
+	check := func(source string) {
+		t.Helper()
+		conv, err := a.Conversation(ctx, ex.SessionID, "", "", "proxy")
+		if err != nil {
+			t.Fatal(err)
 		}
-		_, items, err := rows[1].produce()
-		if got := fmtSlice(kinds(items)); got != "[assistant:thinking assistant:text assistant:tool_call assistant:other]" {
-			t.Fatalf("analytics Gemini items = %s", got)
+		if conv.Source != source || conv.Model != "gemini-4-argon" || len(conv.Items) != 5 {
+			t.Fatalf("Gemini conversation = %+v", conv)
 		}
-		want := responseItems([]byte(geminiReply))
-		for i := range want {
-			want[i].Model = model
-		}
-		if err != nil || !reflect.DeepEqual(items, want) || rows[1].role != "assistant" || !rows[1].ts.Equal(finished) {
-			t.Fatalf("analytics reply = %+v, %v", items, err)
+		for _, it := range conv.Items {
+			if it.Role == "assistant" && it.Model != conv.Model {
+				t.Errorf("assistant model = %q, want %q", it.Model, conv.Model)
+			}
 		}
 	}
+	check("") // The archive reader leaves Source empty; analytics labels its source.
+	drain(t, an)
+	if n := count(t, an, `SELECT count(*) FROM sessions WHERE id = 'proxy:gemini-native-session' AND model = 'gemini-4-argon'`); n != 1 {
+		t.Fatalf("attributed sessions = %d", n)
+	}
+	if n := count(t, an, `SELECT count(*) FROM messages WHERE session_id = 'proxy:gemini-native-session' AND model = 'gemini-4-argon'`); n != 2 {
+		t.Fatalf("attributed messages = %d", n)
+	}
+	if n := count(t, an, `SELECT count(*) FROM items WHERE session_id = 'proxy:gemini-native-session' AND role = 'assistant' AND model = 'gemini-4-argon'`); n != 4 {
+		t.Fatalf("attributed assistant items = %d", n)
+	}
+	check("analytics")
 }

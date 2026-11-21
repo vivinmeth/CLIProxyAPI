@@ -296,7 +296,7 @@ func (a *Archive) proxyConversation(ctx context.Context, sessionID, traceID stri
 		if errReq != nil {
 			return nil, errReq
 		}
-		conv.Model = ojson.GetBytes(req, "model").String()
+		conv.Model = requestModel(req, meta.URL)
 		conv.Items = append(conv.Items, normalizeRequest(req)...)
 	}
 	if meta.ResponseBody != "" {

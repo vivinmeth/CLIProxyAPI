@@ -1,6 +1,42 @@
 package archive
 
-import "github.com/MoeForge/moego/ojson"
+import (
+	"net/url"
+	"strings"
+
+	"github.com/MoeForge/moego/ojson"
+)
+
+// requestModel preserves explicit body models on every provider. Native Gemini
+// requests instead name the requested model in the URL, separate from thinking level.
+func requestModel(body []byte, rawURL string) string {
+	if model := ojson.GetBytes(body, "model").String(); model != "" {
+		return model
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Opaque != "" || (u.Scheme != "" && (u.Scheme != "http" && u.Scheme != "https" || u.Host == "")) {
+		return ""
+	}
+	path := u.Path
+	for _, prefix := range []string{"/v1beta/models/", "/v1/models/", "/models/"} {
+		if native, ok := strings.CutPrefix(path, prefix); ok {
+			model, action, found := strings.Cut(native, ":")
+			if !found || (action != "generateContent" && action != "streamGenerateContent" && action != "countTokens") ||
+				!strings.HasPrefix(model, "gemini-") || len(model) == len("gemini-") {
+				return ""
+			}
+			// Only a model identifier can leave this helper, never URL credentials,
+			// query/fragment text or an escaped path separator.
+			for _, c := range model {
+				if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.') {
+					return ""
+				}
+			}
+			return model
+		}
+	}
+	return ""
+}
 
 // Only skip known empty text/signature carriers. Extra fields or malformed values must
 // survive as raw parts, and function/media parts carrying a signature still have content.
