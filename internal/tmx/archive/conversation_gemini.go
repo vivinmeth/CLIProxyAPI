@@ -2,6 +2,31 @@ package archive
 
 import "github.com/MoeForge/moego/ojson"
 
+// Only skip known empty text/signature carriers. Extra fields or malformed values must
+// survive as raw parts, and function/media parts carrying a signature still have content.
+func emptyGeminiPart(part ojson.Result) bool {
+	if !part.IsObject() {
+		return false
+	}
+	known, carrier := true, false
+	part.ForEach(func(key, value ojson.Result) bool {
+		switch key.String() {
+		case "text":
+			known = value.Type == ojson.String && value.String() == ""
+			carrier = true
+		case "thoughtSignature", "thought_signature":
+			known = value.Type == ojson.String
+			carrier = true
+		case "thought":
+			known = value.IsBool()
+		default:
+			known = false
+		}
+		return known
+	})
+	return known && carrier
+}
+
 // Gemini parts omit type. Only claim parts with a valid known shape, leaving malformed and
 // future parts to otherItem so analytics keeps the original bytes.
 func geminiPart(part ojson.Result, role string) (ConvItem, bool) {
@@ -19,7 +44,7 @@ func geminiPart(part ojson.Result, role string) (ConvItem, bool) {
 			return withData(withCall(item(role, "tool_call", args, name), id, false), args), true
 		}
 		result := fn.Get("response")
-		return withData(withCall(item("tool", "tool_result", result.String(), name), id, false), result.Raw), true
+		return withData(withCall(item("tool", "tool_result", result.String(), name), id, result.Get("error").Exists()), result.Raw), true
 	}
 	if part.Get("thought").Type == ojson.True && part.Get("text").Type == ojson.String {
 		return item(role, "thinking", part.Get("text").String(), ""), true
@@ -51,10 +76,9 @@ type geminiToolKey struct {
 	candidate, kind, name, callID, data string
 }
 
-// Gemini text parts are deltas; tool parts are complete values and can repeat in later frames.
-// Count equal tools per frame so two identical idless calls in one frame survive, while a
-// repeated frame does not add them again. Without upstream ids, later identical calls cannot
-// be distinguished from replays; keep ids empty rather than inventing links.
+// Gemini text parts are deltas. Deduplicate repeated complete tool parts only with an upstream
+// call id; equal idless parts are separate calls/results, even across frames. Count tools per
+// frame to preserve same-frame multiplicity and keep ids empty when the provider omits them.
 type geminiStream struct {
 	items         []ConvItem
 	seen          map[geminiToolKey]int
@@ -70,7 +94,7 @@ func (s *geminiStream) add(root ojson.Result) {
 		candidateID := firstNonEmptyStr(candidate.Get("index").Raw, position.String())
 		counts := map[geminiToolKey]int{}
 		for _, it := range normalizeMessageValue(content, "assistant") {
-			if it.Kind == "tool_call" || it.Kind == "tool_result" {
+			if it.CallID != "" && (it.Kind == "tool_call" || it.Kind == "tool_result") {
 				key := geminiToolKey{candidateID, it.Kind, it.Name, it.CallID, it.Data}
 				counts[key]++
 				if s.seen[key] >= counts[key] {

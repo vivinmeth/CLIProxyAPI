@@ -86,16 +86,81 @@ func TestGeminiResponseStream(t *testing.T) {
 }
 
 func TestGeminiStreamToolIdentity(t *testing.T) {
-	// Missing call ids must stay missing. Preserve two identical calls in one frame,
-	// but do not repeat them when the same complete parts arrive again.
-	frame := `data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"clock","args":{}}},{"functionCall":{"name":"clock","args":{}}}]}}]}`
-	items := responseItems([]byte(frame + "\n\n" + frame + "\n\n"))
-	if len(items) != 2 || items[0].CallID != "" || items[1].CallID != "" {
-		t.Fatalf("idless streamed calls = %+v", items)
+	// Missing ids are normal on Gemini. Each complete part remains a separate call
+	// or result, including equal parts in the same frame or in later frames.
+	for _, part := range []string{
+		`{"functionCall":{"name":"clock","args":{}}}`,
+		`{"functionResponse":{"name":"clock","response":{"time":"12:00"}}}`,
+	} {
+		frame := func(parts string) string {
+			return `data: {"candidates":[{"content":{"role":"model","parts":[` + parts + `]}}]}` + "\n\n"
+		}
+		for _, tc := range []struct {
+			stream string
+			count  int
+		}{
+			{frame(part) + frame(part), 2},
+			{frame(part + "," + part), 2},
+			{frame(part+","+part) + frame(part+","+part), 4},
+		} {
+			items := responseItems([]byte(tc.stream))
+			if len(items) != tc.count {
+				t.Fatalf("idless streamed tools: got %d, want %d: %+v", len(items), tc.count, items)
+			}
+			for _, it := range items {
+				if it.CallID != "" || it.Name != "clock" {
+					t.Fatalf("idless tool identity = %+v", it)
+				}
+			}
+		}
 	}
 	sse := `data: {"candidates":[{"index":0,"content":{"parts":[{"functionCall":{"id":"a","name":"clock","args":{}}}]}},{"index":1,"content":{"parts":[{"functionCall":{"id":"a","name":"clock","args":{}}}]}}]}`
-	if items = responseItems([]byte(sse)); len(items) != 2 {
+	if items := responseItems([]byte(sse)); len(items) != 2 {
 		t.Fatalf("separate candidates collapsed = %+v", items)
+	}
+}
+
+func TestGeminiEmptyParts(t *testing.T) {
+	for _, empty := range []string{
+		`{"text":""}`,
+		`{"text":"","thought":true}`,
+		`{"text":"","thoughtSignature":"sig-empty"}`,
+		`{"thoughtSignature":"sig-only"}`,
+		`{"thought":true,"thoughtSignature":"sig-only"}`,
+		`{"thought_signature":"sig-only"}`,
+	} {
+		t.Run(empty, func(t *testing.T) {
+			frame := func(parts string) string {
+				return `data: {"candidates":[{"index":0,"content":{"role":"model","parts":[` + parts + `]}}],"modelVersion":"gemini-2.5-pro"}` + "\n\n"
+			}
+			// Empty and signature-only frames must not split adjacent text or leave
+			// a trailing item after a completed reply.
+			sse := frame(`{"text":"Hello "}`) + frame(empty) + frame(`{"text":"world"}`) + frame(empty)
+			items := responseItems([]byte(sse))
+			if len(items) != 1 || items[0].Kind != "text" || items[0].Text != "Hello world" {
+				t.Fatalf("stream with empty part = %+v", items)
+			}
+			body := `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello "},` + empty + `,{"text":"world"},` + empty + `]}}]}`
+			items = responseItems([]byte(body))
+			if len(items) != 2 || items[0].Kind != "text" || items[0].Text != "Hello " || items[1].Kind != "text" || items[1].Text != "world" {
+				t.Fatalf("JSON with empty parts = %+v", items)
+			}
+		})
+	}
+	// Imported content blocks retain their prior behavior; only Gemini parts are skipped.
+	items := normalizeRequest([]byte(`{"messages":[{"role":"assistant","content":[{"text":""},{"type":"text","text":""}]}]}`))
+	if len(items) != 2 || items[0].Kind != "other" || items[0].Data != `{"text":""}` || items[1].Kind != "text" {
+		t.Fatalf("imported empty content changed: %+v", items)
+	}
+}
+
+func TestGeminiFunctionResponseError(t *testing.T) {
+	const payload = `{"error":{"code":"NOT_FOUND","message":"missing file"},"output":{"path":"a.go"}}`
+	body := `{"contents":[{"role":"user","parts":[{"functionResponse":{"id":"read-1","name":"read","response":` + payload + `}}]}]}`
+	items := normalizeRequest([]byte(body))
+	if len(items) != 1 || items[0].Kind != "tool_result" || !items[0].IsError || items[0].Name != "read" ||
+		items[0].CallID != "read-1" || items[0].Text != payload || items[0].Data != payload {
+		t.Fatalf("Gemini error result = %+v", items)
 	}
 }
 
@@ -107,7 +172,9 @@ func TestGeminiMalformedResponse(t *testing.T) {
 			t.Errorf("malformed/missing response %q = %+v", body, items)
 		}
 	}
-	for _, part := range []string{`{"functionCall":null}`, `{"functionCall":"bad"}`, `{"functionResponse":[]}`, `{"thought":true,"text":{}}`} {
+	for _, part := range []string{`{"functionCall":null}`, `{"functionCall":"bad"}`, `{"functionResponse":[]}`, `{"thought":true,"text":{}}`,
+		`{"text":"","future":{"value":1}}`, `{"thoughtSignature":{}}`, `{"text":null,"thoughtSignature":"sig"}`,
+		`{"text":"","thoughtSignature":7}`, `{"text":"","thought":true,"future":{"value":1}}`} {
 		body := `{"candidates":[{"content":{"parts":[` + part + `]}}]}`
 		items := responseItems([]byte(body))
 		if len(items) != 1 || items[0].Kind != "other" || items[0].Data != part {

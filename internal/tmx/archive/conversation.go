@@ -327,7 +327,7 @@ func normalizeRequest(body []byte) []ConvItem {
 	var out []ConvItem
 	root := ojson.ParseBytes(body)
 	if sys := root.Get("system"); sys.Exists() {
-		out = append(out, contentValueItems(sys, "system")...)
+		out = append(out, contentValueItems(sys, "system", false)...)
 	}
 	if ins := root.Get("instructions"); ins.Type == ojson.String && ins.String() != "" {
 		out = append(out, item("system", "text", ins.String(), ""))
@@ -353,7 +353,7 @@ func normalizeMessage(m gjson.Result, fallbackRole string) []ConvItem {
 }
 
 func contentItems(content gjson.Result, role string) []ConvItem {
-	return contentValueItems(ojson.Parse(content.Raw), role)
+	return contentValueItems(ojson.Parse(content.Raw), role, false)
 }
 
 // normalizeMessageValue handles one message / input item in any of the supported shapes.
@@ -380,8 +380,10 @@ func normalizeMessageValue(m ojson.Result, fallbackRole string) []ConvItem {
 		return cursorBubble(m, fallbackRole)
 	}
 	content := m.Get("content")
+	isGemini := false
 	if !content.Exists() {
 		content = m.Get("parts")
+		isGemini = content.IsArray()
 	}
 	if !content.Exists() {
 		if !m.IsObject() && !m.IsArray() && m.String() != "" {
@@ -389,7 +391,7 @@ func normalizeMessageValue(m ojson.Result, fallbackRole string) []ConvItem {
 		}
 		return []ConvItem{otherItem(role, m)}
 	}
-	items := contentValueItems(content, role)
+	items := contentValueItems(content, role, isGemini)
 	// Chat Completions tool calls live next to content.
 	m.Get("tool_calls").ForEach(func(_, tc ojson.Result) bool {
 		args := tc.Get("function.arguments").String()
@@ -408,7 +410,7 @@ func normalizeMessageValue(m ojson.Result, fallbackRole string) []ConvItem {
 }
 
 // contentValueItems turns a content value (string or block array) into items.
-func contentValueItems(content ojson.Result, role string) []ConvItem {
+func contentValueItems(content ojson.Result, role string, isGemini bool) []ConvItem {
 	if content.Type == ojson.String {
 		return []ConvItem{item(role, "text", content.String(), "")}
 	}
@@ -418,7 +420,14 @@ func contentValueItems(content ojson.Result, role string) []ConvItem {
 			out = append(out, item(role, "text", b.String(), ""))
 			return true
 		}
+		if isGemini && emptyGeminiPart(b) {
+			return true
+		}
 		if it, ok := geminiPart(b, role); ok {
+			if isGemini && it.Kind == "thinking" && it.Text == "" {
+				// Known empty parts were skipped above; keep extra or malformed fields.
+				it = otherItem(role, b)
+			}
 			out = append(out, it)
 			return true
 		}
@@ -531,7 +540,7 @@ func responseItems(body []byte) []ConvItem {
 	if len(trimmed) > 0 && trimmed[0] == '{' && ojson.ValidBytes(trimmed) {
 		root := ojson.ParseBytes(trimmed)
 		if c := root.Get("content"); c.IsArray() {
-			return contentValueItems(c, "assistant")
+			return contentValueItems(c, "assistant", false)
 		}
 		var out []ConvItem
 		root.Get("output").ForEach(func(_, o ojson.Result) bool {
