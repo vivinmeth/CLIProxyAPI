@@ -5,24 +5,25 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/ojson"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
 // ConvItem is one displayable piece of a conversation, normalised across Anthropic Messages,
-// OpenAI Responses / Chat Completions and imported harness transcripts.
+// OpenAI Responses / Chat Completions, Gemini and imported harness transcripts.
 type ConvItem struct {
 	Role string `json:"role"` // system | user | assistant | tool | event
 	Kind string `json:"kind"` // text | thinking | tool_call | tool_result | image | other
 	Text string `json:"text,omitempty"`
 	Name string `json:"name,omitempty"` // tool name
-	// CallID links a tool_call to its tool_result (Anthropic tool_use id, OpenAI call_id).
+	// CallID links a tool_call to its tool_result when the provider supplies an id.
 	CallID  string     `json:"call_id,omitempty"`
 	IsError bool       `json:"is_error,omitempty"` // tool_result reported an error
 	TS      *time.Time `json:"ts,omitempty"`
@@ -226,7 +227,7 @@ func (a *Archive) importedBatch(ctx context.Context, id string, msgOffset int, a
 		if errBody != nil {
 			return 0, false, fmt.Errorf("message: %w", errBody)
 		}
-		items := normalizeMessage(gjson.GetBytes(body, "message"), m.role)
+		items := normalizeMessageValue(ojson.GetBytes(body, "message"), m.role)
 		for i := range items {
 			if m.ts.Valid {
 				t := m.ts.Time.UTC()
@@ -295,7 +296,7 @@ func (a *Archive) proxyConversation(ctx context.Context, sessionID, traceID stri
 		if errReq != nil {
 			return nil, errReq
 		}
-		conv.Model = gjson.GetBytes(req, "model").String()
+		conv.Model = ojson.GetBytes(req, "model").String()
 		conv.Items = append(conv.Items, normalizeRequest(req)...)
 	}
 	if meta.ResponseBody != "" {
@@ -321,32 +322,42 @@ func (a *Archive) proxyConversation(ctx context.Context, sessionID, traceID stri
 }
 
 // normalizeRequest reads the conversation out of a request body (Anthropic system+messages,
-// OpenAI Responses instructions+input, Chat Completions messages).
+// OpenAI Responses instructions+input, Chat Completions messages, Gemini contents).
 func normalizeRequest(body []byte) []ConvItem {
 	var out []ConvItem
-	root := gjson.ParseBytes(body)
+	root := ojson.ParseBytes(body)
 	if sys := root.Get("system"); sys.Exists() {
-		out = append(out, contentItems(sys, "system")...)
+		out = append(out, contentValueItems(sys, "system")...)
 	}
-	if ins := root.Get("instructions"); ins.Type == gjson.String && ins.String() != "" {
+	if ins := root.Get("instructions"); ins.Type == ojson.String && ins.String() != "" {
 		out = append(out, item("system", "text", ins.String(), ""))
 	}
 	for _, key := range []string{"messages", "input", "contents"} {
 		v := root.Get(key)
-		if v.Type == gjson.String {
+		if v.Type == ojson.String {
 			out = append(out, item("user", "text", v.String(), ""))
 			continue
 		}
-		v.ForEach(func(_, m gjson.Result) bool {
-			out = append(out, normalizeMessage(m, "")...)
+		v.ForEach(func(_, m ojson.Result) bool {
+			out = append(out, normalizeMessageValue(m, "")...)
 			return true
 		})
 	}
 	return out
 }
 
-// normalizeMessage handles one message / input item in any of the supported shapes.
+// These two adapters keep legacy analytics callers working while conversation parsing uses
+// moego. Reparse Raw so unknown blocks keep their original JSON, including string quoting.
 func normalizeMessage(m gjson.Result, fallbackRole string) []ConvItem {
+	return normalizeMessageValue(ojson.Parse(m.Raw), fallbackRole)
+}
+
+func contentItems(content gjson.Result, role string) []ConvItem {
+	return contentValueItems(ojson.Parse(content.Raw), role)
+}
+
+// normalizeMessageValue handles one message / input item in any of the supported shapes.
+func normalizeMessageValue(m ojson.Result, fallbackRole string) []ConvItem {
 	role := firstNonEmptyStr(m.Get("role").String(), fallbackRole, "event")
 	if role == "model" {
 		role = "assistant"
@@ -359,7 +370,7 @@ func normalizeMessage(m gjson.Result, fallbackRole string) []ConvItem {
 		return []ConvItem{withCall(item("tool", "tool_result", outputText(m.Get("output")), ""), m.Get("call_id").String(), false)}
 	case "reasoning":
 		var parts []string
-		m.Get("summary").ForEach(func(_, s gjson.Result) bool {
+		m.Get("summary").ForEach(func(_, s ojson.Result) bool {
 			parts = append(parts, s.Get("text").String())
 			return true
 		})
@@ -378,9 +389,9 @@ func normalizeMessage(m gjson.Result, fallbackRole string) []ConvItem {
 		}
 		return []ConvItem{otherItem(role, m)}
 	}
-	items := contentItems(content, role)
+	items := contentValueItems(content, role)
 	// Chat Completions tool calls live next to content.
-	m.Get("tool_calls").ForEach(func(_, tc gjson.Result) bool {
+	m.Get("tool_calls").ForEach(func(_, tc ojson.Result) bool {
 		args := tc.Get("function.arguments").String()
 		items = append(items, withData(withCall(item(role, "tool_call", args, tc.Get("function.name").String()), tc.Get("id").String(), false), args))
 		return true
@@ -396,21 +407,25 @@ func normalizeMessage(m gjson.Result, fallbackRole string) []ConvItem {
 	return items
 }
 
-// contentItems turns a content value (string or block array) into items.
-func contentItems(content gjson.Result, role string) []ConvItem {
-	if content.Type == gjson.String {
+// contentValueItems turns a content value (string or block array) into items.
+func contentValueItems(content ojson.Result, role string) []ConvItem {
+	if content.Type == ojson.String {
 		return []ConvItem{item(role, "text", content.String(), "")}
 	}
 	var out []ConvItem
-	content.ForEach(func(_, b gjson.Result) bool {
-		if b.Type == gjson.String {
+	content.ForEach(func(_, b ojson.Result) bool {
+		if b.Type == ojson.String {
 			out = append(out, item(role, "text", b.String(), ""))
+			return true
+		}
+		if it, ok := geminiPart(b, role); ok {
+			out = append(out, it)
 			return true
 		}
 		switch t := b.Get("type").String(); t {
 		case "text", "input_text", "output_text", "":
 			text := b.Get("text").String()
-			if text == "" && t == "" {
+			if t == "" && (text == "" || b.Get("text").Type != ojson.String) {
 				out = append(out, otherItem(role, b))
 			} else {
 				out = append(out, item(role, "text", text, ""))
@@ -444,7 +459,7 @@ func contentItems(content gjson.Result, role string) []ConvItem {
 
 // openCodeTool splits an OpenCode tool part (tool, callID, state{status, input, output, error})
 // into a tool_call and, once it has run, its tool_result.
-func openCodeTool(b gjson.Result) []ConvItem {
+func openCodeTool(b ojson.Result) []ConvItem {
 	st := b.Get("state")
 	callID := b.Get("callID").String()
 	input := st.Get("input").Raw
@@ -460,7 +475,7 @@ func openCodeTool(b gjson.Result) []ConvItem {
 
 // cursorBubble reads a Cursor chat bubble (type 1 = user, 2 = assistant): thinking, text, and a
 // tool call with its result (toolFormerData). Everything else in a bubble is editor context.
-func cursorBubble(m gjson.Result, fallbackRole string) []ConvItem {
+func cursorBubble(m ojson.Result, fallbackRole string) []ConvItem {
 	role := fallbackRole
 	switch m.Get("type").Int() {
 	case 1:
@@ -489,15 +504,15 @@ func cursorBubble(m gjson.Result, fallbackRole string) []ConvItem {
 	return out
 }
 
-func outputText(v gjson.Result) string {
-	if v.Type == gjson.String {
+func outputText(v ojson.Result) string {
+	if v.Type == ojson.String {
 		return v.String()
 	}
 	var parts []string
-	v.ForEach(func(_, b gjson.Result) bool {
+	v.ForEach(func(_, b ojson.Result) bool {
 		if s := b.Get("text").String(); s != "" {
 			parts = append(parts, s)
-		} else if b.Type == gjson.String {
+		} else if b.Type == ojson.String {
 			parts = append(parts, b.String())
 		}
 		return true
@@ -510,21 +525,27 @@ func outputText(v gjson.Result) string {
 
 // responseItems extracts the assistant's reply from a response body: a JSON response or an SSE
 // stream (Anthropic content_block deltas, OpenAI Responses output_text deltas, Chat Completions
-// choice deltas).
+// choice deltas, Gemini candidates).
 func responseItems(body []byte) []ConvItem {
 	trimmed := bytes.TrimSpace(body)
-	if len(trimmed) > 0 && trimmed[0] == '{' && gjson.ValidBytes(trimmed) {
-		root := gjson.ParseBytes(trimmed)
+	if len(trimmed) > 0 && trimmed[0] == '{' && ojson.ValidBytes(trimmed) {
+		root := ojson.ParseBytes(trimmed)
 		if c := root.Get("content"); c.IsArray() {
-			return contentItems(c, "assistant")
+			return contentValueItems(c, "assistant")
 		}
 		var out []ConvItem
-		root.Get("output").ForEach(func(_, o gjson.Result) bool {
-			out = append(out, normalizeMessage(o, "assistant")...)
+		root.Get("output").ForEach(func(_, o ojson.Result) bool {
+			out = append(out, normalizeMessageValue(o, "assistant")...)
 			return true
 		})
-		root.Get("choices").ForEach(func(_, ch gjson.Result) bool {
-			out = append(out, normalizeMessage(ch.Get("message"), "assistant")...)
+		root.Get("choices").ForEach(func(_, ch ojson.Result) bool {
+			out = append(out, normalizeMessageValue(ch.Get("message"), "assistant")...)
+			return true
+		})
+		geminiCandidates(root).ForEach(func(_, candidate ojson.Result) bool {
+			if content := geminiContent(candidate); content.Exists() {
+				out = append(out, normalizeMessageValue(content, "assistant")...)
+			}
 			return true
 		})
 		return out
@@ -532,6 +553,7 @@ func responseItems(body []byte) []ConvItem {
 	var text, thinking strings.Builder
 	tools := map[int]*ConvItem{}
 	var toolOrder []int
+	var gemini geminiStream
 	sc := bufio.NewScanner(bytes.NewReader(body))
 	sc.Buffer(make([]byte, 1<<20), 16<<20)
 	for sc.Scan() {
@@ -540,7 +562,12 @@ func responseItems(body []byte) []ConvItem {
 		if !ok {
 			continue
 		}
-		ev := gjson.Parse(strings.TrimSpace(data))
+		data = strings.TrimSpace(data)
+		if !ojson.Valid(data) {
+			continue
+		}
+		ev := ojson.Parse(data)
+		gemini.add(ev)
 		switch ev.Get("type").String() {
 		case "content_block_start":
 			if cb := ev.Get("content_block"); cb.Get("type").String() == "tool_use" {
@@ -572,7 +599,7 @@ func responseItems(body []byte) []ConvItem {
 				toolOrder = append(toolOrder, idx)
 			}
 		default:
-			ev.Get("choices").ForEach(func(_, ch gjson.Result) bool {
+			ev.Get("choices").ForEach(func(_, ch ojson.Result) bool {
 				text.WriteString(ch.Get("delta.content").String())
 				return true
 			})
@@ -589,7 +616,7 @@ func responseItems(body []byte) []ConvItem {
 		t := *tools[idx]
 		out = append(out, withData(withCall(item(t.Role, t.Kind, t.Text, t.Name), t.CallID, false), t.Text))
 	}
-	return out
+	return append(out, gemini.items...)
 }
 
 func withCall(it ConvItem, callID string, isError bool) ConvItem {
@@ -604,7 +631,7 @@ func withData(it ConvItem, raw string) ConvItem {
 	if raw == "" || len(raw) > convMaxItemData {
 		return it
 	}
-	if gjson.Valid(raw) {
+	if ojson.Valid(raw) {
 		it.Data = raw
 	} else if b, err := json.Marshal(raw); err == nil {
 		it.Data = string(b)
@@ -613,7 +640,7 @@ func withData(it ConvItem, raw string) ConvItem {
 }
 
 // otherItem keeps a block nothing else understands: as text, and as data for JSON queries.
-func otherItem(role string, b gjson.Result) ConvItem {
+func otherItem(role string, b ojson.Result) ConvItem {
 	return withData(item(role, "other", b.Raw, ""), b.Raw)
 }
 
