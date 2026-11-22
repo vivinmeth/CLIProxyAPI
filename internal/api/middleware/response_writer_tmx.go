@@ -190,6 +190,10 @@ func (w *ResponseWriterWrapper) tmxSubmit(c *gin.Context, status int) {
 			ex.SessionID = sessionHint
 		}
 	}
+	if ex.SessionID == "" && ex.ClientSessionID == "" {
+		// tmx: Grok helpers share the conversation group but may carry no native session.
+		ex.SessionID, ex.ClientSessionID = capture.GrokSessionIdentity(ex.Method, ex.URL, ex.RequestModel, http.Header(ex.RequestHeaders))
+	}
 	ex.Bodies["request"] = capture.CaptureInGroup(requestBody, nil, group)
 	if override := extractBodyOverride(c, responseBodyOverrideContextKey); len(override) > 0 {
 		ex.Bodies["response"] = capture.CaptureInGroup(override, nil, group)

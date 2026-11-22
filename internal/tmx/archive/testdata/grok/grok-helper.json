@@ -1,0 +1,54 @@
+{
+  "method": "POST",
+  "path": "/v1/responses",
+  "headers": {
+    "X-Grok-Session-Id": [
+      ""
+    ],
+    "X-Grok-Conv-Id": [
+      ""
+    ],
+    "X-Grok-Conv-Group-Id": [
+      "00000000-0000-0000-0000-000000000002"
+    ],
+    "X-Grok-Agent-Id": [
+      ""
+    ],
+    "X-Grok-Req-Id": [
+      ""
+    ],
+    "X-Grok-Client-Identifier": [
+      "grok-shell"
+    ]
+  },
+  "body": {
+    "include": [
+      "[stripped]"
+    ],
+    "input": [
+      {
+        "type": "message",
+        "role": "system",
+        "content": "[stripped]"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": "[stripped]"
+      }
+    ],
+    "max_output_tokens": 1024,
+    "model": "grok-4.6",
+    "reasoning": {
+      "summary": "concise"
+    },
+    "store": false,
+    "stream": true,
+    "tool_choice": {
+      "type": "function",
+      "name": "[stripped]"
+    },
+    "tools": [],
+    "temperature": 1.0
+  }
+}

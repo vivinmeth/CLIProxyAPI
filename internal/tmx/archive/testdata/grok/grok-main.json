@@ -1,0 +1,55 @@
+{
+  "method": "POST",
+  "path": "/v1/chat/completions",
+  "headers": {
+    "X-Grok-Session-Id": [
+      "00000000-0000-0000-0000-000000000001"
+    ],
+    "X-Grok-Conv-Id": [
+      "00000000-0000-0000-0000-000000000001"
+    ],
+    "X-Grok-Conv-Group-Id": [
+      "00000000-0000-0000-0000-000000000002"
+    ],
+    "X-Grok-Agent-Id": [
+      "00000000-0000-0000-0000-000000000003"
+    ],
+    "X-Grok-Req-Id": [
+      "synthetic-request-id"
+    ],
+    "X-Grok-Client-Identifier": [
+      "grok-code-extension"
+    ]
+  },
+  "body": {
+    "model": "grok-4.7",
+    "messages": [
+      {
+        "role": "system",
+        "content": "[stripped]"
+      },
+      {
+        "role": "user",
+        "content": "grok archive regression marker"
+      },
+      {
+        "role": "user",
+        "content": "[stripped]"
+      },
+      {
+        "role": "user",
+        "content": "[stripped]"
+      },
+      {
+        "role": "user",
+        "content": "[stripped]"
+      }
+    ],
+    "tools": [],
+    "reasoning_effort": "low",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  }
+}
