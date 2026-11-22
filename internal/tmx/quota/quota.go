@@ -120,6 +120,7 @@ var providers = map[string]providerSpec{
 	},
 	"meta":        metaSpec,
 	"antigravity": antigravitySpec,
+	"xai":         xaiSpec,
 }
 
 func (p providerSpec) pollable(auth *coreauth.Auth) bool {
@@ -141,6 +142,9 @@ func specFor(auth *coreauth.Auth) (providerSpec, string, bool) {
 		return providerSpec{}, "", false
 	}
 	if name == "meta" && coreauth.IsConfigAPIKeyAuth(auth) {
+		return providerSpec{}, "", false
+	}
+	if name == "xai" && auth.AuthKind() == coreauth.AuthKindAPIKey {
 		return providerSpec{}, "", false
 	}
 	return spec, name, true
@@ -182,6 +186,13 @@ func (s *Service) fetchUsage(ctx context.Context, spec providerSpec, auth *corea
 }
 
 func (s *Service) fetchUsageSent(ctx context.Context, spec providerSpec, auth *coreauth.Auth) (int, []byte, *coreauth.Auth, error) {
+	if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") {
+		f, ok := s.fetch.(XAIBillingFetcher)
+		if !ok {
+			return 0, nil, nil, errors.New("xai billing: current-token fetcher unavailable")
+		}
+		return f.TmxXAIBilling(ctx, auth)
+	}
 	url := spec.usageURL
 	if spec.usageURLFor != nil {
 		url = spec.usageURLFor(auth)
@@ -585,6 +596,14 @@ func (s *Service) poll(ctx context.Context, spec providerSpec, auth *coreauth.Au
 			return
 		}
 	}
+	if err == nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") {
+		if errCurrent := s.checkXAIBillingSent(auth, sent); errCurrent != nil {
+			err = errCurrent
+		} else if status == 401 {
+			s.stopXAIBilling(a, sent, now)
+			return
+		}
+	}
 	var windows []Window
 	var usagePlan string
 	pollErr := ""
@@ -623,11 +642,24 @@ func (s *Service) poll(ctx context.Context, spec providerSpec, auth *coreauth.Au
 		a.pauseUntil = now.Add(rateLimitPause)
 	case pauseAllowed && (status == 401 || status == 403):
 		a.pauseUntil = now.Add(authErrorPause)
+	case err == nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") && status >= 400 && status < 500:
+		a.pauseUntil = now.Add(authErrorPause)
 	}
 	s.mu.Unlock()
 	if pollErr != "" {
 		log.WithField("auth_id", auth.ID).Debugf("tmx quota: poll failed: %s", pollErr)
 		return
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") {
+		// xAI reports one included pool. A plan change must not leave an old
+		// weekly/monthly/untyped reading looking like a second current pool.
+		s.mu.Lock()
+		for _, name := range []string{"7d", "monthly", "billing"} {
+			if name != windows[0].Window {
+				delete(a.current, name)
+			}
+		}
+		s.mu.Unlock()
 	}
 	s.applyRouting(auth.ID, auth.Provider, windows, now)
 	s.record(ctx, auth.ID, windows, "polled", now)
@@ -816,7 +848,7 @@ func quotaTimeChanged(last, next *time.Time) bool {
 // ErrUnknownAccount / ErrUnsupportedProvider are returned by PollNow.
 var (
 	ErrUnknownAccount      = errors.New("unknown auth_id")
-	ErrUnsupportedProvider = errors.New("quota polling supports claude, codex, meta and antigravity subscription accounts only")
+	ErrUnsupportedProvider = errors.New("quota polling supports claude, codex, meta, antigravity and xai subscription accounts only")
 )
 
 // PollNow polls one account immediately and returns its fresh state. A second call within 30 s,
