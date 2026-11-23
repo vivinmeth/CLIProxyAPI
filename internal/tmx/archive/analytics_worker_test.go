@@ -869,30 +869,102 @@ func assertShutdownJoinedAndReplays(t *testing.T, an *analytics, e journalEntry,
 	}
 }
 
+// expiryBatch queues one mixed finalize batch: a completed exchange with a proxy key, a
+// completed proxy (doneRef), a deferred unit, a retry and a terminal failure.
+func expiryBatch(t *testing.T, an *analytics, doneRef string) ([]journalEntry, []*journalUnit) {
+	t.Helper()
+	entries := []journalEntry{
+		queueWork(t, an, "exchange", "expiry-exchange", 0),
+		queueWork(t, an, "proxy", doneRef, 0),
+		queueWork(t, an, "proxy", "expiry-deferred", 0),
+		queueWork(t, an, "proxy", "expiry-retry", 0),
+		queueWork(t, an, "proxy", "expiry-terminal", maxAttempts-1),
+	}
+	var units []*journalUnit
+	for i, outcome := range []journalOutcome{workCompleted, workCompleted, workDeferred, workFailed, workFailed} {
+		u := &journalUnit{entries: []journalEntry{entries[i]}, outcome: outcome, err: errors.New("synthetic")}
+		if i == 0 {
+			u.proxyKeys = []string{"expiry-handoff"}
+		}
+		units = append(units, u)
+	}
+	return entries, units
+}
+
+// assertExpiryRetained checks a failed primary finalize left every selected row queued and
+// unchanged, inserted no proxy row and credited nothing. The analytics terminal record commits
+// separately and first, as the design specifies, so it exists; its failed_at is returned.
+func assertExpiryRetained(t *testing.T, an *analytics, entries []journalEntry, err error, classes ...string) time.Time {
+	t.Helper()
+	var safe *workerError
+	if !errors.As(err, &safe) || !strings.HasPrefix(safe.stage, "finalize_primary_") {
+		t.Fatalf("expiry not a primary finalize failure: %v", err)
+	}
+	matched := false
+	for _, class := range classes {
+		matched = matched || safe.class == class
+	}
+	if !matched {
+		t.Fatalf("expiry class=%s want one of %v", safe.class, classes)
+	}
+	for _, e := range entries {
+		if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE id=$1 AND attempts=$2 AND not_before IS NULL`, e.id, e.attempts); n != 1 {
+			t.Fatal("expiry lost a row or kept a rolled-back retry/defer update")
+		}
+	}
+	if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE kind='proxy' AND ref='expiry-handoff'`); n != 0 {
+		t.Fatal("proxy handoff committed without its acknowledgment")
+	}
+	var failedAt time.Time
+	if err = an.db.QueryRow(`SELECT failed_at FROM failed WHERE journal_id=$1`, entries[4].id).Scan(&failedAt); err != nil {
+		t.Fatal("terminal record missing before its acknowledgment")
+	}
+	if an.processed.Load() != 0 || an.worker.deferred.Load() != 0 || an.worker.unknown.Load() != 0 || an.worker.finalizeFailures.Load() != 1 {
+		t.Fatalf("expiry counters processed=%d deferred=%d unknown=%d failures=%d",
+			an.processed.Load(), an.worker.deferred.Load(), an.worker.unknown.Load(), an.worker.finalizeFailures.Load())
+	}
+	return failedAt
+}
+
+// assertExpiryReplays reruns the same units with no fault and checks they finish exactly once.
+func assertExpiryReplays(t *testing.T, an *analytics, entries []journalEntry, units []*journalUnit, firstFailedAt time.Time) {
+	t.Helper()
+	exchange, done, deferred, retry, terminal := entries[0], entries[1], entries[2], entries[3], entries[4]
+	an.worker.hook = nil
+	if err := an.finalizePhase(units); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []journalEntry{exchange, done, terminal} {
+		if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE id=$1`, e.id); n != 0 {
+			t.Fatal("replay did not acknowledge")
+		}
+	}
+	if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE kind='proxy' AND ref='expiry-handoff'`); n != 1 {
+		t.Fatalf("replay handoff rows=%d", n)
+	}
+	var failedAt time.Time
+	if err := an.db.QueryRow(`SELECT failed_at FROM failed WHERE journal_id=$1`, terminal.id).Scan(&failedAt); err != nil || !failedAt.After(firstFailedAt) {
+		t.Fatal("replay did not refresh the terminal record")
+	}
+	if attempts, def := queueState(t, an, deferred.id); attempts != 0 || !def {
+		t.Fatal("replayed defer consumed an attempt or omitted defer")
+	}
+	if attempts, def := queueState(t, an, retry.id); attempts != 1 || !def {
+		t.Fatal("replayed retry not applied once")
+	}
+	if code, _ := an.worker.finalizeCode.Load().(string); code != "ok" || an.processed.Load() != 3 || an.worker.deferred.Load() != 1 || an.worker.finalizeFailures.Load() != 1 {
+		t.Fatalf("replay code=%s processed=%d deferred=%d failures=%d", code, an.processed.Load(), an.worker.deferred.Load(), an.worker.finalizeFailures.Load())
+	}
+}
+
 // A finalize budget that expires at the primary COMMIT must retain every obligation and
 // replay it. It runs through finalizePhase, so the fresh finalize context is covered.
 func TestRawWorkerFinalizeBudgetExpiryRetainsAndReplays(t *testing.T) {
 	// before_commit (C1): database/sql sees the finalize context already done and never sends
-	// COMMIT, so the primary transaction rolls back. The analytics terminal record committed
-	// separately, first, as the design specifies.
+	// COMMIT, so the primary transaction rolls back.
 	t.Run("before_commit", func(t *testing.T) {
 		_, an := ownedWorker(t)
-		entries := []journalEntry{
-			queueWork(t, an, "exchange", "expiry-exchange", 0),
-			queueWork(t, an, "proxy", "expiry-done", 0),
-			queueWork(t, an, "proxy", "expiry-deferred", 0),
-			queueWork(t, an, "proxy", "expiry-retry", 0),
-			queueWork(t, an, "proxy", "expiry-terminal", maxAttempts-1),
-		}
-		exchange, done, deferred, retry, terminal := entries[0], entries[1], entries[2], entries[3], entries[4]
-		var units []*journalUnit
-		for i, outcome := range []journalOutcome{workCompleted, workCompleted, workDeferred, workFailed, workFailed} {
-			u := &journalUnit{entries: []journalEntry{entries[i]}, outcome: outcome, err: errors.New("synthetic")}
-			if i == 0 {
-				u.proxyKeys = []string{"expiry-handoff"}
-			}
-			units = append(units, u)
-		}
+		entries, units := expiryBatch(t, an, "expiry-done")
 		an.worker.hook = func(ctx context.Context, code string) error {
 			if code == "primary_before_commit" {
 				<-ctx.Done() // the real tx.Commit then runs on the expired finalize context
@@ -900,60 +972,38 @@ func TestRawWorkerFinalizeBudgetExpiryRetainsAndReplays(t *testing.T) {
 			return nil
 		}
 		err := an.finalizePhase(units)
-		var safe *workerError
-		if !errors.As(err, &safe) || !strings.HasPrefix(safe.stage, "finalize_primary_") {
-			t.Fatalf("expiry not a primary finalize failure: %v", err)
-		}
-		if safe.class != "unknown_commit_presend" && safe.class != "unknown_commit_tx_done" {
-			t.Fatalf("pre-send expiry class=%s", safe.class)
-		}
-		for _, e := range entries {
-			if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE id=$1 AND attempts=$2 AND not_before IS NULL`, e.id, e.attempts); n != 1 {
-				t.Fatal("expiry lost a row or kept a rolled-back retry/defer update")
-			}
-		}
-		if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE kind='proxy' AND ref='expiry-handoff'`); n != 0 {
-			t.Fatal("proxy handoff committed without its acknowledgment")
-		}
-		var firstFailedAt time.Time
-		if err = an.db.QueryRow(`SELECT failed_at FROM failed WHERE journal_id=$1`, terminal.id).Scan(&firstFailedAt); err != nil {
-			t.Fatal("terminal record missing before its acknowledgment")
-		}
-		if an.processed.Load() != 0 || an.worker.deferred.Load() != 0 || an.worker.unknown.Load() != 0 || an.worker.finalizeFailures.Load() != 1 {
-			t.Fatalf("expiry counters processed=%d deferred=%d unknown=%d failures=%d",
-				an.processed.Load(), an.worker.deferred.Load(), an.worker.unknown.Load(), an.worker.finalizeFailures.Load())
-		}
-
-		an.worker.hook = nil
-		if err = an.finalizePhase(units); err != nil {
-			t.Fatal(err)
-		}
-		for _, e := range []journalEntry{exchange, done, terminal} {
-			if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE id=$1`, e.id); n != 0 {
-				t.Fatal("replay did not acknowledge")
-			}
-		}
-		if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE kind='proxy' AND ref='expiry-handoff'`); n != 1 {
-			t.Fatalf("replay handoff rows=%d", n)
-		}
-		var failedAt time.Time
-		if err = an.db.QueryRow(`SELECT failed_at FROM failed WHERE journal_id=$1`, terminal.id).Scan(&failedAt); err != nil || !failedAt.After(firstFailedAt) {
-			t.Fatal("replay did not refresh the terminal record")
-		}
-		if attempts, def := queueState(t, an, deferred.id); attempts != 0 || !def {
-			t.Fatal("replayed defer consumed an attempt or omitted defer")
-		}
-		if attempts, def := queueState(t, an, retry.id); attempts != 1 || !def {
-			t.Fatal("replayed retry not applied once")
-		}
-		if code, _ := an.worker.finalizeCode.Load().(string); code != "ok" || an.processed.Load() != 3 || an.worker.deferred.Load() != 1 || an.worker.finalizeFailures.Load() != 1 {
-			t.Fatalf("replay code=%s processed=%d deferred=%d failures=%d", code, an.processed.Load(), an.worker.deferred.Load(), an.worker.finalizeFailures.Load())
-		}
+		firstFailedAt := assertExpiryRetained(t, an, entries, err, "unknown_commit_presend", "unknown_commit_tx_done")
+		assertExpiryReplays(t, an, entries, units, firstFailedAt)
 	})
-	// during_commit (C3) is not here yet: the diagnosis's deferred-trigger fixture cannot
-	// produce a late commit, because pgconn's asyncClose sends a CancelRequest when the read
-	// times out, which aborts the deferred trigger and rolls the COMMIT back. FLT-212 holds
-	// the options.
+	// during_commit: a deferred constraint trigger holds COMMIT for 0.6 s against the 300 ms
+	// owned finalize budget, so the deadline hits with COMMIT in flight. pgx then cancels it:
+	// on the read timeout, pgconn's asyncClose sends a CancelRequest, which aborts the trigger's
+	// sleep and rolls the COMMIT back. So this fixture shows a rollback, not a late commit.
+	// A real late commit (a WAL-flush stall the cancel cannot stop) is seen only as the capture
+	// run's late_commit=true, and is not tested here.
+	t.Run("during_commit", func(t *testing.T) {
+		_, an := ownedWorker(t)
+		entries, units := expiryBatch(t, an, "slow-commit")
+		// The function-level setting keeps the server from noticing the closed client socket
+		// during the sleep, so only the cancel can end the transaction early.
+		workerSQL(t, an.a.db, `CREATE FUNCTION flt212_slow_commit() RETURNS trigger LANGUAGE plpgsql
+   SET client_connection_check_interval = 0 AS $$ BEGIN PERFORM pg_sleep(0.6); RETURN NULL; END $$`)
+		workerSQL(t, an.a.db, `CREATE CONSTRAINT TRIGGER flt212_slow_commit AFTER DELETE ON `+journalTable+`
+   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (OLD.ref = 'slow-commit') EXECUTE FUNCTION flt212_slow_commit()`)
+		dropTrigger := func() {
+			workerSQL(t, an.a.db, `DROP TRIGGER IF EXISTS flt212_slow_commit ON `+journalTable)
+			workerSQL(t, an.a.db, `DROP FUNCTION IF EXISTS flt212_slow_commit()`)
+		}
+		t.Cleanup(dropTrigger)
+		started := time.Now()
+		err := an.finalizePhase(units)
+		// Check only after the trigger's sleep would have ended, so a COMMIT the cancel failed
+		// to stop would already show as acknowledged rows.
+		time.Sleep(time.Until(started.Add(1500 * time.Millisecond)))
+		firstFailedAt := assertExpiryRetained(t, an, entries, err, "unknown_commit_inflight_timeout")
+		dropTrigger()
+		assertExpiryReplays(t, an, entries, units, firstFailedAt)
+	})
 }
 
 // The statement triggers count actual PostgreSQL operation groups and inject latency once
