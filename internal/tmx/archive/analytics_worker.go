@@ -71,9 +71,12 @@ func safeWorkerError(stage string, err error) error {
 	}
 	class := "error"
 	var unknown *unknownCommit
+	var rejected *commitRejected
 	switch {
 	case errors.As(err, &unknown):
 		class = "unknown_commit_" + commitCause(unknown.err)
+	case errors.As(err, &rejected):
+		class = "commit_rejected" // the SQLSTATE follows as the state
 	case errors.Is(err, context.DeadlineExceeded):
 		class = "timeout"
 	case errors.Is(err, context.Canceled):
@@ -116,16 +119,43 @@ type unknownCommit struct{ err error }
 
 func (e *unknownCommit) Error() string { return "analytics commit outcome unknown" }
 func (e *unknownCommit) Unwrap() error { return e.err }
+
+// commitRejected is a COMMIT the server answered with an ERROR. PostgreSQL rolled the
+// transaction back, so the outcome is known: the work failed and follows the ordinary attempts,
+// backoff and ceiling.
+type commitRejected struct{ err error }
+
+func (e *commitRejected) Error() string { return "analytics commit rejected" }
+func (e *commitRejected) Unwrap() error { return e.err }
+
+// commitWork commits, and names how a failed COMMIT ended: rejected by the server (rolled
+// back), or unknown (lost or missing reply, timeout, or a FATAL/PANIC ending the session, which
+// can follow a durable commit record).
 func commitWork(tx *sql.Tx) error {
 	if err := tx.Commit(); err != nil {
+		if serverRejected(err) {
+			return &commitRejected{err}
+		}
 		return &unknownCommit{err}
 	}
 	return nil
 }
 
+func serverRejected(err error) bool {
+	var pg *pgconn.PgError
+	if !errors.As(err, &pg) {
+		return false
+	}
+	severity := pg.SeverityUnlocalized
+	if severity == "" {
+		severity = pg.Severity
+	}
+	return severity == "ERROR"
+}
+
 // commitUnit commits a work unit's analytics transaction (session, thread, commit and PR
-// extraction). Every COMMIT error is an unknown outcome. The owned-test boundary runs after a
-// COMMIT the server applied, so a test can report a lost reply while the data has landed.
+// extraction) through commitWork. The owned-test boundary runs after a COMMIT the server
+// applied, so a test can report a lost reply while the data has landed.
 func (an *analytics) commitUnit(ctx context.Context, tx *sql.Tx) error {
 	if err := commitWork(tx); err != nil {
 		return err
@@ -255,9 +285,10 @@ func (an *analytics) executeUnit(ctx context.Context, u *journalUnit) {
 	}
 	u.err = err
 	// Only a definite error becomes workFailed, the one outcome that consumes an attempt and,
-	// at the ceiling, dead-letters and acknowledges. An unknown COMMIT or a lost connection is
-	// retained like a deferral: not_before moves by deferFor, attempts stay unchanged, and it
-	// never reaches the ceiling.
+	// at the ceiling, dead-letters and acknowledges. That includes a COMMIT the server rejected
+	// (commitRejected: it rolled back). An unknown COMMIT or a lost connection is retained like
+	// a deferral: not_before moves by deferFor, attempts stay unchanged, and it never reaches
+	// the ceiling.
 	var unknown *unknownCommit
 	switch {
 	case errors.As(err, &unknown):

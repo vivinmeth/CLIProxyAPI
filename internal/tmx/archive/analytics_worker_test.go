@@ -1006,44 +1006,47 @@ func TestRawWorkerFinalizeBudgetExpiryRetainsAndReplays(t *testing.T) {
 	})
 }
 
-// A lost reply after a work write, or any COMMIT error, must never be taken as an ordinary
-// failure: that would consume an attempt and, at the ceiling, dead-letter and acknowledge an
-// obligation whose outcome is unknown.
+// A lost reply after a work write must never be taken as an ordinary failure: that would
+// consume an attempt and, at the ceiling, dead-letter and acknowledge an obligation whose
+// outcome is unknown. A COMMIT the server rejects is the opposite case: it rolled back, so it is
+// a definite failure that follows the ordinary attempts and ceiling instead of looping forever.
 //   - lost_reply lets the real write land, then reports a broken connection: after a thread,
 //     commit or PR extraction COMMIT (through commitUnit), and after the exchange mirror's
 //     autocommit copy (a raw write with no unknownCommit wrapper).
-//   - commit_refused makes PostgreSQL itself fail the extraction COMMIT, with a deferred
-//     constraint trigger, so it needs no test boundary in the code under test.
+//   - commit_refused makes PostgreSQL fail the extraction COMMIT with an ERROR (P0001, and a
+//     40001 serialization failure for threads), from a deferred constraint trigger.
 func TestRawWorkerLostReplyNeverDeadLetters(t *testing.T) {
 	ts := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
 	for _, tc := range []lostReplyCase{
-		{kind: "thread", boundary: "unit_committed", table: "threads", lost: io.ErrUnexpectedEOF,
+		{kind: "thread", boundary: "unit_committed", table: "threads", lost: io.ErrUnexpectedEOF, refusals: []string{"P0001", "40001"},
 			queue: func(t *testing.T, a *Archive) {
 				if _, err := a.IngestThreads(context.Background(), ThreadBatch{Source: "t3", Threads: []ThreadIngest{{ExternalID: "lost-reply", Title: "x"}}}); err != nil {
 					t.Fatal(err)
 				}
 			}},
-		{kind: "commit", boundary: "unit_committed", table: "commits", lost: driver.ErrBadConn,
+		{kind: "commit", boundary: "unit_committed", table: "commits", lost: driver.ErrBadConn, refusals: []string{"P0001"},
 			queue: func(t *testing.T, a *Archive) {
 				if _, err := a.IngestCommits(context.Background(), CommitBatch{Machine: "owned", Commits: []CommitIngest{
 					{Repo: "github.com/o/r", SHA: "eeeeeee5", CommittedAt: &ts, Additions: 1, Files: 1}}}); err != nil {
 					t.Fatal(err)
 				}
 			}},
-		{kind: "pull_request", boundary: "unit_committed", table: "prs", lost: io.EOF,
+		{kind: "pull_request", boundary: "unit_committed", table: "prs", lost: io.EOF, refusals: []string{"P0001"},
 			queue: func(t *testing.T, a *Archive) {
 				if _, err := a.IngestPullRequests(context.Background(), PullRequestBatch{Machine: "owned", PullRequests: []PullRequestIngest{
 					{Pull: ghPull(41, "lost reply", "open", "", "2026-10-20T10:00:00Z", "")}}}); err != nil {
 					t.Fatal(err)
 				}
 			}},
+		// The exchange mirror is an autocommit write: it has no COMMIT of its own to refuse.
 		{kind: "exchange", boundary: "mirror_committed", table: "exchanges", lost: io.ErrUnexpectedEOF, trace: "lost-reply-trace",
 			queue: func(t *testing.T, a *Archive) { syntheticExchange(t, a, "lost-reply-trace") }},
 	} {
-		for _, mode := range []string{"lost_reply", "commit_refused"} {
-			if mode == "commit_refused" && tc.kind == "exchange" {
-				continue // the exchange mirror is an autocommit write: it has no COMMIT of its own
-			}
+		modes := []string{"lost_reply"}
+		for _, state := range tc.refusals {
+			modes = append(modes, "commit_refused_"+state)
+		}
+		for _, mode := range modes {
 			for _, attempts := range []int{0, maxAttempts - 1} {
 				t.Run(fmt.Sprintf("%s/%s/attempts_%d", tc.kind, mode, attempts), func(t *testing.T) {
 					testLostReply(t, tc, mode, attempts)
@@ -1056,6 +1059,7 @@ func TestRawWorkerLostReplyNeverDeadLetters(t *testing.T) {
 type lostReplyCase struct {
 	kind, boundary, table, trace string
 	lost                         error
+	refusals                     []string // SQLSTATEs a deferred trigger raises at COMMIT
 	queue                        func(t *testing.T, a *Archive)
 }
 
@@ -1072,31 +1076,33 @@ func testLostReply(t *testing.T, tc lostReplyCase, mode string, attempts int) {
 	if tc.trace != "" {
 		countRows, ref = `SELECT count(*) FROM `+tc.table+` WHERE trace_id=$1`, tc.trace
 	}
-	class, landed := "work:unknown_commit_conn", 1
-	dropTrigger := func() {}
-	switch {
-	case mode == "commit_refused":
-		// Deferred, so the refusal comes from COMMIT itself and rolls the write back.
-		class, landed = "work:unknown_commit_other:P0001", 0
+	refused := strings.TrimPrefix(mode, "commit_refused_")
+	if refused == mode {
+		refused = ""
+	}
+	if refused != "" {
+		// Deferred, so the ERROR comes from COMMIT itself and rolls the write back.
 		workerSQL(t, an.db, `CREATE FUNCTION flt212_refuse_commit() RETURNS trigger LANGUAGE plpgsql AS
-   $$ BEGIN RAISE EXCEPTION 'synthetic commit refusal'; END $$`)
+   $$ BEGIN RAISE EXCEPTION 'synthetic commit refusal' USING ERRCODE = '`+refused+`'; END $$`)
 		workerSQL(t, an.db, `CREATE CONSTRAINT TRIGGER flt212_refuse_commit AFTER INSERT OR UPDATE ON `+tc.table+`
    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION flt212_refuse_commit()`)
-		dropTrigger = func() {
+		dropTrigger := func() {
 			workerSQL(t, an.db, `DROP TRIGGER IF EXISTS flt212_refuse_commit ON `+tc.table)
 			workerSQL(t, an.db, `DROP FUNCTION IF EXISTS flt212_refuse_commit()`)
 		}
 		t.Cleanup(dropTrigger)
-	case tc.kind == "exchange":
+		testRefusedCommit(t, a, an, e, countRows, ref, refused, dropTrigger)
+		return
+	}
+	class := "work:unknown_commit_conn"
+	if tc.kind == "exchange" {
 		class = "work:connection" // a raw write's lost reply, with no COMMIT wrapper
-		fallthrough
-	default:
-		an.worker.hook = func(_ context.Context, code string) error {
-			if code == tc.boundary {
-				return tc.lost // the write landed; its reply did not
-			}
-			return nil
+	}
+	an.worker.hook = func(_ context.Context, code string) error {
+		if code == tc.boundary {
+			return tc.lost // the write landed; its reply did not
 		}
+		return nil
 	}
 	u := &journalUnit{entries: []journalEntry{e}}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1108,8 +1114,8 @@ func testLostReply(t *testing.T, tc lostReplyCase, mode string, attempts int) {
 	if got := safeWorkerError("work", u.err).Error(); got != class {
 		t.Fatalf("class=%s want %s", got, class)
 	}
-	if n := workerCount(t, an, countRows, ref); n != landed {
-		t.Fatalf("fixture rows=%d, want %d", n, landed)
+	if n := workerCount(t, an, countRows, ref); n != 1 {
+		t.Fatalf("fixture write did not land: %d", n)
 	}
 	if err := an.finalizePhase([]*journalUnit{u}); err != nil {
 		t.Fatal(err)
@@ -1124,9 +1130,7 @@ func testLostReply(t *testing.T, tc lostReplyCase, mode string, attempts int) {
 	if an.processed.Load() != 0 || an.worker.unknown.Load() != 1 || an.worker.deferred.Load() != 1 {
 		t.Fatalf("counters processed=%d unknown=%d deferred=%d", an.processed.Load(), an.worker.unknown.Load(), an.worker.deferred.Load())
 	}
-
 	// Replay with no fault: the obligation completes once and acknowledges.
-	dropTrigger()
 	an.worker.hook = nil
 	workerSQL(t, a.db, `UPDATE `+journalTable+` SET not_before=NULL WHERE id=$1`, e.id)
 	drain(t, an)
@@ -1138,6 +1142,60 @@ func testLostReply(t *testing.T, tc lostReplyCase, mode string, attempts int) {
 	}
 	if n := workerCount(t, an, `SELECT count(*) FROM failed`); n != 0 {
 		t.Fatal("replay dead-lettered")
+	}
+}
+
+// testRefusedCommit checks a server-rejected COMMIT is a definite failure: an ordinary retry
+// below the ceiling, and at the ceiling a terminal record before the acknowledgment. No
+// analytics row exists either way, because the transaction rolled back.
+func testRefusedCommit(t *testing.T, a *Archive, an *analytics, e journalEntry, countRows, ref, state string, dropTrigger func()) {
+	t.Helper()
+	u := &journalUnit{entries: []journalEntry{e}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	an.executeUnit(ctx, u)
+	cancel()
+	if u.outcome != workFailed {
+		t.Fatalf("outcome=%d, want failed", u.outcome)
+	}
+	if got := safeWorkerError("work", u.err).Error(); got != "work:commit_rejected:"+state {
+		t.Fatalf("class=%s want work:commit_rejected:%s", got, state)
+	}
+	if n := workerCount(t, an, countRows, ref); n != 0 {
+		t.Fatalf("rolled-back COMMIT left %d rows", n)
+	}
+	if err := an.finalizePhase([]*journalUnit{u}); err != nil {
+		t.Fatal(err)
+	}
+	if an.worker.unknown.Load() != 0 || an.worker.deferred.Load() != 0 {
+		t.Fatalf("definite failure counted unknown=%d deferred=%d", an.worker.unknown.Load(), an.worker.deferred.Load())
+	}
+	if e.attempts+1 >= maxAttempts {
+		if n := workerCount(t, an, `SELECT count(*) FROM failed WHERE journal_id=$1 AND error=$2`, e.id, "work:commit_rejected:"+state); n != 1 {
+			t.Fatal("ceiling did not write the terminal record")
+		}
+		if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE id=$1`, e.id); n != 0 || an.processed.Load() != 1 {
+			t.Fatalf("ceiling did not acknowledge: rows=%d processed=%d", n, an.processed.Load())
+		}
+		if n := workerCount(t, an, countRows, ref); n != 0 {
+			t.Fatal("dead-lettered work left an analytics row")
+		}
+		return
+	}
+	// Below the ceiling: one ordinary attempt with its backoff, then a normal replay.
+	if got, def := queueState(t, an, e.id); got != e.attempts+1 || !def {
+		t.Fatalf("attempts=%d deferred=%t, want attempts=%d with backoff", got, def, e.attempts+1)
+	}
+	if n := workerCount(t, an, `SELECT count(*) FROM failed`); n != 0 || an.processed.Load() != 0 {
+		t.Fatal("retry dead-lettered or acknowledged")
+	}
+	dropTrigger()
+	workerSQL(t, a.db, `UPDATE `+journalTable+` SET not_before=NULL WHERE id=$1`, e.id)
+	drain(t, an)
+	if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE id=$1`, e.id); n != 0 {
+		t.Fatal("replay did not acknowledge")
+	}
+	if n := workerCount(t, an, countRows, ref); n != 1 {
+		t.Fatalf("replay rows=%d, want exactly 1", n)
 	}
 }
 
