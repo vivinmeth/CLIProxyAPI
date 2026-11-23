@@ -141,17 +141,20 @@ func commitWork(tx *sql.Tx) error {
 	return nil
 }
 
-func serverRejected(err error) bool {
+// pgSeverity is a server error's unlocalized severity, or "" when err carries none.
+func pgSeverity(err error) string {
 	var pg *pgconn.PgError
 	if !errors.As(err, &pg) {
-		return false
+		return ""
 	}
-	severity := pg.SeverityUnlocalized
-	if severity == "" {
-		severity = pg.Severity
+	if pg.SeverityUnlocalized != "" {
+		return pg.SeverityUnlocalized
 	}
-	return severity == "ERROR"
+	return pg.Severity
 }
+
+// serverRejected reports an ERROR: the statement or COMMIT failed and nothing was committed.
+func serverRejected(err error) bool { return pgSeverity(err) == "ERROR" }
 
 // commitUnit commits a work unit's analytics transaction (session, thread, commit and PR
 // extraction) through commitWork. The owned-test boundary runs after a COMMIT the server
@@ -166,9 +169,14 @@ func (an *analytics) commitUnit(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-// lostConnection reports a broken connection. The server may have applied the write whose
-// reply was lost (an autocommit statement, or a COMMIT), so the outcome is unknown.
+// lostConnection reports a broken connection, including a FATAL or PANIC that ends the
+// session. The server may have applied the write whose reply was lost (an autocommit statement,
+// or a COMMIT), so the outcome is unknown. It is the one predicate for every work write.
 func lostConnection(err error) bool {
+	switch pgSeverity(err) {
+	case "FATAL", "PANIC":
+		return true
+	}
 	var network net.Error
 	return errors.Is(err, driver.ErrBadConn) || errors.As(err, &network) ||
 		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
@@ -178,7 +186,6 @@ func lostConnection(err error) bool {
 // unknown outcome and retains its obligations; none is treated as definitely not committed.
 // A bare context.Canceled is left to "other": pgx returns it mid-flight as well as before send.
 func commitCause(err error) string {
-	var network net.Error
 	switch {
 	case errors.Is(err, sql.ErrTxDone):
 		return "tx_done" // database/sql rolled back after its context ended
@@ -186,7 +193,7 @@ func commitCause(err error) string {
 		return "presend" // database/sql's pre-commit check, or pgconn sent nothing
 	case pgconn.Timeout(err):
 		return "inflight_timeout"
-	case errors.Is(err, driver.ErrBadConn), errors.As(err, &network) && !network.Timeout(), errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+	case lostConnection(err):
 		return "conn"
 	}
 	return "other"
