@@ -8,11 +8,14 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type workerLimits struct{ legacy, raw, expensive, finalize, deferFor time.Duration }
@@ -71,7 +74,7 @@ func safeWorkerError(stage string, err error) error {
 	var network net.Error
 	switch {
 	case errors.As(err, &unknown):
-		class = "unknown_commit"
+		class = "unknown_commit_" + commitCause(unknown.err)
 	case errors.Is(err, context.DeadlineExceeded):
 		class = "timeout"
 	case errors.Is(err, context.Canceled):
@@ -119,6 +122,24 @@ func commitWork(tx *sql.Tx) error {
 		return &unknownCommit{err}
 	}
 	return nil
+}
+
+// commitCause names a failed COMMIT with a fixed token for diagnosis only. Every case stays an
+// unknown outcome and retains its obligations; none is treated as definitely not committed.
+// A bare context.Canceled is left to "other": pgx returns it mid-flight as well as before send.
+func commitCause(err error) string {
+	var network net.Error
+	switch {
+	case errors.Is(err, sql.ErrTxDone):
+		return "tx_done" // database/sql rolled back after its context ended
+	case err == context.DeadlineExceeded, pgconn.SafeToRetry(err):
+		return "presend" // database/sql's pre-commit check, or pgconn sent nothing
+	case pgconn.Timeout(err):
+		return "inflight_timeout"
+	case errors.Is(err, driver.ErrBadConn), errors.As(err, &network) && !network.Timeout(), errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "conn"
+	}
+	return "other"
 }
 
 var expensiveKinds = []string{"session", "proxy", "requests_truncate", "thread", "commit", "prompt", "attachment", "pull_request"}

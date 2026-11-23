@@ -4,14 +4,21 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tmx/capture"
 	log "github.com/sirupsen/logrus"
 )
@@ -457,144 +464,496 @@ func TestRawWorkerLinksBacklogDirtyRestart(t *testing.T) {
 	}
 }
 
+// TMX_FLT212_CAPTURE=1 reruns the shutdown finalize case as first written: the 300 ms owned
+// finalize budget, with the hook's Ping and snapshot on the product context, so a capture run
+// can reproduce the 1-in-10 failure. The default is the strict earned-ACK test (see below).
+const flt212CaptureEnv = "TMX_FLT212_CAPTURE"
+
+// flt212Cause maps the first finalize failure to a fixed token. It never formats the error,
+// so FLT212-CAUSE lines carry no DB text, IDs or refs.
+func flt212Cause(err error) string {
+	if err == nil {
+		return "none"
+	}
+	var unknown *unknownCommit
+	if !errors.As(err, &unknown) {
+		return "not_unknown_commit"
+	}
+	inner := unknown.err
+	var pg *pgconn.PgError
+	var network net.Error
+	switch {
+	case inner == context.DeadlineExceeded:
+		return "presend_sql_ctx"
+	case errors.Is(inner, sql.ErrTxDone):
+		return "tx_done"
+	case pgconn.SafeToRetry(inner):
+		return "presend_pgconn"
+	case pgconn.Timeout(inner):
+		return "inflight_timeout"
+	case errors.Is(inner, driver.ErrBadConn), errors.As(inner, &network) && !network.Timeout(),
+		errors.Is(inner, io.EOF), errors.Is(inner, io.ErrUnexpectedEOF):
+		return "conn"
+	case errors.As(inner, &pg):
+		var safe *workerError
+		if errors.As(safeWorkerError("cause", pg), &safe) && safe.state != "" {
+			return "server_" + safe.state // validated five-character SQLSTATE only
+		}
+		return "server"
+	case errors.Is(inner, pgx.ErrTxCommitRollback):
+		return "commit_rollback"
+	}
+	return "other"
+}
+
+// flt212LogHook keeps the first finalize failure that setErr logs. setErr logs through
+// log.WithError, so the entry holds the real chain while its message stays a fixed code.
+type flt212LogHook struct {
+	mu    sync.Mutex
+	first error
+}
+
+func (h *flt212LogHook) Levels() []log.Level { return log.AllLevels }
+func (h *flt212LogHook) Fire(entry *log.Entry) error {
+	err, _ := entry.Data[log.ErrorKey].(error)
+	var safe *workerError
+	if errors.As(err, &safe) && strings.HasPrefix(safe.stage, "finalize") {
+		h.mu.Lock()
+		if h.first == nil {
+			h.first = err
+		}
+		h.mu.Unlock()
+	}
+	return nil
+}
+func (h *flt212LogHook) cause() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return flt212Cause(h.first)
+}
+
+func installFLT212LogHook(t *testing.T) *flt212LogHook {
+	t.Helper()
+	h := &flt212LogHook{}
+	logger := log.StandardLogger()
+	previousLevel := logger.GetLevel()
+	if !logger.IsLevelEnabled(log.WarnLevel) {
+		logger.SetLevel(log.WarnLevel) // setErr logs at Warn; hooks fire only for enabled levels
+	}
+	previous := logger.ReplaceHooks(make(log.LevelHooks))
+	hooks := make(log.LevelHooks)
+	for level, hs := range previous {
+		hooks[level] = append([]log.Hook(nil), hs...)
+	}
+	hooks.Add(h)
+	logger.ReplaceHooks(hooks)
+	t.Cleanup(func() {
+		logger.ReplaceHooks(previous)
+		logger.SetLevel(previousLevel)
+	})
+	return h
+}
+
+// flt212Setting reads one server setting as a fixed enum value, on its own context.
+func flt212Setting(db *sql.DB, name string, allowed ...string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var v string
+	if err := db.QueryRowContext(ctx, "SHOW "+name).Scan(&v); err != nil {
+		return "unread"
+	}
+	for _, a := range allowed {
+		if v == a {
+			return v
+		}
+	}
+	return "other"
+}
+
+// flt212Timeline records how much finalize budget is left at each boundary, and when the
+// close handshake started and ended, so a capture run shows where the budget went.
+type flt212Timeline struct {
+	mu                sync.Mutex
+	left              map[string]time.Duration
+	entered, released time.Time
+	leftAfterHook     time.Duration
+	afterHookMarked   bool
+}
+
+func (tl *flt212Timeline) mark(ctx context.Context, code string) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return
+	}
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	if _, seen := tl.left[code]; !seen {
+		tl.left[code] = time.Until(deadline)
+	}
+}
+
+func (tl *flt212Timeline) at(stamp *time.Time) {
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	*stamp = time.Now()
+}
+
+func (tl *flt212Timeline) afterHook(ctx context.Context) {
+	if deadline, ok := ctx.Deadline(); ok {
+		tl.mu.Lock()
+		tl.leftAfterHook, tl.afterHookMarked = time.Until(deadline), true
+		tl.mu.Unlock()
+	}
+}
+
+// line formats durations in milliseconds; -1 means the boundary was never reached.
+func (tl *flt212Timeline) line() string {
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	ms := func(code string) int64 {
+		if d, ok := tl.left[code]; ok {
+			return d.Milliseconds()
+		}
+		return -1
+	}
+	handshake, afterHook := int64(-1), int64(-1)
+	if !tl.entered.IsZero() && !tl.released.IsZero() {
+		handshake = tl.released.Sub(tl.entered).Milliseconds()
+	}
+	if tl.afterHookMarked {
+		afterHook = tl.leftAfterHook.Milliseconds()
+	}
+	return fmt.Sprintf("left_at_finalize_ms=%d handshake_ms=%d left_after_hook_ms=%d left_before_commit_ms=%d left_at_committed_ms=%d",
+		ms("finalize"), handshake, afterHook, ms("primary_before_commit"), ms("primary_committed"))
+}
+
 func TestRawWorkerShutdownFinalizesBeforeDBClose(t *testing.T) {
-	for _, phase := range []string{"work_proxy", "finalize"} {
-		t.Run(phase, func(t *testing.T) {
-			_, an := ownedWorker(t)
-			e := queueWork(t, an, "proxy", "stopping", 0)
-			entered := make(chan struct{})
-			release := make(chan struct{})
-			var snapshot map[int64]bool
-			var hookErr error
-			an.worker.hook = func(ctx context.Context, code string) error {
-				if code == phase && (phase != "finalize" || an.worker.phase.Load() == "finalize" && workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE id=$1`, e.id) == 1) {
-					close(entered)
-					if phase == "work_proxy" {
-						<-ctx.Done()
-						return ctx.Err()
-					}
-					select {
-					case <-release:
-					case <-ctx.Done():
-						hookErr = ctx.Err()
-						return hookErr
-					}
-					hookErr = an.db.PingContext(ctx)
-					if hookErr != nil {
-						return hookErr
-					}
-					var rows *sql.Rows
-					rows, hookErr = an.a.db.QueryContext(ctx, `SELECT id FROM `+journalTable)
-					if hookErr != nil {
-						return hookErr
-					}
-					snapshot = map[int64]bool{}
-					for rows.Next() {
-						var id int64
-						if hookErr = rows.Scan(&id); hookErr != nil {
-							_ = rows.Close()
-							return hookErr
-						}
-						snapshot[id] = true
-					}
-					hookErr = closeRows(rows)
-					return hookErr
-				}
+	t.Run("work_proxy", func(t *testing.T) {
+		_, an := ownedWorker(t)
+		e := queueWork(t, an, "proxy", "stopping", 0)
+		entered := make(chan struct{})
+		an.worker.hook = func(ctx context.Context, code string) error {
+			if code == "work_proxy" {
+				close(entered)
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return nil
+		}
+		before := runtime.NumGoroutine()
+		go an.run()
+		an.poke()
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("worker not admitted")
+		}
+		closed := make(chan struct{})
+		go func() { an.close(); close(closed) }()
+		select {
+		case <-closed:
+		case <-time.After(2 * time.Second):
+			t.Fatal("cooperative close unbounded")
+		}
+		if _, err := an.step(); err != nil {
+			t.Fatal(err)
+		}
+		if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE id=$1`, e.id); n != 1 {
+			t.Fatal("shutdown lost incomplete work")
+		}
+		assertShutdownJoinedAndReplays(t, an, e, before)
+	})
+	// The strict earned-ACK case runs under the production finalize budget, with the hook's
+	// own Ping and snapshot on separate contexts, so instrumentation cannot spend the budget it
+	// is checking. The FLT212-CAUSE line stays, so any later expiry explains itself.
+	t.Run("finalize", func(t *testing.T) {
+		capture := os.Getenv(flt212CaptureEnv) == "1"
+		mode := "strict"
+		_, an := ownedWorker(t)
+		if capture {
+			mode = "capture" // ownedWorker's 300 ms finalize budget, as in the failed run
+		} else {
+			l := *an.worker.limits
+			l.finalize = defaultWorkerLimits.finalize
+			an.worker.limits = &l
+		}
+		logHook := installFLT212LogHook(t)
+		fsync := flt212Setting(an.a.db, "fsync", "on", "off")
+		syncCommit := flt212Setting(an.a.db, "synchronous_commit", "on", "off", "local", "remote_write", "remote_apply")
+		e := queueWork(t, an, "proxy", "stopping", 0)
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		timeline := &flt212Timeline{left: map[string]time.Duration{}}
+		var rawFinalized atomic.Bool
+		var matched, stoppingAtRelease bool
+		var snapshot map[int64]bool
+		var hookErr error
+		an.worker.hook = func(ctx context.Context, code string) error {
+			if code == "raw_finalized" {
+				rawFinalized.Store(true)
 				return nil
 			}
-			before := runtime.NumGoroutine()
-			go an.run()
-			an.poke()
-			select {
-			case <-entered:
-			case <-time.After(3 * time.Second):
-				t.Fatal("worker not admitted")
+			// Act only inside the legacy finalize: never a raw-phase finalize, never twice.
+			if !rawFinalized.Load() || an.worker.phase.Load() != "finalize" {
+				return nil
 			}
-			closed := make(chan struct{})
-			go func() { an.close(); close(closed) }()
-			if phase == "finalize" {
-				select {
-				case <-an.ctx.Done(): // close sets stopping before cancelling admission
-				case <-time.After(2 * time.Second):
-					t.Fatal("close did not stop admission")
+			timeline.mark(ctx, code)
+			if code != "finalize" || matched {
+				return nil
+			}
+			own, cancelOwn := context.WithTimeout(context.Background(), 2*time.Second)
+			var queued int
+			hookErr = an.a.db.QueryRowContext(own, `SELECT count(*) FROM `+journalTable+` WHERE id=$1`, e.id).Scan(&queued)
+			cancelOwn()
+			if hookErr != nil || queued != 1 {
+				return hookErr
+			}
+			matched = true
+			timeline.at(&timeline.entered)
+			close(entered)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				hookErr = ctx.Err()
+				return hookErr
+			}
+			timeline.at(&timeline.released)
+			stoppingAtRelease = an.worker.stopping.Load()
+			probe := ctx
+			if !capture {
+				var cancelProbe context.CancelFunc
+				probe, cancelProbe = context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancelProbe()
+			}
+			defer timeline.afterHook(ctx)
+			if hookErr = an.db.PingContext(probe); hookErr != nil {
+				return hookErr
+			}
+			var rows *sql.Rows
+			rows, hookErr = an.a.db.QueryContext(probe, `SELECT id FROM `+journalTable)
+			if hookErr != nil {
+				return hookErr
+			}
+			snapshot = map[int64]bool{}
+			for rows.Next() {
+				var id int64
+				if hookErr = rows.Scan(&id); hookErr != nil {
+					_ = rows.Close()
+					return hookErr
 				}
-				close(release)
+				snapshot[id] = true
 			}
-			select {
-			case <-closed:
-			case <-time.After(2 * time.Second):
-				t.Fatal("cooperative close unbounded")
+			hookErr = closeRows(rows)
+			return hookErr
+		}
+		before := runtime.NumGoroutine()
+		go an.run()
+		an.poke()
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("worker not admitted")
+		}
+		closeStart := time.Now()
+		closed := make(chan struct{})
+		go func() { an.close(); close(closed) }()
+		select {
+		case <-an.ctx.Done(): // close sets stopping before cancelling admission
+		case <-time.After(2 * time.Second):
+			t.Fatal("close did not stop admission")
+		}
+		close(release)
+		closeBound := 2 * time.Second
+		if !capture {
+			closeBound = an.limits().finalize + 2*time.Second
+		}
+		select {
+		case <-closed:
+		case <-time.After(closeBound):
+			t.Fatal("cooperative close unbounded")
+		}
+		closeMS := time.Since(closeStart).Milliseconds()
+		// A COMMIT that timed out in flight may still finish on the server: wait before
+		// asserting, so the capture can tell an unknown outcome from a definite rollback.
+		lateCommit := "n/a"
+		if workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE id=$1`, e.id) == 1 {
+			lateCommit = "false"
+			for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+				time.Sleep(50 * time.Millisecond)
+				if workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE id=$1`, e.id) == 0 {
+					lateCommit = "true"
+					break
+				}
 			}
-			if _, err := an.step(); err != nil {
+		}
+		code, _ := an.worker.finalizeCode.Load().(string)
+		if code == "" {
+			code = "none"
+		}
+		t.Logf("FLT212-CAUSE mode=%s class=%s %s close_ms=%d late_commit=%s code=%s fsync=%s sync_commit=%s",
+			mode, logHook.cause(), timeline.line(), closeMS, lateCommit, code, fsync, syncCommit)
+		if _, err := an.step(); err != nil {
+			t.Fatal(err)
+		}
+		if hookErr != nil {
+			t.Fatalf("finalize hook: %v", safeWorkerError("hook", hookErr))
+		}
+		if !matched || !stoppingAtRelease {
+			t.Fatalf("legacy finalize matched=%t stopping_at_release=%t", matched, stoppingAtRelease)
+		}
+		if !snapshot[e.id] {
+			t.Fatal("intended job absent before acknowledgment")
+		}
+		remaining := map[int64]bool{}
+		rows, err := an.a.db.Query(`SELECT id FROM ` + journalTable)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var id int64
+			if err = rows.Scan(&id); err != nil {
+				_ = rows.Close()
 				t.Fatal(err)
 			}
-			if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE id=$1`, e.id); phase == "work_proxy" && n != 1 {
-				t.Fatal("shutdown lost incomplete work")
+			remaining[id] = true
+		}
+		if err = closeRows(rows); err != nil {
+			t.Fatal(err)
+		}
+		if remaining[e.id] {
+			t.Fatal("earned synthetic job not acknowledged")
+		}
+		var acked int64
+		for id := range snapshot {
+			if !remaining[id] {
+				acked++
 			}
-			if phase == "finalize" {
-				if hookErr != nil {
-					t.Fatalf("finalize hook: %v", hookErr)
-				}
-				if !snapshot[e.id] {
-					t.Fatal("intended job absent before acknowledgment")
-				}
-				remaining := map[int64]bool{}
-				rows, err := an.a.db.Query(`SELECT id FROM ` + journalTable)
-				if err != nil {
-					t.Fatal(err)
-				}
-				for rows.Next() {
-					var id int64
-					if err = rows.Scan(&id); err != nil {
-						_ = rows.Close()
-						t.Fatal(err)
-					}
-					remaining[id] = true
-				}
-				if err = closeRows(rows); err != nil {
-					t.Fatal(err)
-				}
-				if remaining[e.id] {
-					t.Fatal("earned synthetic job not acknowledged")
-				}
-				var acked int64
-				for id := range snapshot {
-					if !remaining[id] {
-						acked++
-					}
-				}
-				if processed := an.processed.Load(); processed != acked {
-					t.Fatalf("processed=%d acknowledged=%d snapshot=%d remaining=%d", processed, acked, len(snapshot), len(remaining))
-				}
-				if an.worker.finalizeFailures.Load() != 0 || an.worker.finalizeCode.Load() != "ok" {
-					t.Fatalf("finalization failures=%d code=%v", an.worker.finalizeFailures.Load(), an.worker.finalizeCode.Load())
-				}
-				t.Logf("processed=%d acknowledged=%d snapshot=%d remaining=%d", an.processed.Load(), acked, len(snapshot), len(remaining))
-			}
-			// run has returned and all synchronous work has joined before the DB closes.
-			select {
-			case <-an.done:
-			default:
-				t.Fatal("run goroutine abandoned")
-			}
-			if runtime.NumGoroutine() > before+4 {
-				t.Fatal("worker goroutine growth")
-			}
-			// Reopen the analytics connection and worker state, rather than clearing the old
-			// stopping flag. Incomplete work survives shutdown and replays on a real restart.
-			restarted, err := openAnalytics(context.Background(), an.a, os.Getenv("TMX_ANALYTICS_TEST_DSN"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer restarted.cancel()
-			defer func() { _ = restarted.db.Close() }()
-			workerSQL(t, an.a.db, `UPDATE `+journalTable+` SET not_before=NULL WHERE id=$1`, e.id)
-			drain(t, restarted)
-			if n := workerCount(t, restarted, `SELECT count(*) FROM `+journalTable+` WHERE id=$1`, e.id); n != 0 {
-				t.Fatal("restart did not discharge retained obligation")
-			}
-		})
+		}
+		if processed := an.processed.Load(); processed != acked {
+			t.Fatalf("processed=%d acknowledged=%d snapshot=%d remaining=%d", processed, acked, len(snapshot), len(remaining))
+		}
+		if an.worker.finalizeFailures.Load() != 0 || code != "ok" {
+			t.Fatalf("finalization failures=%d code=%s", an.worker.finalizeFailures.Load(), code)
+		}
+		if an.worker.deferred.Load() != 0 || an.worker.unknown.Load() != 0 {
+			t.Fatalf("deferred=%d unknown=%d", an.worker.deferred.Load(), an.worker.unknown.Load())
+		}
+		t.Logf("processed=%d acknowledged=%d snapshot=%d remaining=%d", an.processed.Load(), acked, len(snapshot), len(remaining))
+		assertShutdownJoinedAndReplays(t, an, e, before)
+	})
+}
+
+// assertShutdownJoinedAndReplays checks that run joined before the DB closed, then reopens the
+// analytics connection and worker state, rather than clearing the old stopping flag.
+// Incomplete work survives shutdown and replays on a real restart.
+func assertShutdownJoinedAndReplays(t *testing.T, an *analytics, e journalEntry, before int) {
+	t.Helper()
+	select {
+	case <-an.done:
+	default:
+		t.Fatal("run goroutine abandoned")
 	}
+	if runtime.NumGoroutine() > before+4 {
+		t.Fatal("worker goroutine growth")
+	}
+	restarted, err := openAnalytics(context.Background(), an.a, os.Getenv("TMX_ANALYTICS_TEST_DSN"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.cancel()
+	defer func() { _ = restarted.db.Close() }()
+	workerSQL(t, an.a.db, `UPDATE `+journalTable+` SET not_before=NULL WHERE id=$1`, e.id)
+	drain(t, restarted)
+	if n := workerCount(t, restarted, `SELECT count(*) FROM `+journalTable+` WHERE id=$1`, e.id); n != 0 {
+		t.Fatal("restart did not discharge retained obligation")
+	}
+}
+
+// A finalize budget that expires at the primary COMMIT must retain every obligation and
+// replay it. It runs through finalizePhase, so the fresh finalize context is covered.
+func TestRawWorkerFinalizeBudgetExpiryRetainsAndReplays(t *testing.T) {
+	// before_commit (C1): database/sql sees the finalize context already done and never sends
+	// COMMIT, so the primary transaction rolls back. The analytics terminal record committed
+	// separately, first, as the design specifies.
+	t.Run("before_commit", func(t *testing.T) {
+		_, an := ownedWorker(t)
+		entries := []journalEntry{
+			queueWork(t, an, "exchange", "expiry-exchange", 0),
+			queueWork(t, an, "proxy", "expiry-done", 0),
+			queueWork(t, an, "proxy", "expiry-deferred", 0),
+			queueWork(t, an, "proxy", "expiry-retry", 0),
+			queueWork(t, an, "proxy", "expiry-terminal", maxAttempts-1),
+		}
+		exchange, done, deferred, retry, terminal := entries[0], entries[1], entries[2], entries[3], entries[4]
+		var units []*journalUnit
+		for i, outcome := range []journalOutcome{workCompleted, workCompleted, workDeferred, workFailed, workFailed} {
+			u := &journalUnit{entries: []journalEntry{entries[i]}, outcome: outcome, err: errors.New("synthetic")}
+			if i == 0 {
+				u.proxyKeys = []string{"expiry-handoff"}
+			}
+			units = append(units, u)
+		}
+		an.worker.hook = func(ctx context.Context, code string) error {
+			if code == "primary_before_commit" {
+				<-ctx.Done() // the real tx.Commit then runs on the expired finalize context
+			}
+			return nil
+		}
+		err := an.finalizePhase(units)
+		var safe *workerError
+		if !errors.As(err, &safe) || !strings.HasPrefix(safe.stage, "finalize_primary_") {
+			t.Fatalf("expiry not a primary finalize failure: %v", err)
+		}
+		if safe.class != "unknown_commit_presend" && safe.class != "unknown_commit_tx_done" {
+			t.Fatalf("pre-send expiry class=%s", safe.class)
+		}
+		for _, e := range entries {
+			if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE id=$1 AND attempts=$2 AND not_before IS NULL`, e.id, e.attempts); n != 1 {
+				t.Fatal("expiry lost a row or kept a rolled-back retry/defer update")
+			}
+		}
+		if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE kind='proxy' AND ref='expiry-handoff'`); n != 0 {
+			t.Fatal("proxy handoff committed without its acknowledgment")
+		}
+		var firstFailedAt time.Time
+		if err = an.db.QueryRow(`SELECT failed_at FROM failed WHERE journal_id=$1`, terminal.id).Scan(&firstFailedAt); err != nil {
+			t.Fatal("terminal record missing before its acknowledgment")
+		}
+		if an.processed.Load() != 0 || an.worker.deferred.Load() != 0 || an.worker.unknown.Load() != 0 || an.worker.finalizeFailures.Load() != 1 {
+			t.Fatalf("expiry counters processed=%d deferred=%d unknown=%d failures=%d",
+				an.processed.Load(), an.worker.deferred.Load(), an.worker.unknown.Load(), an.worker.finalizeFailures.Load())
+		}
+
+		an.worker.hook = nil
+		if err = an.finalizePhase(units); err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range []journalEntry{exchange, done, terminal} {
+			if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE id=$1`, e.id); n != 0 {
+				t.Fatal("replay did not acknowledge")
+			}
+		}
+		if n := workerCount(t, an, `SELECT count(*) FROM `+journalTable+` WHERE kind='proxy' AND ref='expiry-handoff'`); n != 1 {
+			t.Fatalf("replay handoff rows=%d", n)
+		}
+		var failedAt time.Time
+		if err = an.db.QueryRow(`SELECT failed_at FROM failed WHERE journal_id=$1`, terminal.id).Scan(&failedAt); err != nil || !failedAt.After(firstFailedAt) {
+			t.Fatal("replay did not refresh the terminal record")
+		}
+		if attempts, def := queueState(t, an, deferred.id); attempts != 0 || !def {
+			t.Fatal("replayed defer consumed an attempt or omitted defer")
+		}
+		if attempts, def := queueState(t, an, retry.id); attempts != 1 || !def {
+			t.Fatal("replayed retry not applied once")
+		}
+		if code, _ := an.worker.finalizeCode.Load().(string); code != "ok" || an.processed.Load() != 3 || an.worker.deferred.Load() != 1 || an.worker.finalizeFailures.Load() != 1 {
+			t.Fatalf("replay code=%s processed=%d deferred=%d failures=%d", code, an.processed.Load(), an.worker.deferred.Load(), an.worker.finalizeFailures.Load())
+		}
+	})
+	// during_commit (C3) is not here yet: the diagnosis's deferred-trigger fixture cannot
+	// produce a late commit, because pgconn's asyncClose sends a CancelRequest when the read
+	// times out, which aborts the deferred trigger and rolls the COMMIT back. FLT-212 holds
+	// the options.
 }
 
 // The statement triggers count actual PostgreSQL operation groups and inject latency once
