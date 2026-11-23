@@ -39,3 +39,28 @@ func TestPoolExplainsToolAttestationCooldown(t *testing.T) {
 		t.Fatalf("pool cooldowns=%+v", got.Cooldowns)
 	}
 }
+
+func TestPoolExplainsMetaBreakerTrip(t *testing.T) {
+	ctx := context.Background()
+	m := auth.NewManager(nil, nil, nil)
+	for _, id := range []string{"first", "second", "third"} {
+		if _, err := m.Register(ctx, &auth.Auth{ID: id, Provider: "meta", Status: auth.StatusActive}); err != nil {
+			t.Fatal(err)
+		}
+		m.MarkResult(ctx, auth.Result{AuthID: id, Provider: "meta", Model: "model", Error: &auth.Error{HTTPStatus: 403, Code: "client_attestation_denied", Message: "synthetic-private-response"}})
+	}
+	snapshot := Build(ctx, m.List(), nil, nil, m, "model")
+	if snapshot.MetaRefusalBreaker == nil || !snapshot.MetaRefusalBreaker.Tripped || snapshot.MetaRefusalBreaker.Alert != refusals.MetaBreakerAlert || snapshot.MetaRefusalBreaker.DisablesInWindow != 2 {
+		t.Fatalf("breaker=%+v", snapshot.MetaRefusalBreaker)
+	}
+	for _, a := range snapshot.Credentials {
+		if a.AuthID != "third" {
+			continue
+		}
+		if !a.Enabled || a.Reason != refusals.AttestationRefused || a.StatusMessage != refusals.AttestationRefused || a.NextRetryAfter == nil || a.PickRank != nil {
+			t.Fatalf("third pool=%+v", a)
+		}
+		return
+	}
+	t.Fatal("third account missing from pool")
+}

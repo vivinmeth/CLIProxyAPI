@@ -1481,3 +1481,10 @@ plugins:
 archive:
   live-capture-max-bytes: 536870912 # 512 MiB shared across live and queued captures
   live-capture-exchange-max-bytes: 33554432 # 32 MiB per body; larger bodies stream to disk (key retained for compatibility)
+
+# tokenmaxx: limit automatic Meta attestation account disables per process.
+# Zero uses defaults; bounds: threshold 1..100, window-seconds 60..86400.
+# A full quiet window rearms future disables, never re-enables stored refusals.
+tmx-meta-refusal-breaker:
+  threshold: 2
+  window-seconds: 3600

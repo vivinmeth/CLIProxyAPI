@@ -40,8 +40,9 @@ type Credential struct {
 }
 
 type Snapshot struct {
-	Credentials []Credential `json:"credentials"`
-	ObservedAt  time.Time    `json:"observed_at"`
+	Credentials        []Credential                `json:"credentials"`
+	ObservedAt         time.Time                   `json:"observed_at"`
+	MetaRefusalBreaker *refusals.MetaBreakerStatus `json:"meta_refusal_breaker,omitempty"`
 }
 
 // Build calls the actual reset-soonest selector on detached snapshots, so its
@@ -50,6 +51,12 @@ type Snapshot struct {
 func Build(ctx context.Context, auths []*auth.Auth, counts map[string]int, accounts []quota.Account, counter InFlightCounter, model string) Snapshot {
 	now := time.Now()
 	out := Snapshot{Credentials: []Credential{}, ObservedAt: now.UTC()}
+	if source, ok := counter.(interface {
+		TmxMetaRefusalBreakerStatus() refusals.MetaBreakerStatus
+	}); ok {
+		status := source.TmxMetaRefusalBreakerStatus()
+		out.MetaRefusalBreaker = &status
+	}
 	filtered := make([]*auth.Auth, 0, len(auths))
 	for _, credential := range auths {
 		if credential != nil {

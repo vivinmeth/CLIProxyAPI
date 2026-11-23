@@ -1611,6 +1611,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			tmxReportFailure(result, nil, false) // tmx
 			return
 		}
+		result = m.tmxLimitMetaRefusalLocked(result, auth) // tmx: before terminal mutation or persistence.
 		if modelKey == "" && strings.TrimSpace(result.RouteModel) != "" {
 			if m != nil {
 				modelKey = m.selectionModelKeyForAuth(auth, result.RouteModel)

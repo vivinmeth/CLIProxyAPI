@@ -143,3 +143,9 @@ Go is in `~/.local/go/bin` (often not on `PATH`). Before handing off:
 
 Dev config is `config.yaml` here (git-ignored); dev keys are in `../.dev-keys`. Secret locations:
 `../AGENTS.md` § Project rules. Skill: `go`.
+
+Meta refusal breaker (FLT-148): `internal/tmx/refusals/meta_breaker.go` owns process-local state;
+`refusal_breaker_tmx.go` hooks Manager result mutation before terminal persistence. Config
+`tmx-meta-refusal-breaker` defaults to threshold 2 and window-seconds 3600 (bounds 1..100,
+60..86400). A full quiet window rearms future disables without clearing account refusals;
+a restart loses breaker history. `/tmx/pool` exposes `meta_refusal_breaker` with a fixed alert.

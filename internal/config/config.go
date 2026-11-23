@@ -16,6 +16,8 @@ type ServerResponseCompression = ResponseCompressionConfig
 type Config struct {
 	Archive ArchiveConfig `yaml:"archive" json:"archive"`
 	Server  ServerConfig  `yaml:"server" json:"server"`
+	// TMXMetaRefusalBreaker limits automatic Meta account disables (fork-local).
+	TMXMetaRefusalBreaker MetaRefusalBreakerConfig `yaml:"tmx-meta-refusal-breaker" json:"tmx-meta-refusal-breaker"`
 	// ServerResponseCompression is the JSON-visible mirror of the downstream
 	// response compression settings (YAML: server.response-compression).
 	ServerResponseCompression ResponseCompressionConfig `yaml:"-" json:"response-compression"`
