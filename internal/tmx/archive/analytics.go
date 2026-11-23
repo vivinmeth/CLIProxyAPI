@@ -100,6 +100,7 @@ type analytics struct {
 	lastErr     atomic.Value // string
 	lastRunUnix atomic.Int64
 	mu          sync.Mutex // serialises step() and backfill bookkeeping
+	worker      workerState
 
 	review reviewState // the writable review schema (review.go)
 }
@@ -141,6 +142,9 @@ func openAnalytics(ctx context.Context, a *Archive, dsn string) (*analytics, err
 	an := &analytics{a: a, db: db, wake: make(chan struct{}, 1), stop: make(chan struct{}),
 		done: make(chan struct{})}
 	an.ctx, an.cancel = context.WithCancel(context.Background())
+	an.phase("idle")
+	an.worker.finalizeCode.Store("not_run")
+	an.worker.linksPending.Store(true)
 	if err = an.ensureSchema(pingCtx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -341,9 +345,13 @@ func (an *analytics) poke() {
 }
 
 func (an *analytics) close() {
-	an.cancel() // in-flight work is abandoned; the journal keeps it for the next start
+	an.worker.stopping.Store(true)
+	an.worker.drainUntil.Store(time.Now().Add(an.limits().finalize).UnixNano())
+	an.cancel() // stop extraction; only already-earned bounded finalization may continue
 	close(an.stop)
 	<-an.done
+	an.mu.Lock()
+	defer an.mu.Unlock()
 	_ = an.db.Close()
 }
 
@@ -358,17 +366,26 @@ func (an *analytics) run() {
 		case <-tick.C:
 		case <-an.wake:
 			// Let a burst of journal entries (one per streamed turn) land before reading them.
-			time.Sleep(500 * time.Millisecond)
+			timer := time.NewTimer(500 * time.Millisecond)
+			select {
+			case <-an.stop:
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 		}
 		for {
 			more, err := an.step()
+			// Give canonical links a bounded turn even with a sustained journal backlog.
+			if !an.worker.stopping.Load() {
+				an.refreshLinks(false)
+			}
 			if err != nil {
 				an.setErr(err)
 				break
 			}
 			if !more {
 				an.buildDeferredIndexes()
-				an.refreshLinks(false)
 				break
 			}
 			select {
@@ -416,210 +433,6 @@ type journalEntry struct {
 	id        int64
 	kind, ref string
 	attempts  int
-}
-
-// step processes one journal batch plus new tmx.requests rows. more = there is probably more.
-func (an *analytics) step() (bool, error) {
-	an.mu.Lock()
-	defer an.mu.Unlock()
-	ctx, cancel := context.WithTimeout(an.ctx, 30*time.Minute)
-	defer cancel()
-	an.lastRunUnix.Store(time.Now().Unix())
-
-	// The journal is a queue: processed entries are deleted. (A cursor over the BIGSERIAL id
-	// would skip entries whose transaction commits after a later id's.) Failed entries back off
-	// and don't hold up the rest. Cheap live entries (usage rows, exchanges) go first; imported
-	// sessions, which can take seconds each, come at most sessionBatch per step, so a bulk
-	// import or backfill never holds live usage back for long.
-	rows, err := an.a.db.QueryContext(ctx, `(SELECT id, kind, ref, attempts FROM `+journalTable+`
-			WHERE kind <> 'session' AND (not_before IS NULL OR not_before <= now()) ORDER BY id LIMIT $1)
-		UNION ALL
-		(SELECT id, kind, ref, attempts FROM `+journalTable+`
-			WHERE kind = 'session' AND (not_before IS NULL OR not_before <= now()) ORDER BY id LIMIT $2)`,
-		journalBatch, sessionBatch)
-	if err != nil {
-		return false, err
-	}
-	var entries []journalEntry
-	for rows.Next() {
-		var e journalEntry
-		if err = rows.Scan(&e.id, &e.kind, &e.ref, &e.attempts); err != nil {
-			_ = rows.Close()
-			return false, err
-		}
-		entries = append(entries, e)
-	}
-	if err = closeRows(rows); err != nil {
-		return false, err
-	}
-	if len(entries) == 0 {
-		return false, nil
-	}
-	nSessions := 0
-	for _, e := range entries {
-		if e.kind == "session" {
-			nSessions++
-		}
-	}
-	more := len(entries)-nSessions == journalBatch || nSessions == sessionBatch
-
-	// Collapse the batch: work is state-based, so each session is processed once.
-	var traces, requestIDs []string
-	requestsTruncated := false
-	imported := map[string]bool{}
-	proxy := map[string]bool{}
-	threads := map[string]bool{}
-	commits := map[string]bool{}
-	var prompts, attachments []string
-	pulls := map[string]bool{}
-	byRef := map[string][]journalEntry{}
-	for _, e := range entries {
-		switch e.kind {
-		case "exchange":
-			traces = append(traces, e.ref)
-		case "session":
-			imported[e.ref] = true
-		case "proxy":
-			proxy[e.ref] = true
-		case "request":
-			requestIDs = append(requestIDs, e.ref)
-		case "requests_truncate":
-			requestsTruncated = true
-		case "thread":
-			threads[e.ref] = true
-		case "commit":
-			commits[e.ref] = true
-		case "prompt":
-			prompts = append(prompts, e.ref)
-		case "attachment":
-			attachments = append(attachments, e.ref)
-		case "pull_request":
-			pulls[e.ref] = true
-		}
-		byRef[e.kind+"\x00"+e.ref] = append(byRef[e.kind+"\x00"+e.ref], e)
-	}
-	failedIDs := map[int64]error{}
-	fail := func(kind, ref string, err error) {
-		for _, e := range byRef[kind+"\x00"+ref] {
-			failedIDs[e.id] = err
-		}
-	}
-	if requestsTruncated {
-		if _, errT := an.reconcileAllRequests(ctx); errT != nil {
-			fail("requests_truncate", "*", errT)
-		}
-	}
-	if len(requestIDs) > 0 {
-		if errR := an.syncRequestRows(ctx, requestIDs); errR != nil {
-			for _, id := range requestIDs {
-				fail("request", id, errR)
-			}
-		}
-	}
-	if len(traces) > 0 {
-		if _, errM := an.exchMirror.copy(ctx, `trace_id = ANY($1::text[])`, pgArray(traces)); errM != nil {
-			for _, t := range traces {
-				fail("exchange", t, errM)
-			}
-		} else {
-			keys, errK := an.proxyKeysForTraces(ctx, traces)
-			if errK != nil {
-				return false, errK
-			}
-			for _, k := range keys {
-				proxy[k] = true
-			}
-		}
-	}
-	for id := range threads {
-		if errT := an.extractThread(ctx, id); errT != nil {
-			fail("thread", id, errT)
-		}
-	}
-	for id := range commits {
-		if errC := an.extractCommit(ctx, id); errC != nil {
-			fail("commit", id, errC)
-		}
-	}
-	if len(prompts) > 0 {
-		for id, errP := range an.extractPrompts(ctx, prompts) {
-			fail("prompt", id, errP)
-		}
-	}
-	if len(attachments) > 0 {
-		if _, errA := an.attMirror.copy(ctx, `id = ANY($1::text[])`, pgTextArray(attachments)); errA != nil {
-			for _, id := range attachments {
-				fail("attachment", id, errA)
-			}
-		}
-	}
-	for id := range pulls {
-		if errP := an.extractPullRequest(ctx, id); errP != nil {
-			fail("pull_request", id, errP)
-		}
-	}
-	importedIDs := make([]string, 0, len(imported))
-	for id := range imported {
-		importedIDs = append(importedIDs, id)
-	}
-	sort.Strings(importedIDs)
-	for id, errS := range an.extractImportedBatch(ctx, importedIDs) {
-		fail("session", id, errS)
-	}
-	for key := range proxy {
-		if errP := an.extractProxy(ctx, key); errP != nil {
-			fail("proxy", key, errP)
-			// An exchange entry produced this key; retry those too.
-			for _, t := range traces {
-				fail("exchange", t, errP)
-			}
-		} else {
-			an.extracted.Add(1)
-		}
-	}
-
-	// Done entries are deleted; failed ones retry after 1, 2, ... minutes and after maxAttempts go
-	// to the failed table (a backfill reruns them).
-	var done []string
-	cleared := map[string][]string{} // kind -> refs that went through: their old failures are moot
-	for _, e := range entries {
-		errE, bad := failedIDs[e.id]
-		if !bad {
-			done = append(done, fmt.Sprint(e.id))
-			if e.kind == "session" || e.kind == "proxy" || e.kind == "thread" || e.kind == "commit" ||
-				e.kind == "prompt" || e.kind == "attachment" || e.kind == "pull_request" {
-				cleared[e.kind] = append(cleared[e.kind], e.ref)
-			}
-			an.markLinks(e.kind, e.ref)
-			continue
-		}
-		an.setErr(fmt.Errorf("%s %s: %w", e.kind, e.ref, errE))
-		if e.attempts+1 >= maxAttempts {
-			// Acknowledge only once the failure is recorded; otherwise keep retrying.
-			if _, errF := an.db.ExecContext(ctx, `INSERT INTO failed (journal_id, kind, ref, error) VALUES ($1,$2,$3,$4)
-				ON CONFLICT (journal_id) DO UPDATE SET error = EXCLUDED.error, failed_at = now()`,
-				e.id, e.kind, e.ref, cleanText(errE.Error())); errF == nil {
-				done = append(done, fmt.Sprint(e.id))
-				log.WithError(errE).Warnf("tmx analytics: giving up on %s %s", e.kind, e.ref)
-				continue
-			}
-		}
-		if _, err = an.a.db.ExecContext(ctx, `UPDATE `+journalTable+` SET attempts = attempts + 1,
-			not_before = now() + make_interval(mins => attempts + 1) WHERE id = $1`, e.id); err != nil {
-			return false, err
-		}
-	}
-	if len(done) > 0 {
-		if _, err = an.a.db.ExecContext(ctx, `DELETE FROM `+journalTable+` WHERE id = ANY($1::bigint[])`,
-			"{"+strings.Join(done, ",")+"}"); err != nil {
-			return false, err
-		}
-		an.processed.Add(int64(len(done)))
-	}
-	for kind, refs := range cleared {
-		_, _ = an.db.ExecContext(ctx, `DELETE FROM failed WHERE kind = $1 AND ref = ANY($2::text[])`, kind, pgTextArray(refs))
-	}
-	return more, nil
 }
 
 // buildDeferredIndexes rebuilds the trigram index after a backfill has drained the journal.
@@ -875,6 +688,9 @@ func (an *analytics) writeSession(ctx context.Context, s sessionRow, msgs []msgR
 	}
 	first := 0
 	for first < len(msgs) && existing[first] == msgs[first].digest && existing[first] != "" {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		first++
 	}
 	sameVersion := !storedVersion.Valid || storedVersion.Int64 == analyticsVersion
@@ -924,6 +740,9 @@ func (an *analytics) writeSession(ctx context.Context, s sessionRow, msgs []msgR
 			return nil
 		}
 		for seq := first; seq < len(msgs); seq++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			m := msgs[seq]
 			msg, items, errP := m.produce()
 			if errP != nil {
@@ -933,6 +752,9 @@ func (an *analytics) writeSession(ctx context.Context, s sessionRow, msgs []msgR
 				m.role, m.model, nullableJSON(msg), nullableJSON(m.usage), jsonOrEmpty(m.metadata), m.blob, m.digest})
 			pending += len(msg)
 			for j, it := range items {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				ts := it.TS
 				if ts == nil {
 					ts = m.ts
@@ -955,7 +777,7 @@ func (an *analytics) writeSession(ctx context.Context, s sessionRow, msgs []msgR
 		WHERE id = $1`, s.id); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return commitWork(tx)
 }
 
 func (an *analytics) deleteSession(ctx context.Context, id string) error {
@@ -968,6 +790,12 @@ func (an *analytics) deleteSession(ctx context.Context, id string) error {
 func (an *analytics) extractImportedBatch(ctx context.Context, ids []string) map[string]error {
 	failed := map[string]error{}
 	for start := 0; start < len(ids); {
+		if err := ctx.Err(); err != nil {
+			for _, id := range ids[start:] {
+				failed[id] = err
+			}
+			return failed
+		}
 		var manifests []string
 		end := start
 		for end < len(ids) && (end == start || len(manifests) < prefetchChunkMsgs) {
@@ -980,6 +808,10 @@ func (an *analytics) extractImportedBatch(ctx context.Context, ids []string) map
 		}
 		an.a.prefetchBodiesOpt(ctx, manifests, false)
 		for _, id := range ids[start:end] {
+			if err := ctx.Err(); err != nil {
+				failed[id] = err
+				continue
+			}
 			if failed[id] != nil {
 				continue
 			}
@@ -1021,13 +853,18 @@ func (an *analytics) extractImported(ctx context.Context, id string) error {
 	if errors.Is(err, sql.ErrNoRows) {
 		// Deleted: drop it, un-shadow its proxied twin, drop its usage copies.
 		var ext string
-		_ = an.db.QueryRowContext(ctx, `SELECT external_id FROM sessions WHERE id = $1`, id).Scan(&ext)
+		if err = an.db.QueryRowContext(ctx, `SELECT external_id FROM sessions WHERE id = $1`, id).Scan(&ext); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
 		if err = an.deleteSession(ctx, id); err != nil {
 			return err
 		}
 		if ext != "" {
-			_, _ = an.db.ExecContext(ctx, `UPDATE sessions SET shadowed_by = NULL WHERE id = $1 AND shadowed_by = $2`,
+			_, err = an.db.ExecContext(ctx, `UPDATE sessions SET shadowed_by = NULL WHERE id = $1 AND shadowed_by = $2`,
 				"proxy:"+ext, id)
+			if err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -1150,10 +987,15 @@ func (an *analytics) extractProxy(ctx context.Context, key string) error {
 	if errS := an.a.db.QueryRowContext(ctx, `SELECT id FROM `+schema+`.sessions WHERE external_id = $1
 		ORDER BY updated_at DESC LIMIT 1`, key).Scan(&shadow); errS == nil {
 		s.shadowedBy = &shadow
+	} else if !errors.Is(errS, sql.ErrNoRows) {
+		return errS
 	}
 
 	best := -1
 	for i, e := range exch {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if e.status >= 200 && e.status < 300 && (best < 0 || e.requestBytes >= exch[best].requestBytes) {
 			best = i
 		}
@@ -1234,6 +1076,9 @@ func (an *analytics) proxyMessages(ctx context.Context, e proxyExchange) ([]msgR
 			blobs := elementBlobs[key]
 			i := 0
 			v.ForEach(func(_, m gjson.Result) bool {
+				if ctx.Err() != nil {
+					return false
+				}
 				blob := ""
 				if i < len(blobs) {
 					blob = blobs[i]
@@ -1247,6 +1092,9 @@ func (an *analytics) proxyMessages(ctx context.Context, e proxyExchange) ([]msgR
 				add(role, blob, mm, func() []ConvItem { return normalizeMessage(mm, "") })
 				return true
 			})
+			if err := ctx.Err(); err != nil {
+				return nil, "", err
+			}
 		}
 	}
 	if e.resBody != "" {
@@ -1492,19 +1340,28 @@ func (a *Archive) AnalyticsStatus(ctx context.Context) (map[string]any, error) {
 		trgm = "built"
 	}
 	return map[string]any{
-		"enabled":          true,
-		"version":          analyticsVersion,
-		"journal_backlog":  backlog,
-		"journal_retrying": retrying,
-		"counts":           counts,
-		"sessions_by_kind": byKind,
-		"processed":        an.processed.Load(),
-		"extracted":        an.extracted.Load(),
-		"failures":         an.failures.Load(),
-		"last_error":       lastErr,
-		"last_run":         time.Unix(an.lastRunUnix.Load(), 0).UTC(),
-		"backfilling":      an.backfilling.Load(),
-		"trgm_index":       trgm,
+		"enabled":               true,
+		"version":               analyticsVersion,
+		"journal_backlog":       backlog,
+		"journal_retrying":      retrying,
+		"counts":                counts,
+		"sessions_by_kind":      byKind,
+		"processed":             an.processed.Load(),
+		"extracted":             an.extracted.Load(),
+		"failures":              an.failures.Load(),
+		"last_error":            lastErr,
+		"last_run":              time.Unix(an.lastRunUnix.Load(), 0).UTC(),
+		"completed_passes":      an.worker.passes.Load(),
+		"last_completed_pass":   time.Unix(an.worker.completedAt.Load(), 0).UTC(),
+		"worker_phase":          an.worker.phase.Load(),
+		"worker_phase_since":    time.Unix(an.worker.phaseAt.Load(), 0).UTC(),
+		"budget_deferrals":      an.worker.deferred.Load(),
+		"unknown_outcomes":      an.worker.unknown.Load(),
+		"finalization_failures": an.worker.finalizeFailures.Load(),
+		"finalization_code":     an.worker.finalizeCode.Load(),
+		"links_pending":         an.worker.linksPending.Load(),
+		"backfilling":           an.backfilling.Load(),
+		"trgm_index":            trgm,
 	}, nil
 }
 
@@ -1639,11 +1496,17 @@ func insertRows(ctx context.Context, ex interface {
 	}
 	per := insertParamLimit / len(cols)
 	for start := 0; start < len(rows); start += per {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		end := min(start+per, len(rows))
 		var b strings.Builder
 		b.WriteString("INSERT INTO " + table + " (" + strings.Join(cols, ", ") + ") VALUES ")
 		args := make([]any, 0, (end-start)*len(cols))
 		for i, r := range rows[start:end] {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if i > 0 {
 				b.WriteByte(',')
 			}

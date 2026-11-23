@@ -5,6 +5,7 @@ package archive
 // requestlog/prices.go), and per-session totals. Recreated on start so they follow the code.
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -107,10 +108,14 @@ func (d *linkDirty) reset() {
 
 // markLinks records refs whose request_sessions rows may have changed.
 func (an *analytics) markLinks(kind, ref string) {
+	an.worker.linksPending.Store(true)
 	d := &an.links
 	if d.requests == nil {
 		d.reset()
 		d.full = true
+	}
+	if d.full {
+		return
 	}
 	switch kind {
 	case "request":
@@ -124,9 +129,11 @@ func (an *analytics) markLinks(kind, ref string) {
 	case "exchange":
 		d.traces[ref] = true
 	case "requests_truncate":
+		d.reset()
 		d.full = true
 	}
 	if d.size() > maxLinkDirty {
+		d.reset()
 		d.full = true
 	}
 }
@@ -174,6 +181,20 @@ const linkAffected = `WITH ds AS (SELECT unnest($1::text[]) AS id),
 // every row (force, at start, after a bulk reconcile). Only changed rows are written, so readers
 // never see it empty and a quiet step costs nothing.
 func (an *analytics) refreshLinks(force bool) {
+	an.mu.Lock()
+	defer an.mu.Unlock()
+	if an.worker.stopping.Load() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(an.ctx, an.limits().links)
+	defer cancel()
+	an.phase("links")
+	defer an.phase("idle")
+	an.refreshLinksContext(ctx, force)
+}
+
+// Caller owns mu. A failed refresh retains dirt, including startup's full-refresh obligation.
+func (an *analytics) refreshLinksContext(ctx context.Context, force bool) {
 	if an.reqMirror == nil {
 		return
 	}
@@ -183,23 +204,25 @@ func (an *analytics) refreshLinks(force bool) {
 		d.full = true
 	}
 	if force {
+		d.reset()
 		d.full = true
 	}
 	if !d.full && d.size() == 0 {
 		return
 	}
+	an.worker.linksPending.Store(true)
 	start := time.Now()
 	// Capture can be extracted before the request log is flushed. Retry attribution after
 	// request rows arrive, and at startup for sessions extracted by earlier versions.
-	if err := an.refreshProxyAttribution(); err != nil {
+	if err := an.refreshProxyAttribution(ctx); err != nil {
 		an.setErr(fmt.Errorf("refresh proxy attribution: %w", err))
 		return // keep the dirty refs so the next refresh retries
 	}
 	var err error
 	if d.full {
-		_, err = an.db.ExecContext(an.ctx, linkUpsert(`SELECT id FROM requests UNION SELECT request_id FROM request_sessions`))
+		_, err = an.db.ExecContext(ctx, linkUpsert(`SELECT id FROM requests UNION SELECT request_id FROM request_sessions`))
 	} else {
-		err = an.updateLinks(d)
+		err = an.updateLinks(ctx, d)
 	}
 	if err != nil {
 		an.setErr(fmt.Errorf("refresh request_sessions: %w", err))
@@ -207,13 +230,14 @@ func (an *analytics) refreshLinks(force bool) {
 	}
 	full := d.full
 	d.reset()
+	an.worker.linksPending.Store(false)
 	log.Debugf("tmx analytics: request_sessions updated (full=%v) in %s", full, time.Since(start).Round(time.Millisecond))
 }
 
 // Only fill missing labels, using the exact captured trace. Retries may produce several
 // request rows: conflicting labels remain unknown rather than guessing a harness or machine.
-func (an *analytics) refreshProxyAttribution() error {
-	_, err := an.db.ExecContext(an.ctx, `WITH labels AS (
+func (an *analytics) refreshProxyAttribution(ctx context.Context) error {
+	_, err := an.db.ExecContext(ctx, `WITH labels AS (
 		SELECT s.id, r.harness, r.machine FROM sessions s
 		CROSS JOIN LATERAL (
 			SELECT CASE WHEN count(DISTINCT NULLIF(r.harness, '')) = 1 THEN min(NULLIF(r.harness, '')) END AS harness,
@@ -233,20 +257,20 @@ func (an *analytics) refreshProxyAttribution() error {
 // first and passed as a literal array: inside one statement the planner can't tell a few thousand
 // rows from every row, and read all of messages for a merge join (~2.5 s instead of ~0.1 s).
 // Custom plans throughout: a cached generic plan has the same blind spot.
-func (an *analytics) updateLinks(d *linkDirty) error {
-	tx, err := an.db.BeginTx(an.ctx, nil)
+func (an *analytics) updateLinks(ctx context.Context, d *linkDirty) error {
+	tx, err := an.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err = tx.ExecContext(an.ctx, `SET LOCAL plan_cache_mode = force_custom_plan`); err != nil {
+	if _, err = tx.ExecContext(ctx, `SET LOCAL plan_cache_mode = force_custom_plan`); err != nil {
 		return err
 	}
 	reqs := make([]string, 0, len(d.requests))
 	for id := range d.requests {
 		reqs = append(reqs, strconv.FormatInt(id, 10))
 	}
-	rows, err := tx.QueryContext(an.ctx, linkAffected, pgArray(mapKeys(d.sessions)), "{"+strings.Join(reqs, ",")+"}",
+	rows, err := tx.QueryContext(ctx, linkAffected, pgArray(mapKeys(d.sessions)), "{"+strings.Join(reqs, ",")+"}",
 		pgArray(mapKeys(d.traces)))
 	if err != nil {
 		return err
@@ -259,6 +283,12 @@ func (an *analytics) updateLinks(d *linkDirty) error {
 			return err
 		}
 		ids = append(ids, strconv.FormatInt(id, 10))
+		if len(ids) > maxLinkDirty {
+			_ = rows.Close()
+			d.reset()
+			d.full = true
+			return fmt.Errorf("link_refresh_full_pending")
+		}
 	}
 	if err = closeRows(rows); err != nil {
 		return err
@@ -266,7 +296,7 @@ func (an *analytics) updateLinks(d *linkDirty) error {
 	if len(ids) == 0 {
 		return tx.Commit()
 	}
-	if _, err = tx.ExecContext(an.ctx, linkUpsert(`SELECT unnest($1::bigint[]) AS id`), "{"+strings.Join(ids, ",")+"}"); err != nil {
+	if _, err = tx.ExecContext(ctx, linkUpsert(`SELECT unnest($1::bigint[]) AS id`), "{"+strings.Join(ids, ",")+"}"); err != nil {
 		return err
 	}
 	return tx.Commit()
