@@ -206,7 +206,7 @@ func (an *analytics) extractCommit(ctx context.Context, id string) error {
 	if err = insertRows(ctx, tx, "commit_threads", []string{"commit_id", "thread_id"}, thr, ""); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return an.commitUnit(ctx, tx)
 }
 
 // commitGhosts lists commits in analytics that the archive no longer has.

@@ -71,7 +71,6 @@ func safeWorkerError(stage string, err error) error {
 	}
 	class := "error"
 	var unknown *unknownCommit
-	var network net.Error
 	switch {
 	case errors.As(err, &unknown):
 		class = "unknown_commit_" + commitCause(unknown.err)
@@ -79,7 +78,7 @@ func safeWorkerError(stage string, err error) error {
 		class = "timeout"
 	case errors.Is(err, context.Canceled):
 		class = "canceled"
-	case errors.Is(err, driver.ErrBadConn), errors.As(err, &network):
+	case lostConnection(err):
 		class = "connection"
 	}
 	state := ""
@@ -122,6 +121,27 @@ func commitWork(tx *sql.Tx) error {
 		return &unknownCommit{err}
 	}
 	return nil
+}
+
+// commitUnit commits a work unit's analytics transaction (session, thread, commit and PR
+// extraction). Every COMMIT error is an unknown outcome. The owned-test boundary runs after a
+// COMMIT the server applied, so a test can report a lost reply while the data has landed.
+func (an *analytics) commitUnit(ctx context.Context, tx *sql.Tx) error {
+	if err := commitWork(tx); err != nil {
+		return err
+	}
+	if err := an.boundary(ctx, "unit_committed"); err != nil {
+		return &unknownCommit{err}
+	}
+	return nil
+}
+
+// lostConnection reports a broken connection. The server may have applied the write whose
+// reply was lost (an autocommit statement, or a COMMIT), so the outcome is unknown.
+func lostConnection(err error) bool {
+	var network net.Error
+	return errors.Is(err, driver.ErrBadConn) || errors.As(err, &network) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 // commitCause names a failed COMMIT with a fixed token for diagnosis only. Every case stays an
@@ -234,8 +254,11 @@ func (an *analytics) executeUnit(ctx context.Context, u *journalUnit) {
 		}
 	}
 	u.err = err
+	// Only a definite error becomes workFailed, the one outcome that consumes an attempt and,
+	// at the ceiling, dead-letters and acknowledges. An unknown COMMIT or a lost connection is
+	// retained like a deferral: not_before moves by deferFor, attempts stay unchanged, and it
+	// never reaches the ceiling.
 	var unknown *unknownCommit
-	var network net.Error
 	switch {
 	case errors.As(err, &unknown):
 		u.outcome = workUnknownCommit
@@ -243,7 +266,7 @@ func (an *analytics) executeUnit(ctx context.Context, u *journalUnit) {
 		u.outcome = workCompleted
 	case ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
 		u.outcome = workDeferred
-	case errors.Is(err, driver.ErrBadConn) || errors.As(err, &network):
+	case lostConnection(err):
 		u.outcome = workUnknownCommit
 	default:
 		u.outcome = workFailed

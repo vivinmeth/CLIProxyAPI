@@ -264,7 +264,7 @@ func (an *analytics) extractThread(ctx context.Context, id string) error {
 			return fmt.Errorf("%s: %w", ins.table, err)
 		}
 	}
-	return tx.Commit()
+	return an.commitUnit(ctx, tx)
 }
 
 // threadGhosts lists threads in analytics that the archive no longer has.

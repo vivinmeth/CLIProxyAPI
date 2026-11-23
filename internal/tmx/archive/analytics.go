@@ -768,7 +768,7 @@ func (an *analytics) writeSession(ctx context.Context, s sessionRow, msgs []msgR
 		WHERE id = $1`, s.id); err != nil {
 		return err
 	}
-	return commitWork(tx)
+	return an.commitUnit(ctx, tx)
 }
 
 func (an *analytics) deleteSession(ctx context.Context, id string) error {

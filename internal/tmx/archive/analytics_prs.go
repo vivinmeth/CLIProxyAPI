@@ -365,5 +365,5 @@ func (an *analytics) extractPullRequest(ctx context.Context, id string) error {
 			return fmt.Errorf("%s: %w", t.table, err)
 		}
 	}
-	return tx.Commit()
+	return an.commitUnit(ctx, tx)
 }
