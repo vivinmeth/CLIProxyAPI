@@ -111,7 +111,8 @@ func TestPollStateLogsOncePerChange(t *testing.T) {
 }
 
 // End to end through poll() and the real routing view: a usage reply without seven_day, while
-// routing holds 7d at 98%, warns once; a reply that carries it again clears the state.
+// routing holds 7d at 98%, warns once (and never for windows routing doesn't weigh); a reply that
+// carries it again clears the state.
 func TestPollWarnsOnMissingOverThresholdWindow(t *testing.T) {
 	// The service's clock runs behind real time: routing (real time) accepts every poll's reading,
 	// and the clock can step past the poll gaps without reaching the future.
@@ -126,7 +127,13 @@ func TestPollWarnsOnMissingOverThresholdWindow(t *testing.T) {
 	s.observer = m
 	full := 98.0
 	reset := now.Add(40 * time.Hour)
-	m.ApplyQuotaObservation(auth.ID, "claude", []coreauth.QuotaWindowObservation{{Window: "7d", UsedPercent: &full, ResetsAt: reset, ObservedAt: now.Add(-time.Hour)}})
+	// 7d_oauth_apps and 7d_cowork are over threshold too, but routing weighs them for no model, so
+	// a poll that omits them must not warn about them.
+	var seeded []coreauth.QuotaWindowObservation
+	for _, w := range []string{"7d", "7d_oauth_apps", "7d_cowork"} {
+		seeded = append(seeded, coreauth.QuotaWindowObservation{Window: w, UsedPercent: &full, ResetsAt: reset, ObservedAt: now.Add(-time.Hour)})
+	}
+	m.ApplyQuotaObservation(auth.ID, "claude", seeded)
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
 

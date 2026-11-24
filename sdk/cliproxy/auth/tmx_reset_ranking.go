@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -66,11 +65,7 @@ func eachOverQuotaWindow(a *Auth, now time.Time, model string, allModels bool, v
 		{"5h", "Anthropic-Ratelimit-Unified-5h-Utilization", "Anthropic-Ratelimit-Unified-5h-Reset", "", 1, v.five},
 		{"7d", "Anthropic-Ratelimit-Unified-7d-Utilization", claudeWeeklyResetSignal, "", 1, v.seven},
 	}
-	weekly := claudeWeeklyResetNames(known, model)
-	if allModels {
-		weekly = claudeAllWeeklyResetNames(known)
-	}
-	for _, name := range weekly {
+	for _, name := range claudeWeeklyResetNamesFor(known, model, allModels) {
 		if name == claudeWeeklyResetSignal {
 			continue
 		}
@@ -128,21 +123,6 @@ func eachOverQuotaWindow(a *Auth, now time.Time, model string, allModels bool, v
 	}
 }
 
-// claudeAllWeeklyResetNames is claudeWeeklyResetNames for every model: the shared weekly reset and
-// each model- or family-scoped one the account carries, in a stable order.
-func claudeAllWeeklyResetNames(signals map[string]string) []string {
-	names := []string{claudeWeeklyResetSignal}
-	var scoped []string
-	for key := range signals {
-		lower := strings.ToLower(key)
-		if strings.HasPrefix(lower, "anthropic-ratelimit-unified-7d_") && strings.HasSuffix(lower, "-reset") {
-			scoped = append(scoped, key)
-		}
-	}
-	sort.Strings(scoped)
-	return append(names, scoped...)
-}
-
 // claudeWindowName is the routing window of a Claude reset signal ("7d_oi" from
 // "Anthropic-Ratelimit-Unified-7d_oi-Reset").
 func claudeWindowName(resetSignal string) string {
@@ -190,13 +170,21 @@ func pickResetSoonestForModel(auths []*Auth, now time.Time, model string, v tmxA
 }
 
 func claudeWeeklyResetNames(signals map[string]string, model string) []string {
+	return claudeWeeklyResetNamesFor(signals, model, false)
+}
+
+// claudeWeeklyResetNamesFor is the Claude weekly reset signals routing weighs for model. With
+// anyModel it is their union over every model routing can rank: each model-scoped rule applies,
+// and windows no rule names (7d_oauth_apps, 7d_cowork) stay out, as they do for every model.
+func claudeWeeklyResetNamesFor(signals map[string]string, model string, anyModel bool) []string {
 	names := []string{claudeWeeklyResetSignal}
 	lowerModel := strings.ToLower(model)
-	if strings.Contains(lowerModel, "fable") {
+	applies := func(scope string) bool { return anyModel || strings.Contains(lowerModel, scope) }
+	if applies("fable") {
 		names = append(names, claudeWeeklyModelResetSignal)
 	}
 	for _, family := range []string{"opus", "sonnet"} {
-		if strings.Contains(lowerModel, family) {
+		if applies(family) {
 			names = append(names, "Anthropic-Ratelimit-Unified-7d_"+family+"-Reset")
 		}
 	}
@@ -207,7 +195,7 @@ func claudeWeeklyResetNames(signals map[string]string, model string) []string {
 			continue
 		}
 		slug := strings.TrimSuffix(strings.TrimPrefix(lower, prefix), "-reset")
-		if slug != "" && strings.Contains(lowerModel, slug) {
+		if slug != "" && applies(slug) {
 			names = append(names, key)
 		}
 	}
