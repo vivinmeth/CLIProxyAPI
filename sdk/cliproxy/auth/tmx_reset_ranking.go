@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -36,8 +37,21 @@ func rankingKey(a *Auth, now time.Time, model string) (int, time.Time) {
 }
 
 func overQuotaThreshold(a *Auth, now time.Time, model string, v tmxAdmissionView) bool {
-	if a == nil {
+	over := false
+	eachOverQuotaWindow(a, now, model, false, v, func(string, string) bool {
+		over = true
 		return false
+	})
+	return over
+}
+
+// eachOverQuotaWindow calls over(window, field) for each window routing holds at or over its
+// threshold for model, or for every model when allModels is set. window is the routing name ("5h",
+// "7d", "7d_oi", ...); field is the signal whose clock dates the reading. It stops when over
+// returns false.
+func eachOverQuotaWindow(a *Auth, now time.Time, model string, allModels bool, v tmxAdmissionView, over func(window, field string) bool) {
+	if a == nil {
+		return
 	}
 	// A reading past its TTL still counts while its own window hasn't reset: utilization only
 	// grows within a window, so a last-known exhausted account stays behind those with headroom
@@ -45,32 +59,36 @@ func overQuotaThreshold(a *Auth, now time.Time, model string, v tmxAdmissionView
 	signals := a.Quota.FreshSignals(now)
 	known := a.Quota.Signals
 	type window struct {
-		used, reset, after string
-		scale, threshold   float64
+		name, used, reset, after string
+		scale, threshold         float64
 	}
 	windows := []window{
-		{"Anthropic-Ratelimit-Unified-5h-Utilization", "Anthropic-Ratelimit-Unified-5h-Reset", "", 1, v.five},
-		{"Anthropic-Ratelimit-Unified-7d-Utilization", claudeWeeklyResetSignal, "", 1, v.seven},
+		{"5h", "Anthropic-Ratelimit-Unified-5h-Utilization", "Anthropic-Ratelimit-Unified-5h-Reset", "", 1, v.five},
+		{"7d", "Anthropic-Ratelimit-Unified-7d-Utilization", claudeWeeklyResetSignal, "", 1, v.seven},
 	}
-	for _, name := range claudeWeeklyResetNames(known, model) {
+	weekly := claudeWeeklyResetNames(known, model)
+	if allModels {
+		weekly = claudeAllWeeklyResetNames(known)
+	}
+	for _, name := range weekly {
 		if name == claudeWeeklyResetSignal {
 			continue
 		}
-		windows = append(windows, window{strings.TrimSuffix(name, "Reset") + "Utilization", name, "", 1, v.seven})
+		windows = append(windows, window{claudeWindowName(name), strings.TrimSuffix(name, "Reset") + "Utilization", name, "", 1, v.seven})
 	}
 	for _, slot := range []string{"Primary", "Secondary"} {
 		minutes, ok := parseQuotaInt(quotaSignalValue(known, "X-Codex-"+slot+"-Window-Minutes"))
 		if !ok {
 			continue
 		}
-		threshold := v.five
+		name, threshold := "5h", v.five
 		if minutes >= minimumWeeklyWindowMinutes {
-			threshold = v.seven
+			name, threshold = "7d", v.seven
 		} else if minutes > 24*60 {
 			continue
 		}
 		base := "X-Codex-" + slot + "-"
-		windows = append(windows, window{base + "Used-Percent", base + "Reset-At", base + "Reset-After-Seconds", 100, threshold})
+		windows = append(windows, window{name, base + "Used-Percent", base + "Reset-At", base + "Reset-After-Seconds", 100, threshold})
 	}
 	for _, name := range tmxQuotaWindows {
 		threshold := v.seven
@@ -78,12 +96,15 @@ func overQuotaThreshold(a *Auth, now time.Time, model string, v tmxAdmissionView
 			threshold = v.five
 		}
 		base := TmxQuotaSignalPrefix + name + "-"
-		windows = append(windows, window{base + "Used-Percent", base + "Reset", "", 100, threshold})
+		windows = append(windows, window{name, base + "Used-Percent", base + "Reset", "", 100, threshold})
 		// The provider itself says the window is spent (OpenCode Go "rate-limited"): last resort
 		// until that window resets, however low its rounded percent reads.
 		if strings.EqualFold(quotaSignalValue(known, base+"Status"), "rejected") {
 			if reset, ok := parseQuotaResetTimestamp(quotaSignalValue(known, base+"Reset")); ok && reset.After(now) {
-				return true
+				if !over(name, base+"Status") {
+					return
+				}
+				windows = windows[:len(windows)-1]
 			}
 		}
 	}
@@ -101,11 +122,35 @@ func overQuotaThreshold(a *Auth, now time.Time, model string, v tmxAdmissionView
 			value = quotaSignalValue(known, w.used)
 		}
 		used, err := strconv.ParseFloat(value, 64)
-		if err == nil && used/w.scale >= w.threshold {
-			return true
+		if err == nil && used/w.scale >= w.threshold && !over(w.name, w.used) {
+			return
 		}
 	}
-	return false
+}
+
+// claudeAllWeeklyResetNames is claudeWeeklyResetNames for every model: the shared weekly reset and
+// each model- or family-scoped one the account carries, in a stable order.
+func claudeAllWeeklyResetNames(signals map[string]string) []string {
+	names := []string{claudeWeeklyResetSignal}
+	var scoped []string
+	for key := range signals {
+		lower := strings.ToLower(key)
+		if strings.HasPrefix(lower, "anthropic-ratelimit-unified-7d_") && strings.HasSuffix(lower, "-reset") {
+			scoped = append(scoped, key)
+		}
+	}
+	sort.Strings(scoped)
+	return append(names, scoped...)
+}
+
+// claudeWindowName is the routing window of a Claude reset signal ("7d_oi" from
+// "Anthropic-Ratelimit-Unified-7d_oi-Reset").
+func claudeWindowName(resetSignal string) string {
+	const prefix, suffix = len("Anthropic-Ratelimit-Unified-"), len("-Reset")
+	if len(resetSignal) <= prefix+suffix {
+		return resetSignal
+	}
+	return resetSignal[prefix : len(resetSignal)-suffix]
 }
 
 // Keep reset-soonest's burn order within headroom classes. Saturated/unknown

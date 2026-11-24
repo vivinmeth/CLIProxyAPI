@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -270,6 +271,10 @@ type account struct {
 	present bool
 	// ocPoll: an OpenCode account's last good usage read (opencode.go); nil until one succeeds.
 	ocPoll *openCodePoll
+	// pollWarned and missingWarned hold the poll state last logged (a failure code, and the
+	// over-threshold windows polls lack), so each logs once per change, not once per poll.
+	pollWarned    string
+	missingWarned map[string]bool
 }
 
 // Service collects and stores quota snapshots.
@@ -606,19 +611,19 @@ func (s *Service) poll(ctx context.Context, spec providerSpec, auth *coreauth.Au
 	}
 	var windows []Window
 	var usagePlan string
-	pollErr := ""
+	pollErr, failCode := "", ""
 	switch {
 	case err != nil:
-		pollErr = err.Error()
+		pollErr, failCode = err.Error(), "fetch_error"
 	case status == 429:
-		pollErr = "rate limited (429)"
+		pollErr, failCode = "rate limited (429)", "rate_limited"
 	case status == 401 || status == 403:
-		pollErr = fmt.Sprintf("unauthorized (%d)", status)
+		pollErr, failCode = fmt.Sprintf("unauthorized (%d)", status), "unauthorized"
 	case status < 200 || status >= 300:
-		pollErr = fmt.Sprintf("status %d", status)
+		pollErr, failCode = fmt.Sprintf("status %d", status), "http_status"
 	default:
 		if windows, usagePlan, err = spec.parseUsage(body); err != nil {
-			pollErr = "bad usage payload: " + err.Error()
+			pollErr, failCode = "bad usage payload: "+err.Error(), "bad_payload"
 		}
 	}
 	if usagePlan != "" {
@@ -647,6 +652,7 @@ func (s *Service) poll(ctx context.Context, spec providerSpec, auth *coreauth.Au
 	}
 	s.mu.Unlock()
 	if pollErr != "" {
+		s.notePollFailure(auth, a, failCode)
 		log.WithField("auth_id", auth.ID).Debugf("tmx quota: poll failed: %s", pollErr)
 		return
 	}
@@ -662,7 +668,73 @@ func (s *Service) poll(ctx context.Context, spec providerSpec, auth *coreauth.Au
 		s.mu.Unlock()
 	}
 	s.applyRouting(auth.ID, auth.Provider, windows, now)
+	s.notePollSuccess(auth, a, now)
 	s.record(ctx, auth.ID, windows, "polled", now)
+}
+
+// overThresholdReader is the routing observer's view of over-threshold windows a poll didn't
+// refresh (coreauth.Manager.TmxOverThresholdWindowsBefore).
+type overThresholdReader interface {
+	TmxOverThresholdWindowsBefore(authID string, at time.Time) []string
+}
+
+// pollLogFields are the only fields poll-state logs carry: fixed codes, the provider and the
+// opaque auth index. Never a label, email, auth ID, token or response body.
+func pollLogFields(auth *coreauth.Auth, code string) log.Fields {
+	return log.Fields{"code": code, "provider": strings.ToLower(strings.TrimSpace(auth.Provider)), "auth_index": auth.EnsureIndex()}
+}
+
+// notePollFailure logs a failed poll at Warn once per change of failure (reason is a fixed code);
+// repeats of the same failure log only at Debug.
+func (s *Service) notePollFailure(auth *coreauth.Auth, a *account, reason string) {
+	s.mu.Lock()
+	changed := a.pollWarned != reason
+	a.pollWarned = reason
+	s.mu.Unlock()
+	if changed {
+		log.WithFields(pollLogFields(auth, "tmx_quota_poll_failed")).WithField("reason", reason).Warn("tmx quota: poll failed")
+	}
+}
+
+// notePollSuccess logs, once per change of state, a recovery from a logged failure (Info) and each
+// window routing holds as over threshold that this poll at at didn't carry (Warn), and when such a
+// window is carried again or stops being over threshold (Info).
+func (s *Service) notePollSuccess(auth *coreauth.Auth, a *account, at time.Time) {
+	var missing []string
+	if reader, ok := s.observer.(overThresholdReader); ok {
+		missing = reader.TmxOverThresholdWindowsBefore(auth.ID, at)
+	}
+	current := make(map[string]bool, len(missing))
+	for _, w := range missing {
+		current[w] = true
+	}
+	s.mu.Lock()
+	recovered := a.pollWarned
+	a.pollWarned = ""
+	var added, cleared []string
+	for _, w := range missing {
+		if !a.missingWarned[w] {
+			added = append(added, w)
+		}
+	}
+	for w := range a.missingWarned {
+		if !current[w] {
+			cleared = append(cleared, w)
+		}
+	}
+	a.missingWarned = current
+	s.mu.Unlock()
+	sort.Strings(added)
+	sort.Strings(cleared)
+	if recovered != "" {
+		log.WithFields(pollLogFields(auth, "tmx_quota_poll_recovered")).WithField("reason", recovered).Info("tmx quota: poll recovered")
+	}
+	for _, w := range added {
+		log.WithFields(pollLogFields(auth, "tmx_quota_poll_missing_window")).WithField("window", w).Warn("tmx quota: poll lacks a window routing holds as over threshold")
+	}
+	for _, w := range cleared {
+		log.WithFields(pollLogFields(auth, "tmx_quota_poll_window_back")).WithField("window", w).Info("tmx quota: over-threshold window no longer missing from polls")
+	}
 }
 
 // record updates current state and writes a snapshot for windows that changed or are due a

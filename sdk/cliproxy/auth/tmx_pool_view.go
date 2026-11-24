@@ -1,6 +1,9 @@
 package auth
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // PoolSelectionContext supplies the same configured thresholds, cap and live
 // reservation counts as routing, without reserving a slot or binding a session.
@@ -26,4 +29,34 @@ func (m *Manager) tmxPoolAdmissionView() tmxAdmissionView {
 		}
 	}
 	return view
+}
+
+// TmxOverThresholdWindowsBefore names the windows routing holds at or over threshold for authID,
+// for any model and with the configured thresholds, whose reading is older than at. A poll observed
+// at at that carried such a window would have refreshed its clock, so these are the windows that
+// poll lacked. It reads routing state and never changes it.
+func (m *Manager) TmxOverThresholdWindowsBefore(authID string, at time.Time) []string {
+	if m == nil {
+		return nil
+	}
+	view := m.tmxPoolAdmissionView()
+	m.mu.RLock()
+	a := m.auths[authID]
+	if a != nil {
+		a = a.Clone()
+	}
+	m.mu.RUnlock()
+	if a == nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	eachOverQuotaWindow(a, time.Now(), "", true, view, func(window, field string) bool {
+		if !seen[window] && a.Quota.SignalObservedTime(field).Before(at) {
+			seen[window] = true
+			out = append(out, window)
+		}
+		return true
+	})
+	return out
 }
