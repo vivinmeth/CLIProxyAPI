@@ -77,3 +77,85 @@ func TestPoolShowsPolledOpenCodeWindows(t *testing.T) {
 		t.Fatalf("windows = %+v", ws)
 	}
 }
+
+// T13: a passive window shows its own field clock, not the account-wide ObservedAt that any newer
+// header (here a 5h one) moves forward. A frozen 7d window then shows its real age.
+func TestPoolPassiveWindowKeepsItsOwnClock(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	weekly, session := now.Add(-7*time.Hour), now.Add(-time.Minute)
+	a := &auth.Auth{ID: "claude-hash-alice@example.com.json", Provider: "claude", Label: "claude-alice@example.com", Status: auth.StatusActive}
+	a.Quota.ObservedAt = session
+	a.Quota.Signals = map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.98",
+		"Anthropic-Ratelimit-Unified-7d-Reset":       strconv.FormatInt(now.Add(40*time.Hour).Unix(), 10),
+		"Anthropic-Ratelimit-Unified-5h-Utilization": "0.1",
+		"Anthropic-Ratelimit-Unified-5h-Reset":       strconv.FormatInt(now.Add(2*time.Hour).Unix(), 10),
+	}
+	a.Quota.SignalObservedAt = map[string]time.Time{
+		"Anthropic-Ratelimit-Unified-7d-Utilization": weekly,
+		"Anthropic-Ratelimit-Unified-7d-Reset":       weekly,
+		"Anthropic-Ratelimit-Unified-5h-Utilization": session,
+		"Anthropic-Ratelimit-Unified-5h-Reset":       session,
+	}
+	s := Build(context.Background(), []*auth.Auth{a}, nil, nil, nil, "")
+	got := map[string]time.Time{}
+	for _, w := range s.Credentials[0].Windows {
+		got[w.Window.Window] = w.ObservedAt
+		if w.Source != "passive" {
+			t.Fatalf("%s source = %q", w.Window.Window, w.Source)
+		}
+	}
+	if !got["7d"].Equal(weekly) {
+		t.Fatalf("7d observed_at = %v, want the 7 h old field clock %v", got["7d"], weekly)
+	}
+	if !got["5h"].Equal(session) {
+		t.Fatalf("5h observed_at = %v, want %v", got["5h"], session)
+	}
+
+	// Privacy: the per-window clocks add no raw IDs, labels or signal names to the payload.
+	raw, _ := json.Marshal(s)
+	for _, leak := range []string{"alice@example.com", "Anthropic-Ratelimit", "signal_observed_at"} {
+		if strings.Contains(string(raw), leak) {
+			t.Fatalf("pool payload leaks %q: %s", leak, raw)
+		}
+	}
+	if !strings.Contains(string(raw), `"observed_at":"`+weekly.Format(time.RFC3339)) {
+		t.Fatalf("payload lacks the 7d window's own observed_at: %s", raw)
+	}
+}
+
+// A Codex window found by its length keeps its own clock too.
+func TestPoolCodexWindowKeepsItsOwnClock(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	weekly, session := now.Add(-3*time.Hour), now.Add(-time.Minute)
+	a := &auth.Auth{ID: "codex-a", Provider: "codex", Status: auth.StatusActive}
+	a.Quota.ObservedAt = session
+	a.Quota.Signals = map[string]string{
+		"X-Codex-Primary-Used-Percent":     "10",
+		"X-Codex-Primary-Window-Minutes":   "300",
+		"X-Codex-Primary-Reset-At":         strconv.FormatInt(now.Add(time.Hour).Unix(), 10),
+		"X-Codex-Secondary-Used-Percent":   "50",
+		"X-Codex-Secondary-Window-Minutes": "10080",
+		"X-Codex-Secondary-Reset-At":       strconv.FormatInt(now.Add(48*time.Hour).Unix(), 10),
+	}
+	a.Quota.SignalObservedAt = map[string]time.Time{}
+	for key := range a.Quota.Signals {
+		a.Quota.SignalObservedAt[key] = session
+		if strings.HasPrefix(key, "X-Codex-Secondary-") {
+			a.Quota.SignalObservedAt[key] = weekly
+		}
+	}
+	s := Build(context.Background(), []*auth.Auth{a}, nil, nil, nil, "")
+	for _, w := range s.Credentials[0].Windows {
+		want := session
+		if w.Window.Window == "7d" {
+			want = weekly
+		}
+		if !w.ObservedAt.Equal(want) {
+			t.Fatalf("%s observed_at = %v, want %v", w.Window.Window, w.ObservedAt, want)
+		}
+	}
+	if len(s.Credentials[0].Windows) != 2 {
+		t.Fatalf("windows = %+v", s.Credentials[0].Windows)
+	}
+}

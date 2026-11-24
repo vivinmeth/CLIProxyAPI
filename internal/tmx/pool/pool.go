@@ -145,7 +145,7 @@ func Build(ctx context.Context, auths []*auth.Auth, counts map[string]int, accou
 			}
 		}
 		for _, window := range passive {
-			windows[window.Window] = quota.Current{Window: window, ObservedAt: a.Quota.ObservedAt, Source: source, Stale: window.ResetsAt != nil && !window.ResetsAt.After(now)}
+			windows[window.Window] = quota.Current{Window: window, ObservedAt: quota.WindowObservedAt(a.Quota, a.Provider, window.Window, a.Quota.Signals), Source: source, Stale: window.ResetsAt != nil && !window.ResetsAt.After(now)}
 		}
 		if account, ok := latest[a.ID]; ok {
 			if account.Plan != "" {
